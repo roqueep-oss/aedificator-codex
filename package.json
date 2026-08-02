@@ -1,0 +1,115 @@
+{
+  "name": "aedificator-codex",
+  "version": "1.0.0",
+  "description": "Aedificator Codex - Desenvolvimento com agentes de IA orquestrados",
+  "author": "Aedificator Codex",
+  "license": "MIT",
+  "main": "main.js",
+  "repository": {
+    "type": "git",
+    "url": ""
+  },
+  "scripts": {
+    "start": "electron .",
+    "dev": "electron . --enable-logging",
+    "build:win": "electron-builder --win --x64",
+    "build:win32": "electron-builder --win --ia32",
+    "build:mac": "electron-builder --mac",
+    "build:linux": "electron-builder --linux",
+    "build:all": "electron-builder --win --mac --linux",
+    "dist": "electron-builder --win --x64",
+    "postinstall": "electron-builder install-app-deps",
+    "lint": "eslint .",
+    "test": "node --test",
+    "version:patch": "npm version patch && npm run publish:all",
+    "version:minor": "npm version minor && npm run publish:all",
+    "version:major": "npm version major && npm run publish:all",
+    "publish:github": "node scripts/publish.js github",
+    "publish:gitlab": "node scripts/publish.js gitlab",
+    "publish:all": "node scripts/publish.js all",
+    "publish:all:mac": "node scripts/publish.js all mac",
+    "publish:all:linux": "node scripts/publish.js all linux"
+  },
+  "build": {
+    "appId": "com.aedificator.codex",
+    "productName": "Aedificator Codex",
+    "copyright": "© 2026 Aedificator Codex",
+    "directories": {
+      "output": "dist"
+    },
+    "publish": [
+      {
+        "provider": "github",
+        "owner": "SEU_USUARIO_GITHUB",
+        "repo": "aedificator-codex"
+      },
+      {
+        "provider": "gitlab",
+        "owner": "SEU_USUARIO_GITLAB",
+        "repo": "aedificator-codex",
+        "private": false,
+        "releaseType": "release"
+      }
+    ],
+    "files": [
+      "main.js",
+      "preload.js",
+      "backend/**/*",
+      "frontend/**/*"
+    ],
+    "win": {
+      "target": [
+        {
+          "target": "nsis",
+          "arch": [
+            "x64",
+            "ia32"
+          ]
+        }
+      ],
+      "icon": "build/icon.ico",
+      "publisherName": "Aedificator Codex",
+      "verifyUpdateCodeSignature": false
+    },
+    "nsis": {
+      "oneClick": false,
+      "perMachine": true,
+      "allowToChangeInstallationDirectory": true,
+      "installerIcon": "build/icon.ico",
+      "uninstallerIcon": "build/icon.ico",
+      "createDesktopShortcut": true,
+      "createStartMenuShortcut": true,
+      "shortcutName": "Aedificator Codex",
+      "menuCategory": "Aedificator Codex"
+    },
+    "mac": {
+      "target": [
+        "dmg",
+        "zip"
+      ],
+      "icon": "build/icon.icns",
+      "category": "public.app-category.developer-tools"
+    },
+    "linux": {
+      "target": [
+        "AppImage",
+        "deb",
+        "snap"
+      ],
+      "icon": "build/icon.png",
+      "category": "Development"
+    }
+  },
+  "devDependencies": {
+    "electron": "^30.5.1",
+    "electron-builder": "^24.13.3",
+    "eslint": "^8.56.0"
+  },
+  "dependencies": {
+    "cors": "^2.8.6",
+    "dotenv": "^16.3.1",
+    "express": "^4.22.2",
+    "merge-descriptors": "^2.0.0",
+    "ws": "^8.21.1"
+  }
+}

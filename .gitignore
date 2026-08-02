@@ -1,0 +1,34 @@
+# Dependências
+node_modules/
+
+# Build / distribuição
+dist/
+build/
+*.exe
+*.msi
+*.AppImage
+
+# Backend
+backend/.env
+backend/config.json
+backend/projects/
+
+# Tokens / segredos locais
+.env.local
+scripts/.env.local
+
+# Backups gerados pelo app
+.aedificator-backup/
+
+# Logs
+*.log
+npm-debug.log*
+
+# Sistema
+Thumbs.db
+.DS_Store
+desktop.ini
+
+# IDE
+.vscode/
+.idea/
