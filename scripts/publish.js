@@ -77,11 +77,151 @@ function detectRepo() {
     };
 }
 
+// ===== BOOTSTRAP: cria o repositório remoto automaticamente =====
+const readline = require('readline');
+const ask = (q) => new Promise((resolve) => {
+    const rl = readline.createInterface({ input: process.stdin, output: process.stdout });
+    rl.question(q, (a) => { rl.close(); resolve(a.trim()); });
+});
+
+// Busca credencial já salva no credential manager do Git (ex.: Antigravity/VSCode)
+function readStoredToken(provider) {
+    const host = provider === 'github' ? 'github.com' : 'gitlab.com';
+    const inp = `protocol=https\nhost=${host}\n\n`;
+    const proc = spawnSync('git', ['credential', 'fill'], { input: inp, encoding: 'utf-8' });
+    const out = (proc.stdout || '');
+    let token = '';
+    for (const line of out.split(/\r?\n/)) {
+        if (/^password=/i.test(line)) token = line.slice('password='.length).trim();
+    }
+    if (token) console.log(`🔑 Credencial encontrada automaticamente (${host}).`);
+    return token || null;
+}
+
+async function getUsername(provider, token) {
+    let r;
+    if (provider === 'github') {
+        r = await fetch('https://api.github.com/user', { headers: { Authorization: `token ${token}` } });
+        if (!r.ok) throw new Error(`Falha ao autenticar no GitHub (${r.status}): ${(await r.text()).slice(0, 200)}`);
+        const j = await r.json();
+        return { owner: j.login, id: j.id };
+    }
+    r = await fetch('https://gitlab.com/api/v4/user', { headers: { 'PRIVATE-TOKEN': token } });
+    if (!r.ok) throw new Error(`Falha ao autenticar no GitLab (${r.status}): ${(await r.text()).slice(0, 200)}`);
+    const j = await r.json();
+    return { owner: j.username, id: j.id };
+}
+
+async function createGitHubRepo(token, owner, name, isPrivate, description) {
+    const body = { name, private: !!isPrivate, description: description || '' };
+    const url = `https://api.github.com/${owner ? 'orgs/' + owner + '/repos' : 'user/repos'}`;
+    const r = await fetch(url, {
+        method: 'POST',
+        headers: { 'Authorization': `token ${token}`, 'Content-Type': 'application/json', 'Accept': 'application/vnd.github+json' },
+        body: JSON.stringify(body)
+    });
+    if (!r.ok && r.status !== 422) throw new Error(`Falha ao criar repo GitHub (${r.status}): ${(await r.text()).slice(0, 300)}`);
+    return { provider: 'github', owner, repo: name };
+}
+
+async function createGitlabRepo(token, name, visibility) {
+    const url = `https://gitlab.com/api/v4/projects?name=${encodeURIComponent(name)}&visibility=${visibility}`;
+    const r = await fetch(url, {
+        method: 'POST',
+        headers: { 'PRIVATE-TOKEN': token }
+    });
+    if (!r.ok) throw new Error(`Falha ao criar repo GitLab (${r.status}): ${(await r.text()).slice(0, 300)}`);
+    const j = await r.json();
+    const owner = j.path_with_namespace.split('/').slice(0, -1).join('/') || j.namespace?.full_path;
+    return { provider: 'gitlab', owner, repo: name };
+}
+
+async function bootstrapRemote(pkg) {
+    const name = pkg.name || path.basename(ROOT);
+    console.log(`\n🌱 Não há repositório remoto configurado. Vou criar um para você.`);
+
+    // Detecta a plataforma automaticamente pela credencial do Git; senão pergunta
+    let finalProvider = process.argv.includes('github') ? 'github' : process.argv.includes('gitlab') ? 'gitlab' : null;
+    if (!finalProvider) {
+        const gh = readStoredToken('github');
+        if (gh) finalProvider = 'github';
+    }
+    if (!finalProvider) {
+        finalProvider = process.argv[2]?.toLowerCase() === 'gitlab' ? 'gitlab'
+            : (await ask('Qual plataforma deseja usar? (github/gitlab): ')).toLowerCase().startsWith('gitl') ? 'gitlab' : 'github';
+    }
+
+    const tokenKey = finalProvider === 'github' ? 'GITHUB_TOKEN' : 'GITLAB_TOKEN';
+    let token = process.env[tokenKey] || process.env[finalProvider === 'github' ? 'GH_TOKEN' : 'GITLAB_TOKEN'];
+    if (!token) {
+        // Tenta ler do credential manager do Git antes de pedir manualmente
+        token = readStoredToken(finalProvider);
+    }
+    if (!token) {
+        token = await ask(`Digite seu ${tokenKey} (não será salvo no git): `);
+        if (!token) { console.error('❌ Token vazio. Abortando.'); process.exit(1); }
+    }
+    // Disponibiliza o token para a etapa de publicação (electron-builder)
+    process.env[tokenKey] = token;
+
+    let isPrivate = false;
+    if (process.argv.includes('--private')) {
+        isPrivate = true;
+    } else if (process.argv.includes('--public')) {
+        isPrivate = false;
+    } else if (!process.env.AED_NO_ASK) {
+        const privAns = await ask('Repo privado? (s/n, padrão n): ');
+        isPrivate = privAns.toLowerCase().startsWith('s');
+    }
+
+    const visibility = finalProvider === 'gitlab' ? (isPrivate ? 'private' : 'public') : null;
+    const auth = await getUsername(finalProvider, token);
+
+    let info;
+    if (finalProvider === 'github') {
+        info = await createGitHubRepo(token, null, name, isPrivate, pkg.description);
+        info.owner = auth.owner;
+    } else {
+        info = await createGitlabRepo(token, name, visibility);
+    }
+
+    console.log(`\n✅ Repositório criado: ${finalProvider} · ${info.owner}/${info.repo}`);
+    console.log(`🔗 Configurando git remote "origin"...`);
+
+    const remoteUrl =
+        finalProvider === 'github'
+            ? `https://github.com/${info.owner}/${info.repo}.git`
+            : `git@gitlab.com:${info.owner}/${info.repo}.git`;
+
+    run(['remote', 'remove', 'origin']);
+    const addR = run(['remote', 'add', 'origin', remoteUrl]);
+    if (addR.code !== 0) { console.error(`❌ Falha ao configurar remote: ${addR.output}`); process.exit(1); }
+
+    console.log('📤 Fazendo push inicial para a branch atual...');
+    const branch = run(['rev-parse', '--abbrev-ref', 'HEAD']).output.trim() || 'master';
+    const pushR = run(['push', '-u', 'origin', branch]);
+    if (pushR.code !== 0) {
+        console.error(`❌ Falha no push: ${pushR.output}\n   Dica: configure o auth (gh auth login / git credential) e tente de novo.`);
+        process.exit(1);
+    }
+    console.log('🔧 Salvando origin em package.json.build.publish...');
+
+    return { isRepo: true, provider: finalProvider, owner: info.owner, repo: info.repo, remoteUrl };
+}
+
 // ===== TOKENS =====
+async function main() {
 const target = (process.argv[2] || 'all').toLowerCase();
-const platform = (process.argv[3] || (process.platform === 'win32' ? 'win' : 'linux')).toLowerCase();
+const platformArg = (process.argv[3] || '').toLowerCase();
+const isFlag = (arg) => /^--/.test(arg);
+const platform = !isFlag(platformArg) && platformArg ? platformArg : (process.platform === 'win32' ? 'win' : 'linux');
 
 const repo = detectRepo();
+
+if (!repo.isRepo || !repo.provider) {
+    const setup = await bootstrapRemote(JSON.parse(fs.readFileSync(pkgPath, 'utf-8')));
+    Object.assign(repo, setup);
+}
 
 if (!repo.isRepo) {
     console.error('❌ Esta pasta não é um repositório git.\n');
@@ -135,7 +275,10 @@ const backupPkg = fs.readFileSync(pkgPath, 'utf-8');
 const tmpPkgPath = path.join(os.tmpdir(), `pkg-${Date.now()}.json`);
 fs.writeFileSync(tmpPkgPath, JSON.stringify(buildPkg, null, 2));
 fs.writeFileSync(pkgPath, JSON.stringify(buildPkg, null, 2));
-const cleanup = () => { fs.writeFileSync(pkgPath, backupPkg); fs.unlinkSync(tmpPkgPath); };
+const cleanup = () => {
+    try { fs.writeFileSync(pkgPath, backupPkg); } catch {}
+    try { if (fs.existsSync(tmpPkgPath)) fs.unlinkSync(tmpPkgPath); } catch {}
+};
 process.on('exit', cleanup);
 
 const pkg = buildPkg;
@@ -144,14 +287,23 @@ const baseArgs = ['electron-builder', `--${platform}`];
 
 let failed = false;
 for (const provider of providers) {
-    const requiredToken = provider === 'github' ? process.env.GITHUB_TOKEN : process.env.GITLAB_TOKEN;
+    let requiredToken = provider === 'github' ? process.env.GITHUB_TOKEN : process.env.GITLAB_TOKEN;
+    if (!requiredToken) {
+        const stored = readStoredToken(provider);
+        if (stored) {
+            if (provider === 'github') process.env.GITHUB_TOKEN = stored; else process.env.GITLAB_TOKEN = stored;
+            requiredToken = stored;
+            console.log(`🔑 Usando credencial do Git para ${provider}.`);
+        }
+    }
     if (!requiredToken) {
         console.error(`❌ ${provider.toUpperCase()}_TOKEN não definida. Pulando ${provider}.`);
         failed = true;
         continue;
     }
     console.log(`\n🚀 Publicando no ${provider.toUpperCase()} (${repo.owner}/${repo.repo}, plataforma: ${platform})...`);
-    const result = spawnSync(neb, [...baseArgs, '--publish', provider], {
+    const cmdArgs = [neb, ...baseArgs, '--publish', 'always'].map(a => /[ ()"]/.test(a) ? `"${a}"` : a).join(' ');
+    const result = spawnSync(process.platform === 'win32' ? 'cmd' : 'sh', process.platform === 'win32' ? ['/c', cmdArgs] : ['-c', cmdArgs], {
         cwd: ROOT,
         stdio: 'inherit',
         env: {
@@ -160,6 +312,9 @@ for (const provider of providers) {
             GITLAB_TOKEN: process.env.GITLAB_TOKEN
         }
     });
+    if (result.error) {
+        console.error('❌ Erro ao executar builder:', result.error.message);
+    }
     if (result.status !== 0) {
         console.error(`❌ Falha ao publicar no ${provider}.`);
         failed = true;
@@ -175,3 +330,6 @@ if (failed) {
     process.exit(1);
 }
 console.log('\n🏁 Publicação concluída com sucesso!');
+}
+
+main().catch((e) => { console.error('❌', e.message); process.exit(1); });
