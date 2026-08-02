@@ -916,6 +916,106 @@
             white-space: nowrap;
         }
 
+        /* ===== SNAPSHOTS ROTULADOS ===== */
+        #snapshotModal {
+            display: none;
+            position: fixed;
+            top: 0;
+            left: 0;
+            width: 100%;
+            height: 100%;
+            background: rgba(0, 0, 0, 0.7);
+            z-index: 1000;
+            justify-content: center;
+            align-items: center;
+            backdrop-filter: blur(4px);
+        }
+        #snapshotModal .modal-content {
+            background: #161b22;
+            border: 1px solid #30363d;
+            border-radius: 12px;
+            padding: 24px;
+            max-width: 640px;
+            width: 92%;
+            max-height: 85vh;
+            display: flex;
+            flex-direction: column;
+            gap: 12px;
+        }
+        #snapshotModal h2 {
+            color: #e6edf3;
+            margin-bottom: 0;
+            font-size: 18px;
+        }
+        .snapshot-create-row {
+            display: flex;
+            gap: 8px;
+            align-items: center;
+        }
+        .snapshot-create-row input {
+            flex: 1;
+            background: #0d1117;
+            border: 1px solid #30363d;
+            border-radius: 8px;
+            color: #e6edf3;
+            padding: 8px 12px;
+            font-size: 13px;
+        }
+        .snapshot-card {
+            background: #0d1117;
+            border: 1px solid #30363d;
+            border-radius: 8px;
+            padding: 10px 12px;
+            display: flex;
+            align-items: center;
+            gap: 10px;
+            margin-bottom: 8px;
+        }
+        .snapshot-card-info {
+            flex: 1;
+            min-width: 0;
+        }
+        .snapshot-card-name {
+            color: #e6edf3;
+            font-size: 13px;
+            font-weight: 600;
+            word-break: break-all;
+        }
+        .snapshot-card-note {
+            color: #8b949e;
+            font-size: 11px;
+        }
+        .snapshot-card-meta {
+            color: #8b949e;
+            font-size: 10px;
+        }
+        .snapshot-card-actions {
+            display: flex;
+            gap: 6px;
+            flex-shrink: 0;
+        }
+        .snapshot-mini-btn {
+            font-size: 12px;
+            padding: 3px 8px;
+            background: transparent;
+            border: 1px solid #30363d;
+            border-radius: 6px;
+            color: #c9d1d9;
+            cursor: pointer;
+        }
+        body.theme-light .snapshot-card {
+            background: #ffffff;
+            border-color: #d0d7de;
+        }
+        body.theme-light .snapshot-card .snapshot-card-name,
+        body.theme-light #snapshotModal h2 {
+            color: #1f2328;
+        }
+        body.theme-light .snapshot-card-note,
+        body.theme-light .snapshot-card-meta {
+            color: #57606a;
+        }
+
         /* ===== APROVAÇÃO DO PLANO ===== */
         #approvalModal {
             display: none;
@@ -1946,6 +2046,8 @@ body.theme-light .chat-area,
             <button class="btn-theme" id="publishVersionBtn" title="Detectar repositório e publicar versão" disabled>🚀</button>
             <!-- ===== BACKUP ===== -->
             <button class="btn-theme" id="backupBtn" title="Restaurar backup">↩️</button>
+            <!-- ===== SNAPSHOTS ROTULADOS ===== -->
+            <button class="btn-theme" id="snapshotBtn" title="Snapshots rotulados da pasta">📸</button>
             <!-- ===== TEMA ===== -->
             <button class="btn-theme" id="themeBtn" title="Alternar tema claro/escuro">☀️</button>
         </div>
@@ -2116,6 +2218,22 @@ body.theme-light .chat-area,
             <div class="approval-list" id="backupList"></div>
             <div class="modal-actions">
                 <button class="btn-close-modal" id="backupCloseBtn">❌ Fechar</button>
+            </div>
+        </div>
+    </div>
+
+    <!-- ===== SNAPSHOTS ROTULADOS ===== -->
+    <div id="snapshotModal">
+        <div class="modal-content">
+            <h2>📸 Snapshots Rotulados</h2>
+            <p class="modal-desc">Salve uma versão completa da pasta com um rótulo, compare e restaure quando quiser.</p>
+            <div class="snapshot-create-row">
+                <input type="text" id="snapshotNameInput" placeholder="Nome do snapshot (ex.: antes_da_feature_x)" maxlength="80">
+                <button class="btn-save" id="snapshotCreateBtn">✅ Criar</button>
+            </div>
+            <div class="approval-list" id="snapshotList"></div>
+            <div class="modal-actions">
+                <button class="btn-close-modal" id="snapshotCloseBtn">❌ Fechar</button>
             </div>
         </div>
     </div>

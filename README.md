@@ -27,6 +27,7 @@ Ferramenta de desenvolvimento assistida por IA que analisa, planeja e aplica alt
 - **Visualização de imagens** (PNG, JPG, GIF, SVG, etc.).
 - **Aprovação de plano** com opção de execução automática (⚡).
 - **Backups versionados** antes de cada alteração (até 10 versões por arquivo) — restaure pelo botão ↩️.
+- **Snapshots rotulados da pasta** (botão 📸): salve uma versão completa da pasta com um rótulo, liste, veja o diff e restaure quando quiser.
 - **Executar comandos** no projeto (ex.: `npm test`, `npm run build`) — barra ▶️ ou `/run <comando>` no chat.
 - **Busca** por nome de arquivo e conteúdo no explorador (🔍).
 - **Histórico de chat por projeto** e **projetos recentes**.

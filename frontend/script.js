@@ -159,7 +159,9 @@ document.addEventListener('DOMContentLoaded', () => {
 
     document.getElementById('themeBtn').addEventListener('click', toggleTheme);
     document.getElementById('backupBtn').addEventListener('click', openBackupModal);
+    document.getElementById('snapshotBtn').addEventListener('click', openSnapshotModal);
     document.getElementById('backupCloseBtn').addEventListener('click', closeBackupModal);
+    document.getElementById('snapshotCloseBtn').addEventListener('click', closeSnapshotModal);
 
     document.getElementById('gitBtn').addEventListener('click', openGitModal);
     document.getElementById('gitRefreshBtn').addEventListener('click', loadGitStatus);
@@ -1019,6 +1021,10 @@ function handleShortcuts(e) {
         }
         if (document.getElementById('backupModal').style.display === 'flex') {
             closeBackupModal();
+            return;
+        }
+        if (document.getElementById('snapshotModal').style.display === 'flex') {
+            closeSnapshotModal();
             return;
         }
         if (document.getElementById('gitModal').style.display === 'flex') {
@@ -2081,6 +2087,143 @@ async function restoreBackup(file) {
 
 function closeBackupModal() {
     document.getElementById('backupModal').style.display = 'none';
+}
+
+// =============================================
+//  SNAPSHOTS ROTULADOS (versões da pasta)
+// =============================================
+async function openSnapshotModal() {
+    if (!currentProjectPath) {
+        showToast('📁 Selecione uma pasta primeiro!');
+        return;
+    }
+    const modal = document.getElementById('snapshotModal');
+    modal.style.display = 'flex';
+    document.getElementById('snapshotNameInput').value = '';
+    await loadSnapshots();
+
+    const createBtn = document.getElementById('snapshotCreateBtn');
+    createBtn.onclick = async () => {
+        const nameInput = document.getElementById('snapshotNameInput');
+        const name = nameInput.value.trim();
+        if (!name) { showToast('📝 Dê um nome ao snapshot'); return; }
+        createBtn.disabled = true;
+        try {
+            const res = await apiFetch('/api/snapshot/create', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ name })
+            });
+            const data = await res.json();
+            if (data.success) {
+                showToast('✅ ' + data.message);
+                nameInput.value = '';
+                await loadSnapshots();
+            } else {
+                showToast('❌ ' + (data.error || 'Falha ao criar'));
+            }
+        } catch (e) {
+            showToast('❌ ' + e.message);
+        } finally {
+            createBtn.disabled = false;
+        }
+    };
+}
+
+async function loadSnapshots() {
+    const list = document.getElementById('snapshotList');
+    list.innerHTML = '<div style="padding:20px;text-align:center;color:#8b949e;">⏳ Carregando snapshots...</div>';
+    try {
+        const res = await apiFetch('/api/snapshot/list', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: '{}'
+        });
+        const data = await res.json();
+        const snapshots = data.success ? data.snapshots : [];
+        list.innerHTML = '';
+        if (snapshots.length === 0) {
+            list.innerHTML = '<div style="padding:20px;text-align:center;color:#8b949e;">📸 Nenhum snapshot ainda.<br><span style="font-size:11px;color:#484f58;">Dê um nome acima e clique em "Criar".</span></div>';
+            return;
+        }
+        for (const s of snapshots) {
+            const card = await snapshotCard(s);
+            list.appendChild(card);
+        }
+    } catch (e) {
+        list.innerHTML = `<div style="padding:20px;text-align:center;color:#f85149;">❌ ${escapeHtml(e.message)}</div>`;
+    }
+}
+
+async function snapshotCard(s) {
+    const card = document.createElement('div');
+    card.className = 'snapshot-card';
+    const date = s.createdAt ? new Date(s.createdAt).toLocaleString('pt-BR') : '';
+    const note = s.note ? `<div class="snapshot-card-note">${escapeHtml(s.note)}</div>` : '';
+    card.innerHTML = `
+        <div class="snapshot-card-info">
+            <div class="snapshot-card-name">📸 ${escapeHtml(s.name)}</div>
+            ${note}
+            <div class="snapshot-card-meta">${date} · ${s.files} arquivos</div>
+        </div>
+        <div class="snapshot-card-actions">
+            <button class="snapshot-mini-btn" data-act="diff">🔍 Diff</button>
+            <button class="snapshot-mini-btn" data-act="restore">↩️ Restaurar</button>
+        </div>
+    `;
+    card.querySelector('[data-act="diff"]').addEventListener('click', () => snapshotDiff(s.name));
+    card.querySelector('[data-act="restore"]').addEventListener('click', () => snapshotRestore(s.name));
+    return card;
+}
+
+async function snapshotDiff(name) {
+    try {
+        const res = await apiFetch('/api/snapshot/diff', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ name })
+        });
+        const data = await res.json();
+        if (!data.success) { showToast('❌ ' + (data.error || 'Falha no diff')); return; }
+        const c = data.changes || {};
+        const mods = c.modified || [], created = c.created || [], deleted = c.deleted || [];
+        const parts = [];
+        if (mods.length) parts.push(`✏️ Modificados: ${mods.length}`);
+        if (created.length) parts.push(`🆕 Criados: ${created.length}`);
+        if (deleted.length) parts.push(`🗑️ Deletados: ${deleted.length}`);
+        parts.push(`✅ Inalterados: ${c.unchanged || 0}`);
+        const sample = ['modificado', 'criado', 'deletado'].find(k => c[k] && c[k].length);
+        let detail = '';
+        if (sample && c[sample] && c[sample].length) {
+            detail = '\n\n' + c[sample].slice(0, 8).map(f => '· ' + f).join('\n');
+        }
+        showToast(`📸 "${data.name || name}": ` + parts.join(' · ') + detail);
+    } catch (e) {
+        showToast('❌ ' + e.message);
+    }
+}
+
+async function snapshotRestore(name) {
+    if (!confirm(`Restaurar o snapshot "${name}"? Os arquivos voltarão ao estado salvo.`)) return;
+    try {
+        const res = await apiFetch('/api/snapshot/restore', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ name })
+        });
+        const data = await res.json();
+        if (data.success) {
+            showToast('✅ ' + data.message);
+        } else {
+            showToast('❌ ' + (data.error || 'Falha ao restaurar'));
+        }
+    } catch (e) {
+        showToast('❌ ' + e.message);
+    }
+}
+
+function closeSnapshotModal() {
+    document.getElementById('snapshotModal').style.display = 'none';
 }
 
 // =============================================
