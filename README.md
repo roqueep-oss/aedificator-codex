@@ -93,6 +93,26 @@ O app está configurado para publicar instaladores automaticamente no **GitHub**
 3. Copie `scripts/.env.example` para `scripts/.env.local` e preencha os tokens
    (ou defina as variáveis de ambiente `GITHUB_TOKEN` e `GITLAB_TOKEN`).
 
+### Configuração totalmente automática
+
+Você não precisa digitar usuários nem editar `build.publish`: o script **detecta o repositório
+automaticamente** a partir do `git remote -v` da pasta atual (mesma lógica do botão 🚀 do app).
+
+- `node scripts/publish.js github` (ou `gitlab` / `all`):
+  - Detecta o repositório e monta a configuração de publicação sozinho;
+  - Usa a credencial salva no **credential manager do Git** (Antigravity/VSCode/GitHub CLI), sem você colar token;
+  - Se **não houver repositório**, pergunta a plataforma, **cria o repositório via API**, configura o `remote` e faz o push inicial;
+  - Faz o build (Windows x64/ia32 por padrão) e publica a **GitHub Release / GitLab Release** da versão atual.
+
+Exemplos:
+```
+node scripts/publish.js            # detecta tudo sozinho
+node scripts/publish.js github     # força GitHub
+node scripts/publish.js github --private   # cria repo privado
+node scripts/publish.js all mac    # publica para macOS
+node scripts/publish.js all linux  # publica para Linux
+```
+
 ### Publicar (versões)
 Ao rodar um comando, o app publica a versão atual do `package.json` nos serviços configurados:
 
