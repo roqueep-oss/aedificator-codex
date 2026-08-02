@@ -705,6 +705,7 @@ body {
 .file-item {
     display: flex;
     align-items: center;
+    flex-wrap: wrap;
     padding: 3px 12px;
     cursor: pointer;
     font-size: 13px;
@@ -798,6 +799,7 @@ body {
 }
 
 .folder-item .children {
+    flex-basis: 100%;
     padding-left: 16px;
     display: none;
 }

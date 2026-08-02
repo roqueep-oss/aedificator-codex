@@ -22,6 +22,17 @@ contextBridge.exposeInMainWorld('electronAPI', {
     openInExplorer: (path) => ipcRenderer.invoke('open-in-explorer', path),
     
     // =============================================
+    //  EMPACOTAMENTO (BUILD DA APLICAÇÃO)
+    // =============================================
+    buildApp: (options) => ipcRenderer.invoke('build-app', options),
+    cancelBuild: () => ipcRenderer.invoke('build-cancel'),
+    onBuildOutput: (callback) => {
+        const listener = (_event, line) => callback(line);
+        ipcRenderer.on('build-output', listener);
+        return () => ipcRenderer.removeListener('build-output', listener);
+    },
+    
+    // =============================================
     //  FUTURAS FUNÇÕES (JÁ PREPARADAS)
     // =============================================
     

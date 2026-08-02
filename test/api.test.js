@@ -406,3 +406,73 @@ test('snapshot/diff detecta criar, modificar e deletar', () => {
         fs.rmSync(projectRoot, { recursive: true, force: true });
     }
 });
+
+test('runner.validateBuildTarget aceita alvos válidos e rejeita inválidos', () => {
+    const { runner } = require(SERVER_PATH);
+    assert.strictEqual(runner.validateBuildTarget({ platform: 'win', arch: 'x64', format: 'nsis' }).length, 0);
+    assert.strictEqual(runner.validateBuildTarget({ platform: 'mac', arch: 'arm64', format: 'dmg' }).length, 0);
+    assert.ok(runner.validateBuildTarget({ platform: 'todos', arch: 'x64', format: 'nsis' }).length > 0, 'plataforma inválida');
+    assert.ok(runner.validateBuildTarget({ platform: 'win', arch: 'ppc', format: 'nsis' }).length > 0, 'arquitetura inválida');
+    assert.ok(runner.validateBuildTarget({ platform: 'win', arch: 'x64', format: 'hack' }).length > 0, 'formato inválido');
+});
+
+test('build rejeita plataforma inválida com 400', async (t) => {
+    const { child, projectRoot } = startServer('');
+    try {
+        await waitForPort();
+        const res = await fetch(`${BASE}/api/build`, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ platform: 'todos', arch: 'x64', format: 'nsis' })
+        });
+        assert.strictEqual(res.status, 400);
+        const data = await res.json();
+        assert.ok(!data.success);
+        assert.ok(data.error.includes('Plataforma'));
+    } finally {
+        stopServer(child, projectRoot);
+    }
+});
+
+test('build/cancel sem build em andamento responde ok', async (t) => {
+    const { child, projectRoot } = startServer('');
+    try {
+        await waitForPort();
+        const res = await fetch(`${BASE}/api/build/cancel`, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: '{}'
+        });
+        assert.strictEqual(res.status, 200);
+        const data = await res.json();
+        assert.strictEqual(data.cancelled, false);
+    } finally {
+        stopServer(child, projectRoot);
+    }
+});
+
+test('CORS bloqueia origem externa', async (t) => {
+    const { child, projectRoot } = startServer('');
+    try {
+        await waitForPort();
+        const res = await fetch(`${BASE}/api/health`, {
+            headers: { 'Origin': 'http://evil.example.com' }
+        });
+        assert.ok(!res.headers.get('access-control-allow-origin'), 'não deve liberar CORS para origem externa');
+    } finally {
+        stopServer(child, projectRoot);
+    }
+});
+
+test('CORS libera origem localhost', async (t) => {
+    const { child, projectRoot } = startServer('');
+    try {
+        await waitForPort();
+        const res = await fetch(`${BASE}/api/health`, {
+            headers: { 'Origin': 'http://localhost:3001' }
+        });
+        assert.ok(res.headers.get('access-control-allow-origin'), 'deve liberar CORS para localhost');
+    } finally {
+        stopServer(child, projectRoot);
+    }
+});

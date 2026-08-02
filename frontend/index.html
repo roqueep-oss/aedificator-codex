@@ -226,6 +226,7 @@
         .file-item {
             display: flex;
             align-items: center;
+            flex-wrap: wrap;
             padding: 3px 12px;
             cursor: pointer;
             font-size: 13px;
@@ -298,20 +299,30 @@
         }
 
         .folder-item .chevron {
-            margin-left: auto;
             font-size: 10px;
             color: #8b949e;
-            transition: 0.2s;
+            width: 14px;
+            flex-shrink: 0;
+            text-align: center;
+            transition: transform 0.15s ease;
         }
         .folder-item .chevron.open {
             transform: rotate(90deg);
         }
         .folder-item .children {
-            padding-left: 16px;
+            flex-basis: 100%;
+            padding-left: 18px;
             display: none;
         }
         .folder-item .children.open {
             display: block;
+        }
+        .folder-item.root-folder .name {
+            font-weight: 600;
+        }
+        .folder-item.root-folder > .children {
+            border-left: 1px solid #30363d;
+            margin-left: 8px;
         }
 
         /* ===== PAINEL DE ATIVIDADE (CENTRO) ===== */
@@ -1787,6 +1798,96 @@ body.theme-light .chat-area,
         .pub-field input:focus {
             border-color: #58a6ff;
         }
+        .pub-field select {
+            width: 100%;
+            padding: 8px 12px;
+            background: #0d1117;
+            color: #e6edf3;
+            border: 1px solid #30363d;
+            border-radius: 6px;
+            font-size: 13px;
+            outline: none;
+        }
+        .pub-field select:focus {
+            border-color: #58a6ff;
+        }
+        body.theme-light .pub-field select {
+            background: #f6f8fa;
+            color: #1f2328;
+            border-color: #d0d7de;
+        }
+        #buildModal .git-output {
+            background: #0d1117;
+            border: 1px solid #30363d;
+            border-radius: 8px;
+            padding: 12px;
+            font-family: 'Consolas', monospace;
+            font-size: 12px;
+            color: #c9d1d9;
+            white-space: pre-wrap;
+            word-break: break-word;
+            max-height: 260px;
+            overflow-y: auto;
+            margin-top: 10px;
+        }
+        body.theme-light #buildModal .git-output {
+            background: #f6f8fa;
+            color: #1f2328;
+            border-color: #d0d7de;
+        }
+        #buildDropdown {
+            position: fixed;
+            z-index: 1200;
+            background: #161b22;
+            border: 1px solid #30363d;
+            border-radius: 10px;
+            padding: 14px;
+            width: 300px;
+            box-shadow: 0 8px 24px rgba(0, 0, 0, 0.5);
+        }
+        #buildDropdown .build-dd-header {
+            color: #e6edf3;
+            font-size: 14px;
+            font-weight: 600;
+            margin-bottom: 6px;
+        }
+        #buildDropdown .pub-field {
+            margin-top: 6px;
+        }
+        #buildDropdown .build-dd-output {
+            background: #0d1117;
+            border: 1px solid #30363d;
+            border-radius: 8px;
+            padding: 10px;
+            font-family: 'Consolas', monospace;
+            font-size: 11px;
+            color: #c9d1d9;
+            white-space: pre-wrap;
+            word-break: break-word;
+            max-height: 200px;
+            overflow-y: auto;
+            margin-top: 10px;
+        }
+        #buildDropdown .build-dd-actions {
+            display: flex;
+            gap: 8px;
+            margin-top: 10px;
+        }
+        #buildDropdown .build-dd-actions button {
+            flex: 1;
+        }
+        body.theme-light #buildDropdown {
+            background: #f6f8fa;
+            border-color: #d0d7de;
+        }
+        body.theme-light #buildDropdown .build-dd-header {
+            color: #1f2328;
+        }
+        body.theme-light #buildDropdown .build-dd-output {
+            background: #fff;
+            color: #1f2328;
+            border-color: #d0d7de;
+        }
         .pub-output {
             background: #0d1117;
             border: 1px solid #30363d;
@@ -2048,6 +2149,8 @@ body.theme-light .chat-area,
             <button class="btn-theme" id="backupBtn" title="Restaurar backup">↩️</button>
             <!-- ===== SNAPSHOTS ROTULADOS ===== -->
             <button class="btn-theme" id="snapshotBtn" title="Snapshots rotulados da pasta">📸</button>
+            <!-- ===== EMPACOTAR / BUILD ===== -->
+            <button class="btn-theme" id="buildBtn" title="Empacotar a aplicação em executável">📦</button>
             <!-- ===== TEMA ===== -->
             <button class="btn-theme" id="themeBtn" title="Alternar tema claro/escuro">☀️</button>
         </div>
@@ -2250,6 +2353,39 @@ body.theme-light .chat-area,
                 <button class="btn-toolbar" id="gitRefreshBtn">🔄 Atualizar</button>
                 <button class="btn-close-modal" id="gitCloseBtn">❌ Fechar</button>
             </div>
+        </div>
+    </div>
+
+    <!-- ===== EMPACOTAR / BUILD (DROPDOWN) ===== -->
+    <div id="buildDropdown" style="display:none;">
+        <div class="build-dd-header">📦 Empacotar Aplicação</div>
+        <div class="pub-field">
+            <label>Plataforma</label>
+            <select id="buildPlatformSelect">
+                <option value="win">🪟 Windows</option>
+                <option value="mac">🍎 macOS</option>
+                <option value="linux">🐧 Linux</option>
+            </select>
+        </div>
+        <div class="pub-field">
+            <label>Arquitetura</label>
+            <select id="buildArchSelect">
+                <option value="x64">64 bits (x64)</option>
+                <option value="ia32">32 bits (ia32)</option>
+            </select>
+        </div>
+        <div class="pub-field">
+            <label>Formato</label>
+            <select id="buildFormatSelect">
+                <option value="nsis">Instalador (Setup.exe)</option>
+                <option value="portable">Portátil (exe único)</option>
+                <option value="zip">ZIP</option>
+            </select>
+        </div>
+        <pre class="build-dd-output" id="buildOutput">Clique em "Iniciar Build".</pre>
+        <div class="build-dd-actions">
+            <button class="btn-save" id="buildStartBtn">🚀 Iniciar Build</button>
+            <button class="btn-toolbar" id="buildCancelBtn" disabled>⏹️ Cancelar</button>
         </div>
     </div>
 

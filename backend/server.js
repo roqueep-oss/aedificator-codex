@@ -9,8 +9,24 @@ const crypto = require('crypto');
 const { spawn } = require('child_process');
 require('dotenv').config({ path: path.join(__dirname, '.env') });
 
+// ===== ENCODING UTF-8 (evita acentos corrompidos no console Windows) =====
+process.stdout.setDefaultEncoding('utf8');
+process.stderr.setDefaultEncoding('utf8');
+
 const app = express();
-app.use(cors());
+
+// ===== ORIGEM LOCAL (CORS restrito + proteção contra DNS rebinding) =====
+function isLocalOrigin(origin) {
+    if (!origin || origin === 'null') return true;
+    return /^https?:\/\/(localhost|127\.0\.0\.1)(:\d+)?$/i.test(origin);
+}
+
+app.use(cors({
+    origin(origin, cb) {
+        if (isLocalOrigin(origin)) return cb(null, true);
+        return cb(null, false);
+    }
+}));
 app.use(express.json({ limit: '50mb' }));
 
 // ===== SERVE O FRONTEND =====
@@ -20,12 +36,18 @@ app.use(express.static(frontendDir));
 const server = http.createServer(app);
 const wss = new WebSocket.Server({ server });
 
+const runner = require('./runner');
+
 const PORT = process.env.PORT || 3001;
 
 // =============================================
 //  AUTENTICAÇÃO LOCAL
 // =============================================
 const BACKEND_TOKEN = process.env.BACKEND_TOKEN || '';
+
+if (!BACKEND_TOKEN) {
+    console.log('🔓 Sem BACKEND_TOKEN — servidor sem autenticação (acesso restrito a 127.0.0.1). Defina BACKEND_TOKEN no backend/.env para proteger a API.');
+}
 
 // ===== SEGREDO PARA CRIPTOGRAFAR AS CHAVES =====
 const BACKEND_SECRET = process.env.BACKEND_SECRET || '';
@@ -170,7 +192,8 @@ function readFileContent(filePath) {
         if (!fullPath || !fs.existsSync(fullPath)) {
             return null;
         }
-        return fs.readFileSync(fullPath, 'utf-8');
+        const raw = fs.readFileSync(fullPath, 'utf-8');
+        return raw.charCodeAt(0) === 0xFEFF ? raw.slice(1) : raw;
     } catch (error) {
         return null;
     }
@@ -286,17 +309,20 @@ function listDirectory(dirPath) {
             console.log(`❌ Diretório não existe: ${fullPath}`);
             return [];
         }
-        const items = fs.readdirSync(fullPath);
+        const entries = fs.readdirSync(fullPath, { withFileTypes: true });
         const result = [];
-        for (const item of items) {
-            const itemPath = path.join(fullPath, item);
-            const isDir = fs.statSync(itemPath).isDirectory();
-            result.push({
-                name: item,
-                isDirectory: isDir,
-                path: path.join(dirPath, item).replace(/\\/g, '/'),
-                extension: isDir ? '' : path.extname(item)
-            });
+        for (const entry of entries) {
+            try {
+                const isDir = entry.isDirectory();
+                result.push({
+                    name: entry.name,
+                    isDirectory: isDir,
+                    path: path.join(dirPath, entry.name).replace(/\\/g, '/'),
+                    extension: isDir ? '' : path.extname(entry.name)
+                });
+            } catch (e) {
+                console.log(`⚠️ Ignorando item inacessível: ${entry.name}`);
+            }
         }
         console.log(`✅ ${result.length} itens encontrados`);
         return result;
@@ -1332,38 +1358,32 @@ app.post('/api/snapshot/restore', (req, res) => {
 });
 
 // ===== EXECUTAR COMANDOS =====
-app.post('/api/run', (req, res) => {
+app.post('/api/run', async (req, res) => {
     const { command } = req.body;
     if (!command || typeof command !== 'string') {
         return res.status(400).json({ error: 'Comando não especificado' });
     }
 
-    const shell = process.platform === 'win32' ? 'cmd.exe' : '/bin/sh';
-    const args = process.platform === 'win32' ? ['/d', '/s', '/c', command] : ['-c', command];
-    let child;
+    const broadcastRun = (line) => {
+        const payload = JSON.stringify({ type: 'run-output', line });
+        for (const client of wss.clients) {
+            if (client.readyState === WebSocket.OPEN) {
+                try { client.send(payload); } catch (e) {}
+            }
+        }
+    };
+
     try {
-        child = spawn(shell, args, { cwd: PROJECT_ROOT });
-    } catch (e) {
-        return res.status(500).json({ error: e.message });
-    }
-
-    let stdout = '';
-    let stderr = '';
-    const timer = setTimeout(() => {
-        try { child.kill(); } catch (e) {}
-    }, 300000);
-
-    child.stdout.on('data', (d) => { stdout += d.toString(); });
-    child.stderr.on('data', (d) => { stderr += d.toString(); });
-    child.on('error', (err) => {
-        clearTimeout(timer);
-        res.status(500).json({ error: 'Falha ao executar: ' + err.message });
-    });
-    child.on('close', (code) => {
-        clearTimeout(timer);
+        const { code, stdout, stderr } = await runner.runCommand({
+            command,
+            cwd: PROJECT_ROOT,
+            onLine: broadcastRun
+        });
         const output = stdout + (stderr ? (stdout && !stdout.endsWith('\n') ? '\n' : '') + stderr : '');
         res.json({ success: true, code, stdout, stderr, output });
-    });
+    } catch (e) {
+        res.status(500).json({ error: 'Falha ao executar: ' + e.message });
+    }
 });
 
 // ===== BUSCA NO PROJETO =====
@@ -1508,7 +1528,7 @@ function parseRemoteUrl(url) {
     const u = String(url).trim();
     const stripGit = (r) => r.replace(/\.git$/, '').replace(/\/$/, '');
     // https://github.com/gitlab.com/…/owner/repo(.git)
-    let m = u.match(/https?:\/\/(github|gitlab)\.com\/([^\/\s]+?)(?:\/(.+?))?\/([^\/\s]+)(?:\.git)?$/i);
+    let m = u.match(/https?:\/\/(github|gitlab)\.com\/([^/\s]+?)(?:\/(.+?))?\/([^/\s]+)(?:\.git)?$/i);
     if (m) {
         let owner = m[3] ? `${m[2]}/${m[3]}` : m[2]; // grupos: owner é o namespace
         return { provider: m[1].toLowerCase(), owner: stripGit(owner), repo: stripGit(m[4]) };
@@ -1630,6 +1650,8 @@ app.post('/api/git/publish', async (req, res) => {
 function getRootLocations() {
     const roots = [];
     if (process.platform === 'win32') {
+        const home = os.homedir();
+        if (home && home !== '') roots.push({ name: '🏠 Usuário', path: home, isDirectory: true });
         for (let code = 65; code <= 90; code++) {
             const letter = String.fromCharCode(code);
             try {
@@ -1638,8 +1660,6 @@ function getRootLocations() {
                 }
             } catch (e) {}
         }
-        const home = os.homedir();
-        if (home && home !== '') roots.push({ name: '🏠 Usuário', path: home, isDirectory: true });
     } else {
         roots.push({ name: '/', path: '/', isDirectory: true });
         const home = os.homedir();
@@ -1696,8 +1716,69 @@ app.post('/api/chat', async (req, res) => {
     }
 });
 
+// ===== EMPACOTAMENTO / BUILD =====
+const BUILD_CWD = path.join(__dirname, '..');
+
+function broadcastBuild(line) {
+    const payload = JSON.stringify({ type: 'build-output', line });
+    for (const client of wss.clients) {
+        if (client.readyState === WebSocket.OPEN) {
+            try { client.send(payload); } catch (e) {}
+        }
+    }
+}
+
+function broadcastBuildStatus(status) {
+    const payload = JSON.stringify({ type: 'build-status', status });
+    for (const client of wss.clients) {
+        if (client.readyState === WebSocket.OPEN) {
+            try { client.send(payload); } catch (e) {}
+        }
+    }
+}
+
+app.post('/api/build', async (req, res) => {
+    const platform = (req.body && req.body.platform) || 'win';
+    const arch = (req.body && req.body.arch) || 'x64';
+    const format = (req.body && req.body.format) || 'nsis';
+
+    const errors = runner.validateBuildTarget({ platform, arch, format });
+    if (errors.length) {
+        return res.status(400).json({ success: false, error: errors.join('; ') });
+    }
+    if (runner.isBuildRunning()) {
+        return res.status(409).json({ success: false, error: 'Já existe um build em andamento.' });
+    }
+
+    try {
+        const { code } = await runner.startBuild({
+            platform,
+            arch,
+            format,
+            cwd: BUILD_CWD,
+            onLine: broadcastBuild
+        });
+        broadcastBuildStatus(code === 0 ? 'done' : 'error');
+        res.json({ success: true });
+    } catch (e) {
+        broadcastBuildStatus('error');
+        res.status(e.status || 500).json({ success: false, error: e.message });
+    }
+});
+
+app.post('/api/build/cancel', (req, res) => {
+    const cancelled = runner.cancelBuild(broadcastBuild);
+    if (cancelled) broadcastBuildStatus('cancelled');
+    res.json({ success: true, cancelled });
+});
+
 // ===== WEBSOCKET =====
-wss.on('connection', (ws) => {
+wss.on('connection', (ws, req) => {
+    const origin = (req.headers && req.headers.origin) || '';
+    if (origin && !isLocalOrigin(origin)) {
+        ws.close(1008, 'Origin não permitida');
+        return;
+    }
     console.log('🔌 Cliente WebSocket conectado');
     let streamController = null;
     let pendingPlan = null;
@@ -1854,7 +1935,7 @@ wss.on('connection', (ws) => {
     });
 });
 
-module.exports = { app, server, resolveSafePath, extractJson, setProjectRoot, writeFileContent, readFileContent, listBackups, analyzeTask, executePlan, parseJsonC, buildOpenCodePrompt, snapshotProjectFiles, diffSnapshots, parseRemoteUrl, nextVersion, detectRepo, latestVersionTag };
+module.exports = { app, server, resolveSafePath, extractJson, setProjectRoot, writeFileContent, readFileContent, listBackups, analyzeTask, executePlan, parseJsonC, buildOpenCodePrompt, snapshotProjectFiles, diffSnapshots, parseRemoteUrl, nextVersion, detectRepo, latestVersionTag, runner };
 
 // =============================================
 //  INICIAR SERVIDOR (APENAS SE EXECUTADO DIRETO)

@@ -39,7 +39,7 @@ function parseRemoteUrl(url) {
     const u = String(url).trim();
     const stripGit = (r) => r.replace(/\.git$/, '').replace(/\/$/, '');
     // https://github.com/gitlab.com/…/owner/repo(.git)
-    let m = u.match(/https?:\/\/(github|gitlab)\.com\/([^\/\s]+?)(?:\/(.+?))?\/([^\/\s]+)(?:\.git)?$/i);
+    let m = u.match(/https?:\/\/(github|gitlab)\.com\/([^/\s]+?)(?:\/(.+?))?\/([^/\s]+)(?:\.git)?$/i);
     if (m) {
         let owner = m[3] ? `${m[2]}/${m[3]}` : m[2]; // grupos: owner é o namespace
         return { provider: m[1].toLowerCase(), owner: stripGit(owner), repo: stripGit(m[4]) };

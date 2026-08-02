@@ -29,6 +29,7 @@ let autoExecTimer = null;
 let autoExecCountdown = null;
 let isRunning = false;
 let runController = null;
+let runStreamed = false;
 let searchTimer = null;
 let editorTabs = [];        // { path, content, loaded, dirty, isImage, imageUrl }
 let activeTabPath = null;
@@ -175,6 +176,9 @@ document.addEventListener('DOMContentLoaded', () => {
     document.getElementById('pubCloseBtn').addEventListener('click', closePublishModal);
 
     document.getElementById('terminalBtn').addEventListener('click', openTerminal);
+    document.getElementById('buildBtn').addEventListener('click', openBuildModal);
+    document.getElementById('buildStartBtn').addEventListener('click', startBuild);
+    document.getElementById('buildCancelBtn').addEventListener('click', cancelBuild);
     document.getElementById('terminalRunBtn').addEventListener('click', () => {
         runTerminalCommand(document.getElementById('terminalInput').value.trim());
     });
@@ -376,7 +380,7 @@ function handleWsMessage(data) {
         }
         agentMessages[agent] += data.content;
         updateAgentMessage(agent, agentMessages[agent]);
-        if (agent === 'Sistema') taskActivityProgress(data.content.replace(/[\n✅❌📄🗑️✏️🆕]/g, ''));
+        if (agent === 'Sistema') taskActivityProgress(data.content.replace(/\n|✅|❌|📄|🗑️|✏️|🆕/g, ''));
         return;
     }
 
@@ -389,6 +393,40 @@ function handleWsMessage(data) {
 
     if (data.type === 'refresh') {
         if (currentProjectPath) loadFolderStructure(currentProjectPath);
+        return;
+    }
+
+    if (data.type === 'build-output') {
+        const el = document.getElementById('buildOutput');
+        if (el) {
+            el.textContent += data.line || '';
+            el.scrollTop = el.scrollHeight;
+        }
+        return;
+    }
+
+    if (data.type === 'build-status') {
+        const startBtn = document.getElementById('buildStartBtn');
+        const cancelBtn = document.getElementById('buildCancelBtn');
+        if (startBtn) startBtn.disabled = false;
+        if (cancelBtn) cancelBtn.disabled = true;
+        if (data.status === 'done') {
+            showToast('✅ Build concluído!');
+        } else if (data.status === 'cancelled') {
+            showToast('⏹️ Build cancelado.');
+        } else if (data.status === 'error') {
+            showToast('❌ Build falhou.');
+        }
+        return;
+    }
+
+    if (data.type === 'run-output') {
+        const el = document.getElementById('terminalOutput');
+        if (el && isRunning) {
+            runStreamed = true;
+            el.textContent += data.line || '';
+            el.scrollTop = el.scrollHeight;
+        }
         return;
     }
 
@@ -538,6 +576,7 @@ async function openFolderPicker() {
 
         if (pickerRoots.length > 0) {
             pickerCurrentPath = pickerRoots[0].path;
+            driveSelect.value = pickerCurrentPath;
             loadPickerFolder(pickerCurrentPath);
         } else {
             body.innerHTML = '<div style="padding:20px;text-align:center;color:#f85149;">❌ Nenhuma unidade encontrada</div>';
@@ -813,53 +852,7 @@ function renderExplorer(files, basePath) {
         return;
     }
 
-    const sorted = files.sort((a, b) => {
-        if (a.isDirectory && !b.isDirectory) return -1;
-        if (!a.isDirectory && b.isDirectory) return 1;
-        return a.name.localeCompare(b.name);
-    });
-
-    for (const item of sorted) {
-        const div = document.createElement('div');
-        const fullPath = item.path || (basePath ? `${basePath}/${item.name}` : item.name);
-
-        if (item.isDirectory) {
-            div.className = 'folder-item';
-            div.innerHTML = `
-                <span class="icon">📂</span>
-                <span class="name">${escapeHtml(item.name)}</span>
-                <span class="chevron">▶</span>
-            `;
-            const childrenDiv = document.createElement('div');
-            childrenDiv.className = 'children';
-            div.appendChild(childrenDiv);
-
-            div.addEventListener('click', async () => {
-                const isOpen = childrenDiv.classList.toggle('open');
-                div.querySelector('.chevron').classList.toggle('open');
-                if (isOpen && childrenDiv.children.length === 0) {
-                    const subFiles = await loadSubFolder(fullPath);
-                    if (subFiles) {
-                        renderSubFolder(childrenDiv, subFiles, fullPath);
-                    }
-                }
-            });
-
-        } else {
-            const status = fileStatusMap[fullPath] || 'normal';
-            div.className = `file-item ${STATUS_CLASSES[status] || 'status-normal'}`;
-            div.dataset.path = fullPath;
-            div.innerHTML = `
-                <span class="icon">${getFileIcon(item.name)}</span>
-                <span class="name">${escapeHtml(item.name)}</span>
-                <span class="status-dot"></span>
-            `;
-            div.addEventListener('click', () => {
-                openFile(fullPath);
-            });
-        }
-        container.appendChild(div);
-    }
+    renderSubFolder(container, files.slice(), '');
 }
 
 async function loadSubFolder(folderPath) {
@@ -876,9 +869,8 @@ async function loadSubFolder(folderPath) {
     }
 }
 
-function renderSubFolder(container, files, basePath) {
-    container.innerHTML = '';
-    const sorted = files.sort((a, b) => {
+async function renderSubFolder(container, files, basePath) {
+    const sorted = files.slice().sort((a, b) => {
         if (a.isDirectory && !b.isDirectory) return -1;
         if (!a.isDirectory && b.isDirectory) return 1;
         return a.name.localeCompare(b.name);
@@ -891,17 +883,18 @@ function renderSubFolder(container, files, basePath) {
         if (item.isDirectory) {
             div.className = 'folder-item';
             div.innerHTML = `
+                <span class="chevron">▶</span>
                 <span class="icon">📂</span>
                 <span class="name">${escapeHtml(item.name)}</span>
-                <span class="chevron">▶</span>
             `;
             const childrenDiv = document.createElement('div');
             childrenDiv.className = 'children';
             div.appendChild(childrenDiv);
 
-            div.addEventListener('click', async () => {
+            div.addEventListener('click', async (e) => {
+                e.stopPropagation();
                 const isOpen = childrenDiv.classList.toggle('open');
-                div.querySelector('.chevron').classList.toggle('open');
+                div.querySelector('.chevron').classList.toggle('open', isOpen);
                 if (isOpen && childrenDiv.children.length === 0) {
                     const subFiles = await loadSubFolder(fullPath);
                     if (subFiles) {
@@ -919,7 +912,8 @@ function renderSubFolder(container, files, basePath) {
                 <span class="name">${escapeHtml(item.name)}</span>
                 <span class="status-dot"></span>
             `;
-            div.addEventListener('click', () => {
+            div.addEventListener('click', (e) => {
+                e.stopPropagation();
                 openFile(fullPath);
             });
         }
@@ -1141,6 +1135,82 @@ function closeTerminal() {
     document.getElementById('terminalModal').style.display = 'none';
 }
 
+// =============================================
+//  EMPACOTAR / BUILD DA APLICAÇÃO
+// =============================================
+
+function openBuildModal() {
+    const dd = document.getElementById('buildDropdown');
+    if (dd.style.display !== 'none') {
+        dd.style.display = 'none';
+        return;
+    }
+    const btn = document.getElementById('buildBtn');
+    const rect = btn.getBoundingClientRect();
+    dd.style.left = Math.max(8, rect.right - 300) + 'px';
+    dd.style.top = (rect.bottom + 6) + 'px';
+    dd.style.display = 'block';
+    const out = document.getElementById('buildOutput');
+    out.textContent = 'Clique em "Iniciar Build".';
+}
+
+document.addEventListener('click', (e) => {
+    const dd = document.getElementById('buildDropdown');
+    if (!dd) return;
+    if (dd.style.display === 'none') return;
+    if (dd.contains(e.target)) return;
+    if (e.target.id === 'buildBtn') return;
+    dd.style.display = 'none';
+});
+
+async function startBuild() {
+    const platform = document.getElementById('buildPlatformSelect').value;
+    const arch = document.getElementById('buildArchSelect').value;
+    const format = document.getElementById('buildFormatSelect').value;
+    document.getElementById('buildOutput').textContent = '';
+    document.getElementById('buildStartBtn').disabled = true;
+    document.getElementById('buildCancelBtn').disabled = false;
+    try {
+        const res = await apiFetch('/api/build', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ platform, arch, format })
+        });
+        const data = await res.json();
+        if (!data.success) {
+            const el = document.getElementById('buildOutput');
+            el.textContent += `❌ ${data.error || 'Falha ao iniciar build'}\n`;
+            document.getElementById('buildStartBtn').disabled = false;
+            document.getElementById('buildCancelBtn').disabled = true;
+        }
+    } catch (e) {
+        const el = document.getElementById('buildOutput');
+        el.textContent += `❌ ${e.message}\n`;
+        document.getElementById('buildStartBtn').disabled = false;
+        document.getElementById('buildCancelBtn').disabled = true;
+    }
+}
+
+async function cancelBuild() {
+    try {
+        const res = await apiFetch('/api/build/cancel', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: '{}'
+        });
+        const data = await res.json();
+        if (data.cancelled) {
+            const el = document.getElementById('buildOutput');
+            el.textContent += '\n⏹️ Build cancelado.\n';
+        }
+    } catch (e) {
+        const el = document.getElementById('buildOutput');
+        el.textContent += `❌ ${e.message}\n`;
+    }
+    document.getElementById('buildStartBtn').disabled = false;
+    document.getElementById('buildCancelBtn').disabled = true;
+}
+
 function runTerminalCommand(command) {
     if (!command) return;
     if (!currentProjectPath) {
@@ -1161,6 +1231,7 @@ function runTerminalCommand(command) {
     runBtn.disabled = true;
 
     isRunning = true;
+    runStreamed = false;
     document.getElementById('sendButton').disabled = true;
     runController = new AbortController();
 
@@ -1174,8 +1245,12 @@ function runTerminalCommand(command) {
             });
             const data = await res.json();
             if (data.success) {
-                const txt = (data.output || '').trim() || '(sem saída)';
-                out.textContent += `${txt}\n\n[exit code: ${data.code}]\n\n`;
+                if (runStreamed) {
+                    out.textContent += `\n[exit code: ${data.code}]\n\n`;
+                } else {
+                    const txt = (data.output || '').trim() || '(sem saída)';
+                    out.textContent += `${txt}\n\n[exit code: ${data.code}]\n\n`;
+                }
             } else {
                 out.textContent += `❌ ${data.error || 'Erro ao executar'}\n\n`;
             }
@@ -1184,6 +1259,7 @@ function runTerminalCommand(command) {
         } finally {
             runController = null;
             isRunning = false;
+            runStreamed = false;
             runBtn.disabled = false;
             document.getElementById('sendButton').disabled = false;
             out.scrollTop = out.scrollHeight;

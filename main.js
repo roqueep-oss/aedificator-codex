@@ -214,6 +214,115 @@ function createWindow() {
 }
 
 // =============================================
+//  EMPACOTAMENTO (BUILD DA APLICAÇÃO)
+// =============================================
+
+let buildProcess = null;
+
+function resolveBuilderPath() {
+    const candidates = [
+        path.join(__dirname, 'node_modules', 'electron-builder', 'out', 'cli', 'cli.js'),
+        path.join(__dirname, 'node_modules', 'electron-builder', 'cli.js'),
+        path.join(__dirname, 'node_modules', '.bin', process.platform === 'win32' ? 'electron-builder.cmd' : 'electron-builder')
+    ];
+    for (const c of candidates) {
+        try { if (fs.existsSync(c)) return c; } catch (e) {}
+    }
+    return null;
+}
+
+ipcMain.handle('build-app', async (event, options = {}) => {
+    if (buildProcess) {
+        return { success: false, error: 'Já existe um build em andamento. Aguarde ou cancele.' };
+    }
+
+    const platform = options.platform || 'win';
+    const arch = options.arch || 'x64';
+    const format = options.format || 'nsis';
+    const builder = resolveBuilderPath();
+
+    if (!builder) {
+        return { success: false, error: 'electron-builder não encontrado. Execute "npm install" antes de compilar.' };
+    }
+
+    const send = (line) => {
+        try {
+            if (event.sender && !event.sender.isDestroyed()) {
+                event.sender.send('build-output', line);
+            }
+        } catch (e) {}
+    };
+    send(`🚀 Iniciando build: ${platform}/${arch} (${format})...\n`);
+
+    const isJs = builder.endsWith('.js');
+    const args = [];
+    if (isJs) {
+        args.push(builder);
+    } else {
+        args.push('electron-builder');
+    }
+    args.push(`--${platform}`, arch);
+    if (format !== 'nsis') {
+        args.push(`-c.${platform}.target=${format}`);
+    }
+
+    const nodeBin = process.env.npm_node_execpath || 'node';
+    const spawnOptions = {
+        cwd: __dirname,
+        env: { ...process.env, CSC_IDENTITY_AUTO_DISCOVERY: 'false' },
+        windowsHide: true
+    };
+
+    return new Promise((resolve) => {
+        let output = '';
+        let child = null;
+        try {
+            child = isJs
+                ? spawn(nodeBin, args, spawnOptions)
+                : spawn(builder, ['electron-builder', ...args.slice(1)], { ...spawnOptions, shell: process.platform === 'win32' });
+        } catch (e) {
+            resolve({ success: false, error: e.message });
+            return;
+        }
+
+        buildProcess = child;
+        child.stdout.on('data', (d) => {
+            const text = d.toString();
+            output += text;
+            send(text);
+        });
+        child.stderr.on('data', (d) => {
+            const text = d.toString();
+            output += text;
+            send(text);
+        });
+        child.on('close', (code) => {
+            buildProcess = null;
+            send(code === 0 ? '\n✅ Build concluído!\n' : `\n❌ Build falhou (código ${code}).\n`);
+            resolve({ success: code === 0, code, output: output.slice(-4000) });
+        });
+        child.on('error', (err) => {
+            buildProcess = null;
+            send(`❌ Erro ao iniciar build: ${err.message}\n`);
+            resolve({ success: false, error: err.message });
+        });
+    });
+});
+
+ipcMain.handle('build-cancel', () => {
+    if (buildProcess) {
+        try {
+            buildProcess.kill();
+            buildProcess = null;
+            return { success: true, cancelled: true };
+        } catch (e) {
+            return { success: false, error: e.message };
+        }
+    }
+    return { success: true, cancelled: false };
+});
+
+// =============================================
 //  IPC HANDLERS (COMUNICAÇÃO FRONTEND-BACKEND)
 // =============================================
 

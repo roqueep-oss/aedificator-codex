@@ -1,4 +1,5 @@
 @echo off
+chcp 65001 >nul
 title Aedificator Codex
 cd /d "%~dp0"
 
