@@ -18,6 +18,7 @@ backend/projects/
 scripts/.env.local
 
 # Backups gerados pelo app
+.aedificator-codex-ide-backup/
 .aedificator-backup/
 
 # Logs

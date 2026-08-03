@@ -20,7 +20,7 @@
     "node_modules/",
     "dist/",
     "build/",
-    ".aedificator-backup/",
+    ".aedificator-codex-ide-backup/",
     "*.min.js"
   ]
 }

@@ -1,5 +1,5 @@
 // =============================================
-//  AEDIFICATOR CODEX - PUBLICAÇÃO GITHUB + GITLAB
+//  AEDIFICATOR CODEX IDE - PUBLICAÇÃO GITHUB + GITLAB
 //  Uso: node scripts/publish.js [github|gitlab|all] [win|win32|mac|linux]
 //  Detecta automaticamente o repositório a partir do `git remote -v`.
 // =============================================

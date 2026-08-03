@@ -5,7 +5,7 @@ const fs = require('fs');
 const net = require('net');
 const crypto = require('crypto');
 
-console.log('🏗️ Aedificator Codex iniciando...');
+console.log('🏗️ Aedificator Codex IDE iniciando...');
 console.log('📂 Diretório:', __dirname);
 
 // ===== CONTROLE DE INSTÂNCIA ÚNICA =====
@@ -144,7 +144,7 @@ function createWindow() {
         },
         icon: path.join(__dirname, 'build', 'icon.ico'),
         show: false,
-        title: 'Aedificator Codex',
+        title: 'Aedificator Codex IDE',
         backgroundColor: '#0d1117'
     });
 
@@ -409,7 +409,7 @@ process.on('uncaughtException', (error) => {
     console.error('❌ Erro não tratado:', error);
 });
 
-console.log('🏗️ Aedificator Codex aguardando eventos...');
+console.log('🏗️ Aedificator Codex IDE aguardando eventos...');
 console.log('💡 Funcionalidades disponíveis:');
 console.log('   - Selecionar pasta (explorador nativo)');
 console.log('   - Abrir pasta no explorador do sistema');

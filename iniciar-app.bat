@@ -1,10 +1,10 @@
 @echo off
 chcp 65001 >nul
-title Aedificator Codex
+title Aedificator Codex IDE
 cd /d "%~dp0"
 
 echo ============================================
-echo    Aedificator Codex - Iniciar
+echo    Aedificator Codex IDE - Iniciar
 echo ============================================
 echo.
 

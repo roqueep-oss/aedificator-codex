@@ -168,7 +168,7 @@ function saveConfigToFile() {
 //  SISTEMA DE ARQUIVOS
 // =============================================
 
-const BACKUP_DIR_NAME = '.aedificator-backup';
+const BACKUP_DIR_NAME = '.aedificator-codex-ide-backup';
 const IGNORED_DIRS = new Set(['node_modules', '.git', 'dist', 'build', '.next', '.cache', BACKUP_DIR_NAME]);
 const MAX_CONTEXT_FILES = 500;
 
@@ -638,7 +638,7 @@ function buildOpenCodePrompt(message, mode, history) {
         ? history.slice(-15).map(h => `- ${h.role === 'user' ? 'Usuário' : 'Assistente'}: ${String(h.content || '').slice(0, 800)}`).join('\n')
         : '(sem histórico)';
 
-    return `Você é o Aedificator Codex, um assistente de desenvolvimento prático que opera no diretório atual do projeto.
+    return `Você é o Aedificator Codex IDE, um assistente de desenvolvimento prático que opera no diretório atual do projeto.
 
 MODO ATIVO: ${modeInstruction}
 
@@ -647,7 +647,11 @@ SOLICITAÇÃO DO USUÁRIO: "${message}"
 HISTÓRICO DA CONVERSA:
 ${historyText}
 
-Execute a solicitação diretamente no diretório do projeto. Se precisar criar ou modificar arquivos, faça isso.`;
+Execute a solicitação no diretório do projeto seguindo estas REGRAS:
+- Se o pedido for uma pergunta, análise ou opinião, APENAS responda sem alterar nenhum arquivo.
+- Só crie/modifique/delete arquivos se o usuário pedir EXPLICITAMENTE.
+- NUNCA faça mudanças drásticas (refatorações grandes, reescritas completas, reorganização) sem o usuário pedir explicitamente. Prefira alterações mínimas.
+- SEJA CONCISO: responda de forma curta e direta. Nada de explicações longas, listas extensas ou repetições. Vá direto ao ponto.`;
 }
 
 // ===== SNAPSHOT DOS ARQUIVOS PARA DETECTAR MUDANÇAS DO OPEncode =====
@@ -751,7 +755,7 @@ async function callOpenCode(prompt, onChunk, signal, model) {
         useModel = 'opencode/' + useModel;
     }
     args.push('--model', useModel);
-    args.push('--title', 'Aedificator');
+    args.push('--title', 'Aedificator Codex IDE');
     args.push(prompt);
     let child;
     try {
@@ -930,7 +934,7 @@ function extractJson(text) {
 //  MODOS DE TRABALHO
 // =============================================
 const MODE_INSTRUCTIONS = {
-    cowork: 'Modo Equipe: execute a solicitação normalmente, criando ou modificando os arquivos necessários para atender ao pedido.',
+    cowork: 'Modo Equipe (conservador): se o usuário fizer uma pergunta, análise ou pedir opinião/sugestões, responda no "resumo" e NÃO altere arquivos (deixe "arquivos" como []). Só crie/modifique/delete arquivos se o usuário pedir EXPLICITAMENTE. Nunca faça mudanças drásticas (refatorações grandes, reescritas completas, reorganização de pastas, criação de muitos arquivos) a menos que o usuário peça explicitamente. Prefira sempre alterações mínimas e localizadas.',
     clarify: 'Modo Esclarecer: NÃO altere nenhum arquivo. Apenas faça perguntas de esclarecimento. Responda com um JSON onde "resumo" contém suas perguntas e "arquivos" é uma lista VAZIA [].',
     code: 'Modo Código: foque exclusivamente em código. Faça apenas as alterações mínimas necessárias e mantenha explicações curtas.',
     acp: 'Modo Arquitetura: foque na arquitetura do sistema. Prefira criar ou atualizar um documento de arquitetura (ex.: ARQUITETURA.md) descrevendo a solução, em vez de alterar código diretamente.'
@@ -951,7 +955,7 @@ async function analyzeTask(message, onChunk, signal, mode = 'cowork', history = 
     console.log(`📁 Projeto: ${PROJECT_ROOT}`);
     console.log(`📄 Arquivos no contexto: ${allFiles.length}`);
 
-    const analysisPrompt = `Você é um assistente de desenvolvimento prático.
+    const analysisPrompt = `Você é o Aedificator Codex IDE, um assistente de desenvolvimento prático e CUIDADOSO. O código de um projeto é uma arte: respeite a estrutura existente e nunca imponha mudanças sem o usuário decidir.
 
 DIRETÓRIO DO PROJETO: ${PROJECT_ROOT}
 
@@ -968,42 +972,88 @@ MODO ATIVO: ${modeInstruction}
 HISTÓRICO DA CONVERSA:
 ${historyText}
 
-TAREFA:
-1. Analise o que o usuário pediu
-2. Identifique quais arquivos precisam ser criados ou modificados
-3. Para CADA arquivo, especifique:
-   - Caminho completo do arquivo (ex: src/index.js)
-   - Ação: "criar", "modificar" ou "deletar"
-   - Conteúdo completo (se criar ou modificar)
-   - Explicação da mudança
+DECIDA O FORMATO DA RESPOSTA CONFORME A SOLICITAÇÃO:
 
-Responda APENAS com um JSON válido no formato:
+CASO A — SOLICITAÇÃO DE MELHORIA / SUGESTÃO / OPINIÃO (ex.: "existe algo para melhorar?", "o que você sugere?", "tem alguma coisa errada no app?"):
+1. Faça uma análise DETALHADA e cuidadosa do projeto como um todo.
+2. Proponha várias melhorias RELACIONADAS, ORGANIZADAS por categoria (ex.: usabilidade, desempenho, segurança, manutenção, arquitetura, código limpo).
+3. Para CADA sugestão, especifique: titulo (nome curto), descricao (detalhada), impacto ("baixo", "médio" ou "alto") e arquivos (lista dos arquivos que seriam alterados).
+4. Cada sugestão deve ser MÍNIMA e LOCALIZADA. NUNCA sugira reescrever o app inteiro nem mudanças drásticas. Se a mudança afetar muitas áreas, quebre em sugestões menores e independentes.
+5. Apenas PROPOSTAS — você não altera nada por conta própria; o usuário escolherá o que aplicar, item por item.
+6. LIMITE: no máximo 4 sugestões. Cada sugestão altera no máximo 2 arquivos. NUNCA proponha reescrever arquivos que já funcionam — só pequenas melhorias pontuais.
+
+CASO B — PEDIDO EXPLÍCITO DE ALTERAÇÃO (o usuário pediu claramente para criar, corrigir, modificar ou deletar arquivos):
+1. Identifique os arquivos que precisam ser criados ou modificados.
+2. Para CADA arquivo, especifique: caminho, ação, conteúdo completo e explicação.
+3. Faça APENAS o que foi pedido, da forma mais mínima possível.
+4. LIMITE: no máximo 5 arquivos no total, apenas os necessários para atender ao pedido.
+
+Responda APENAS com um JSON válido em UM dos formatos abaixo.
+
+FORMATO A (melhorias/sugestões):
 {
-  "resumo": "Resumo do que será feito",
-  "arquivos": [
+  "resumo": "MÁXIMO 2-3 frases curtas com a análise geral",
+  "sugestoes": [
     {
-      "caminho": "src/index.js",
-      "acao": "modificar",
-      "conteudo": "conteúdo completo do arquivo",
-      "explicacao": "por que esta mudança é necessária"
+      "id": "s1",
+      "titulo": "Título curto da melhoria",
+      "descricao": "MÁXIMO 2 frases",
+      "impacto": "baixo",
+      "arquivos": [
+        { "caminho": "src/index.js", "acao": "modificar", "conteudo": "conteúdo completo do arquivo", "explicacao": "uma frase curta" }
+      ]
     }
   ]
 }
 
-IMPORTANTE: 
-- Seja específico
+FORMATO B (alterações diretas):
+{
+  "resumo": "Resumo curto do que será feito",
+  "arquivos": [
+    { "caminho": "src/index.js", "acao": "modificar", "conteudo": "conteúdo completo do arquivo", "explicacao": "uma frase curta" }
+  ]
+}
+
+REGRAS GERAIS:
+- SEJA CONCISO E PRECISO: "resumo" com no máximo 2-3 frases. "descricao" com no máximo 2 frases. "explicacao" com uma única frase curta. "titulo" curto (5-8 palavras). Sem introduções longas, sem repetições, sem listar o que não foi pedido.
+- REGRA DE OURO: NUNCA faça mudanças drásticas (refatorações grandes, reescritas completas, reorganização de pastas, alterar o app inteiro) sem o usuário pedir EXPLICITAMENTE. O código é uma arte — seja cuidadoso e conservador.
+- Perguntas de opinião/análise usam o FORMATO A (sugestoes). O usuário decidirá, uma a uma, o que aplicar.
+- Pedidos concretos de alteração usam o FORMATO B e fazem só o que foi pedido.
+- Prefira sempre alterações mínimas e localizadas.
 - O conteúdo deve ser COMPLETO (o arquivo inteiro)
 - Se for criar, inclua todo o conteúdo necessário
 - Se for modificar, inclua o arquivo inteiro com as alterações`;
 
     if (onChunk) onChunk('Assistente', '🔍 Analisando estrutura do projeto...\n');
 
-    const response = await callAI(provider, analysisPrompt, (chunk) => {
-        if (onChunk) onChunk('Assistente', chunk);
-    }, signal);
+    const response = await callAI(provider, analysisPrompt, null, signal);
 
     const plan = extractJson(response);
-    if (!plan || !Array.isArray(plan.arquivos)) {
+    if (!plan) {
+        throw new Error('Não foi possível interpretar a resposta da IA.');
+    }
+
+    if (onChunk) {
+        const resumo = String(plan.resumo || '').trim();
+        if (resumo) onChunk('Assistente', '📋 ' + resumo + '\n');
+    }
+
+    if (Array.isArray(plan.sugestoes) && plan.sugestoes.length > 0) {
+        for (const sugestao of plan.sugestoes) {
+            if (!sugestao.titulo) throw new Error('Sugestão sem título.');
+            if (!Array.isArray(sugestao.arquivos)) sugestao.arquivos = [];
+            for (const arquivo of sugestao.arquivos) {
+                if (!arquivo.caminho) throw new Error('Sugestão com arquivo sem caminho.');
+                if (!['criar', 'modificar', 'deletar'].includes(arquivo.acao)) {
+                    arquivo.acao = 'modificar';
+                }
+            }
+        }
+        plan.arquivos = [];
+        return plan;
+    }
+
+    if (!Array.isArray(plan.arquivos)) {
         throw new Error('Não foi possível interpretar a resposta da IA.');
     }
 
@@ -1217,7 +1267,7 @@ app.post('/api/backup/restore', (req, res) => {
 });
 
 // ===== SNAPSHOTS ROTULADOS (versões completas da pasta) =====
-// Guarda cópias completas rotuladas em .aedificator-backup/snapshots/<rotulo>/,
+// Guarda cópias completas rotuladas em .aedificator-codex-ide-backup/snapshots/<rotulo>/,
 // ignorando pastas grandes (node_modules, .git, dist, build) e binários maiores que o limite.
 const SNAPSHOT_ROOT = () => path.join(PROJECT_ROOT, BACKUP_DIR_NAME, 'snapshots');
 const SNAPSHOT_MAX_FILE = 10 * 1024 * 1024; // 10 MB por arquivo
@@ -1860,17 +1910,35 @@ wss.on('connection', (ws, req) => {
                 const planId = crypto.randomBytes(8).toString('hex');
                 pendingPlan = { id: planId, plan, controller: streamController };
 
-                ws.send(JSON.stringify({
+                const hasSuggestions = Array.isArray(plan.sugestoes) && plan.sugestoes.length > 0;
+                const payload = {
                     type: 'approval',
                     planId,
-                    total: plan.arquivos.length,
-                    resumo: plan.resumo || '',
-                    arquivos: plan.arquivos.map(a => ({
+                    total: hasSuggestions
+                        ? plan.sugestoes.reduce((n, s) => n + (Array.isArray(s.arquivos) ? s.arquivos.length : 0), 0)
+                        : plan.arquivos.length,
+                    resumo: plan.resumo || ''
+                };
+                if (hasSuggestions) {
+                    payload.sugestoes = plan.sugestoes.map((s, i) => ({
+                        id: s.id || 's' + (i + 1),
+                        titulo: s.titulo || 'Sugestão ' + (i + 1),
+                        descricao: s.descricao || '',
+                        impacto: s.impacto || 'médio',
+                        arquivos: (Array.isArray(s.arquivos) ? s.arquivos : []).map(a => ({
+                            caminho: a.caminho,
+                            acao: a.acao,
+                            explicacao: a.explicacao || ''
+                        }))
+                    }));
+                } else {
+                    payload.arquivos = plan.arquivos.map(a => ({
                         caminho: a.caminho,
                         acao: a.acao,
                         explicacao: a.explicacao || ''
-                    }))
-                }));
+                    }));
+                }
+                ws.send(JSON.stringify(payload));
             } catch (error) {
                 const cancelled = error && error.name === 'AbortError';
                 ws.send(JSON.stringify({
@@ -1911,7 +1979,19 @@ wss.on('connection', (ws, req) => {
             };
 
             try {
-                const result = await executePlan(plan, onChunk, controller.signal);
+                let filesToExecute;
+                if (Array.isArray(plan.sugestoes) && plan.sugestoes.length > 0) {
+                    const selected = new Set(Array.isArray(data.selecionadas) ? data.selecionadas : []);
+                    filesToExecute = [];
+                    for (const s of plan.sugestoes) {
+                        if (selected.has(s.id) && Array.isArray(s.arquivos)) {
+                            filesToExecute.push(...s.arquivos);
+                        }
+                    }
+                } else {
+                    filesToExecute = plan.arquivos || [];
+                }
+                await executePlan({ resumo: plan.resumo || '', arquivos: filesToExecute }, onChunk, controller.signal);
                 ws.send(JSON.stringify({ type: 'done' }));
             } catch (error) {
                 const cancelled = error && error.name === 'AbortError';
@@ -1942,7 +2022,7 @@ module.exports = { app, server, resolveSafePath, extractJson, setProjectRoot, wr
 // =============================================
 if (require.main === module) {
     server.listen(PORT, '127.0.0.1', () => {
-        console.log(`✅ Aedificator Codex Backend rodando na porta ${PORT}`);
+        console.log(`✅ Aedificator Codex IDE Backend rodando na porta ${PORT}`);
         console.log(`🔗 http://localhost:${PORT}/api/health`);
         console.log(`📁 Diretório do projeto: ${PROJECT_ROOT}`);
     });
@@ -1959,7 +2039,7 @@ if (require.main === module) {
         console.error('❌ Erro não tratado:', error);
     });
 
-    console.log('🏗️ Aedificator Codex Backend inicializando...');
+    console.log('🏗️ Aedificator Codex IDE Backend inicializando...');
     console.log(`📁 Diretório base: ${PROJECT_ROOT}`);
     console.log('🎯 Modo AUTOMÁTICO - Analisa e altera arquivos automaticamente!');
 }

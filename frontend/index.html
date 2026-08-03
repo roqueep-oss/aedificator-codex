@@ -3,7 +3,7 @@
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>Aedificator Codex</title>
+    <title>Aedificator Codex IDE</title>
     <style>
         * {
             margin: 0;
@@ -562,6 +562,34 @@
             border-radius: 10px;
             font-size: 10px;
             color: #58a6ff;
+        }
+        .message .user-badge {
+            background: rgba(31, 111, 235, 0.25);
+            padding: 0 10px;
+            border-radius: 10px;
+            font-size: 10px;
+            color: #d2e3ff;
+        }
+        .msg-copy-btn {
+            margin-left: auto;
+            background: none;
+            border: none;
+            cursor: pointer;
+            font-size: 12px;
+            line-height: 1;
+            opacity: 0.45;
+            padding: 3px 7px;
+            border-radius: 6px;
+            color: #8b949e;
+        }
+        .msg-copy-btn:hover {
+            opacity: 1;
+            background: rgba(255, 255, 255, 0.08);
+            color: #e6edf3;
+        }
+        .msg-copy-btn.copied {
+            opacity: 1;
+            color: #3fb950;
         }
 
         /* ===== INPUT ===== */
@@ -1130,6 +1158,108 @@
             color: #58a6ff;
             text-align: center;
             min-height: 16px;
+        }
+        .approval-suggestions {
+            flex: 1;
+            overflow-y: auto;
+            border: 1px solid #30363d;
+            border-radius: 8px;
+            min-height: 140px;
+            max-height: 45vh;
+        }
+        .suggestion-item {
+            border-bottom: 1px solid #21262d;
+            padding: 10px 12px;
+            display: flex;
+            flex-direction: column;
+            gap: 6px;
+        }
+        .suggestion-item:last-child {
+            border-bottom: none;
+        }
+        .suggestion-header {
+            display: flex;
+            align-items: center;
+            gap: 8px;
+        }
+        .suggestion-check {
+            display: flex;
+            align-items: flex-start;
+            gap: 8px;
+            cursor: pointer;
+            flex: 1;
+        }
+        .suggestion-cb {
+            margin-top: 2px;
+            accent-color: #58a6ff;
+            width: 15px;
+            height: 15px;
+            flex-shrink: 0;
+        }
+        .suggestion-title {
+            color: #e6edf3;
+            font-size: 13px;
+            font-weight: 600;
+        }
+        .suggestion-impact {
+            flex-shrink: 0;
+            font-size: 11px;
+            font-weight: 600;
+            padding: 2px 8px;
+            border-radius: 10px;
+            white-space: nowrap;
+        }
+        .suggestion-impact.baixo {
+            background: rgba(63, 185, 80, 0.15);
+            color: #3fb950;
+        }
+        .suggestion-impact.médio, .suggestion-impact.medio {
+            background: rgba(210, 153, 34, 0.15);
+            color: #d29922;
+        }
+        .suggestion-impact.alto {
+            background: rgba(248, 81, 73, 0.15);
+            color: #f85149;
+        }
+        .suggestion-desc {
+            color: #8b949e;
+            font-size: 12px;
+            line-height: 1.5;
+            padding-left: 23px;
+        }
+        .suggestion-files {
+            padding-left: 23px;
+            font-size: 12px;
+        }
+        .suggestion-files summary {
+            color: #58a6ff;
+            cursor: pointer;
+            margin-bottom: 4px;
+        }
+        .suggestion-file {
+            color: #c9d1d9;
+            padding: 3px 0;
+            word-break: break-all;
+            display: flex;
+            align-items: center;
+            gap: 6px;
+        }
+        .suggestion-actions {
+            display: flex;
+            gap: 8px;
+            margin-top: 2px;
+        }
+        .btn-link {
+            background: none;
+            border: none;
+            color: #58a6ff;
+            cursor: pointer;
+            font-size: 12px;
+            padding: 0;
+            text-decoration: underline;
+        }
+        .btn-link:hover {
+            color: #79c0ff;
         }
 
         /* ===== EDITOR DE ARQUIVOS ===== */
@@ -2116,7 +2246,7 @@ body.theme-light .chat-area,
 
     <!-- ===== HEADER ===== -->
     <div class="header">
-        <h1>🏗️ Aedificator <span>Codex</span></h1>
+        <h1>🏗️ Aedificator <span>Codex IDE</span></h1>
         <div class="controls">
             <select id="modelSelect">
                 <option value="gemini">Gemini 3.5</option>
@@ -2204,7 +2334,7 @@ body.theme-light .chat-area,
                 <button class="btn-theme" id="clearChatBtn" title="Limpar conversa">🗑️ Limpar</button>
             </div>
             <div id="messages">
-                <div class="message system">👋 Bem-vindo ao Aedificator Codex!</div>
+                <div class="message system">👋 Bem-vindo ao Aedificator Codex IDE!</div>
                 <div class="message system">📁 Selecione uma pasta para começar a trabalhar.</div>
                 <div class="message system">💡 Exemplo: "Crie um arquivo server.js com Express"</div>
             </div>
@@ -2226,7 +2356,7 @@ body.theme-light .chat-area,
 
     <!-- ===== FOOTER ===== -->
     <div class="footer">
-        <span id="appVersion">Aedificator Codex v1.0.0</span>
+        <span id="appVersion">Aedificator Codex IDE v1.0.0</span>
         <span id="backendStatus" class="status-offline">🔴 Desconectado</span>
     </div>
 
@@ -2292,15 +2422,22 @@ body.theme-light .chat-area,
     <div id="approvalModal">
         <div class="modal-content">
             <h2>📋 Aprovar Plano</h2>
-            <p class="modal-desc">A IA gerou o seguinte plano de alterações. Revise e aprove:</p>
+            <p class="modal-desc" id="approvalDesc">A IA gerou o seguinte plano de alterações. Revise e aprove:</p>
 
             <div class="approval-resumo" id="approvalResumo"></div>
 
+            <div class="approval-suggestions" id="approvalSuggestions" style="display:none;"></div>
+
             <div class="approval-list" id="approvalFilesList"></div>
+
+            <div class="suggestion-actions" id="suggestionQuickActions" style="display:none;">
+                <button class="btn-link" id="suggestAllBtn">☑ Selecionar todas</button>
+                <button class="btn-link" id="suggestNoneBtn">☐ Limpar seleção</button>
+            </div>
 
             <div class="approval-options">
                 <label class="approval-check">
-                    <input type="checkbox" id="autoExecCheckbox" checked> ⚡ Executar automaticamente
+                    <input type="checkbox" id="autoExecCheckbox"> ⚡ Executar automaticamente após o tempo (não recomendado)
                 </label>
             </div>
 

@@ -38,11 +38,11 @@ let activitySeq = 0;
 let actTaskId = null;
 let repoInfo = null;
 
-const CHAT_HISTORY_KEY = 'aedificator_chat_history';
-const RECENT_PROJECTS_KEY = 'aedificator_recent_projects';
-const THEME_KEY = 'aedificator_theme';
-const AUTO_EXEC_KEY = 'aedificator_auto_exec';
-const OPENCODE_KEY = 'aedificator_use_opencode';
+const CHAT_HISTORY_KEY = 'aedificator_codex_ide_chat_history';
+const RECENT_PROJECTS_KEY = 'aedificator_codex_ide_recent_projects';
+const THEME_KEY = 'aedificator_codex_ide_theme';
+const AUTO_EXEC_KEY = 'aedificator_codex_ide_auto_exec';
+const OPENCODE_KEY = 'aedificator_codex_ide_use_opencode';
 
 // =============================================
 //  UTILIDADES
@@ -105,7 +105,7 @@ async function apiFetch(path, options = {}) {
 //  INICIALIZAÇÃO
 // =============================================
 document.addEventListener('DOMContentLoaded', () => {
-    console.log('🚀 Aedificator Codex com Explorador Nativo iniciando...');
+    console.log('🚀 Aedificator Codex IDE com Explorador Nativo iniciando...');
 
     if (window.electronAPI) {
         window.electronAPI.getBackendUrl().then((url) => {
@@ -221,6 +221,12 @@ document.addEventListener('DOMContentLoaded', () => {
         executePendingPlan();
     });
     document.getElementById('approvalCancelBtn').addEventListener('click', cancelApproval);
+    document.getElementById('suggestAllBtn').addEventListener('click', () => {
+        document.querySelectorAll('.suggestion-cb').forEach(cb => { cb.checked = true; });
+    });
+    document.getElementById('suggestNoneBtn').addEventListener('click', () => {
+        document.querySelectorAll('.suggestion-cb').forEach(cb => { cb.checked = false; });
+    });
 
     document.getElementById('fileEditorSaveBtn').addEventListener('click', saveFileEditor);
     document.getElementById('fileEditorCloseBtn').addEventListener('click', closeFileEditor);
@@ -450,7 +456,7 @@ function handleWsMessage(data) {
 //  ÚLTIMA PASTA USADA / PROJETOS RECENTES
 // =============================================
 function tryLoadLastFolder() {
-    const lastPath = localStorage.getItem('aedificator_last_path');
+    const lastPath = localStorage.getItem('aedificator_codex_ide_last_path');
     if (lastPath) {
         console.log(`📁 Carregando última pasta: ${lastPath}`);
         currentProjectPath = lastPath;
@@ -471,7 +477,7 @@ function tryLoadLastFolder() {
 }
 
 function saveLastFolder(path) {
-    localStorage.setItem('aedificator_last_path', path);
+    localStorage.setItem('aedificator_codex_ide_last_path', path);
 }
 
 function getRecentProjects() {
@@ -682,7 +688,7 @@ function unlinkFolder() {
             </div>
         `;
         setLinkedStatus(false);
-        localStorage.removeItem('aedificator_last_path');
+        localStorage.removeItem('aedificator_codex_ide_last_path');
         restoreChatHistory();
         repoInfo = null;
         document.getElementById('publishVersionBtn').disabled = true;
@@ -1296,7 +1302,7 @@ function clearChat() {
 
 function exportChat() {
     const container = document.getElementById('messages');
-    let text = `Aedificator Codex - Conversa\n${new Date().toLocaleString()}\n\n`;
+    let text = `Aedificator Codex IDE - Conversa\n${new Date().toLocaleString()}\n\n`;
     for (const div of container.children) {
         const role = div.classList.contains('user') ? 'Usuário' : div.classList.contains('agent') ? 'Assistente' : 'Sistema';
         const contentEl = div.querySelector('.msg-content') || div.querySelector('.cmd-output');
@@ -1543,17 +1549,19 @@ function closeFileEditor() {
 // =============================================
 //  APROVAÇÃO DO PLANO
 // =============================================
-let autoExecute = true;
+let autoExecute = false;
 
 function initAutoExec() {
     try {
-        autoExecute = localStorage.getItem(AUTO_EXEC_KEY) !== '0';
+        autoExecute = localStorage.getItem(AUTO_EXEC_KEY) === '1';
     } catch (e) {}
     document.getElementById('autoExecCheckbox').checked = autoExecute;
 }
 
 function showApprovalModal(data) {
-    if (!data.arquivos || data.arquivos.length === 0) {
+    const hasSuggestions = Array.isArray(data.sugestoes) && data.sugestoes.length > 0;
+
+    if (!hasSuggestions && (!data.arquivos || data.arquivos.length === 0)) {
         showToast('📋 Nada a executar');
         executePendingPlan();
         return;
@@ -1561,10 +1569,40 @@ function showApprovalModal(data) {
 
     pendingApproval = data;
     document.getElementById('approvalResumo').textContent = data.resumo || '';
+
+    const suggEl = document.getElementById('approvalSuggestions');
+    const filesEl = document.getElementById('approvalFilesList');
+    const quickActions = document.getElementById('suggestionQuickActions');
+    const descEl = document.getElementById('approvalDesc');
+
+    if (hasSuggestions) {
+        descEl.textContent = 'A IA propôs as melhorias abaixo. Marque na lista as que você quer aplicar e clique em Executar:';
+        suggEl.style.display = 'block';
+        filesEl.style.display = 'none';
+        quickActions.style.display = 'flex';
+        renderSuggestions(data.sugestoes);
+    } else {
+        descEl.textContent = 'A IA gerou o seguinte plano de alterações. Revise e aprove:';
+        suggEl.style.display = 'none';
+        filesEl.style.display = 'block';
+        quickActions.style.display = 'none';
+        renderApprovalFiles(data.arquivos);
+    }
+
+    document.getElementById('approvalModal').style.display = 'flex';
+    setProgress(data.total || 0);
+
+    if (autoExecute) {
+        startAutoExecCountdown();
+    } else {
+        stopAutoExecCountdown();
+    }
+}
+
+function renderApprovalFiles(arquivos) {
     const list = document.getElementById('approvalFilesList');
     list.innerHTML = '';
-
-    for (const f of data.arquivos) {
+    for (const f of arquivos) {
         const row = document.createElement('div');
         row.className = 'approval-file';
         const actionText = f.acao === 'criar' ? '🆕 Criar' : f.acao === 'deletar' ? '🗑️ Deletar' : '✏️ Modificar';
@@ -1576,14 +1614,35 @@ function showApprovalModal(data) {
         if (f.explicacao) row.title = f.explicacao;
         list.appendChild(row);
     }
+}
 
-    document.getElementById('approvalModal').style.display = 'flex';
-    setProgress(data.total);
-
-    if (autoExecute) {
-        startAutoExecCountdown();
-    } else {
-        stopAutoExecCountdown();
+function renderSuggestions(sugestoes) {
+    const container = document.getElementById('approvalSuggestions');
+    container.innerHTML = '';
+    for (const s of sugestoes) {
+        const div = document.createElement('div');
+        div.className = 'suggestion-item';
+        const impacto = String(s.impacto || 'médio').toLowerCase();
+        const files = Array.isArray(s.arquivos) ? s.arquivos : [];
+        const filesHtml = files.length
+            ? `<details class="suggestion-files"><summary>Arquivos (${files.length})</summary>${files.map(f => {
+                const actionText = f.acao === 'criar' ? '🆕 Criar' : f.acao === 'deletar' ? '🗑️ Deletar' : '✏️ Modificar';
+                const actionClass = f.acao === 'criar' ? 'acao-criar' : f.acao === 'deletar' ? 'acao-deletar' : 'acao-modificar';
+                return `<div class="suggestion-file"><span class="approval-acao ${actionClass}">${actionText}</span><span>${escapeHtml(f.caminho)}</span></div>`;
+            }).join('')}</details>`
+            : '';
+        div.innerHTML = `
+            <div class="suggestion-header">
+                <label class="suggestion-check">
+                    <input type="checkbox" class="suggestion-cb" value="${escapeHtml(s.id || '')}">
+                    <span class="suggestion-title">${escapeHtml(s.titulo || 'Sugestão')}</span>
+                </label>
+                <span class="suggestion-impact ${escapeHtml(impacto)}">${escapeHtml(impacto === 'médio' ? 'médio' : impacto)}</span>
+            </div>
+            <div class="suggestion-desc">${escapeHtml(s.descricao || '')}</div>
+            ${filesHtml}
+        `;
+        container.appendChild(div);
     }
 }
 
@@ -1618,11 +1677,28 @@ function stopAutoExecCountdown() {
 function executePendingPlan() {
     if (!pendingApproval) return;
     const planId = pendingApproval.planId;
-    const total = pendingApproval.total;
+
+    const msg = { type: 'execute', planId, token: BACKEND_TOKEN };
+
+    if (Array.isArray(pendingApproval.sugestoes) && pendingApproval.sugestoes.length > 0) {
+        const selected = [];
+        document.querySelectorAll('.suggestion-cb:checked').forEach(cb => selected.push(cb.value));
+        if (selected.length === 0) {
+            showToast('⚠️ Marque ao menos uma sugestão na lista para executar');
+            return;
+        }
+        msg.selecionadas = selected;
+        const total = pendingApproval.sugestoes
+            .filter(s => selected.includes(s.id))
+            .reduce((n, s) => n + (Array.isArray(s.arquivos) ? s.arquivos.length : 0), 0);
+        setProgress(total || 1);
+    } else {
+        setProgress(pendingApproval.total || 0);
+    }
+
     closeApprovalModal();
     pendingApproval = null;
-    setProgress(total);
-    sendStreamingMessage({ type: 'execute', planId, token: BACKEND_TOKEN });
+    sendStreamingMessage(msg);
 }
 
 function cancelApproval() {
@@ -1934,25 +2010,89 @@ function startResize(e, resizer) {
 // =============================================
 function addMessage(role, content, agentId = null) {
     const container = document.getElementById('messages');
-    const div = document.createElement('div');
-    div.className = `message ${role}`;
+    const div = createMessageDiv(role, content, role === 'agent' ? agentId : null);
     if (role === 'agent' && agentId) {
         agentCounter++;
         const id = `msg-${agentCounter}`;
         agentDivIds[agentId] = id;
         div.id = id;
+    }
+    container.appendChild(div);
+    container.scrollTop = container.scrollHeight;
+    scheduleSaveChatHistory();
+}
+
+function createMessageDiv(role, content, agentName = null) {
+    const div = document.createElement('div');
+    div.className = `message ${role}`;
+    if (role === 'agent') {
         div.innerHTML = `
             <div class="msg-header">
-                <span class="agent-badge">🤖 ${escapeHtml(agentId)}</span>
+                <span class="agent-badge">🤖 ${escapeHtml(agentName || 'Assistente')}</span>
+            </div>
+            <div class="msg-content">${formatContent(content)}</div>
+        `;
+    } else if (role === 'user') {
+        div.innerHTML = `
+            <div class="msg-header">
+                <span class="user-badge">🧑 Você</span>
             </div>
             <div class="msg-content">${formatContent(content)}</div>
         `;
     } else {
         div.innerHTML = `<div class="msg-content">${formatContent(content)}</div>`;
     }
-    container.appendChild(div);
-    container.scrollTop = container.scrollHeight;
-    scheduleSaveChatHistory();
+    const header = div.querySelector('.msg-header');
+    if (header && role !== 'system') {
+        attachCopyButton(header, () => {
+            const contentEl = div.querySelector('.msg-content');
+            if (!contentEl) return '';
+            const clone = contentEl.cloneNode(true);
+            clone.querySelectorAll('br').forEach(br => br.replaceWith('\n'));
+            return clone.textContent;
+        });
+    }
+    return div;
+}
+
+function attachCopyButton(headerEl, getText) {
+    const btn = document.createElement('button');
+    btn.type = 'button';
+    btn.className = 'msg-copy-btn';
+    btn.textContent = '📋';
+    btn.title = 'Copiar mensagem';
+    btn.addEventListener('click', () => {
+        const text = getText();
+        if (!text) return;
+        const done = () => {
+            btn.textContent = '✅';
+            btn.classList.add('copied');
+            setTimeout(() => {
+                btn.textContent = '📋';
+                btn.classList.remove('copied');
+            }, 1500);
+        };
+        if (navigator.clipboard && navigator.clipboard.writeText) {
+            navigator.clipboard.writeText(text).then(done).catch(() => fallbackCopy(text, done));
+        } else {
+            fallbackCopy(text, done);
+        }
+    });
+    headerEl.appendChild(btn);
+}
+
+function fallbackCopy(text, done) {
+    try {
+        const ta = document.createElement('textarea');
+        ta.value = text;
+        ta.style.position = 'fixed';
+        ta.style.opacity = '0';
+        document.body.appendChild(ta);
+        ta.select();
+        document.execCommand('copy');
+        document.body.removeChild(ta);
+        done();
+    } catch (e) {}
 }
 
 function updateAgentMessage(agentId, content) {
@@ -2014,19 +2154,10 @@ function restoreChatHistory() {
     agentDivIds = {};
     agentCounter = 0;
     for (const item of items) {
-        const div = document.createElement('div');
-        div.className = `message ${item.role}`;
+        const div = createMessageDiv(item.role, item.content, item.role === 'agent' ? item.agent : null);
         if (item.role === 'agent') {
             agentCounter++;
             div.id = `msg-${agentCounter}`;
-            div.innerHTML = `
-                <div class="msg-header">
-                    <span class="agent-badge">🤖 ${escapeHtml(item.agent)}</span>
-                </div>
-                <div class="msg-content">${formatContent(item.content)}</div>
-            `;
-        } else {
-            div.innerHTML = `<div class="msg-content">${formatContent(item.content)}</div>`;
         }
         container.appendChild(div);
     }
@@ -2361,6 +2492,6 @@ function toggleTheme() {
     showToast(isLight ? '🌙 Tema escuro' : '☀️ Tema claro');
 }
 
-console.log('🏗️ Aedificator Codex com Explorador Nativo carregado!');
+console.log('🏗️ Aedificator Codex IDE com Explorador Nativo carregado!');
 console.log('📁 Para selecionar uma pasta, clique em "Selecionar Pasta"');
 console.log('🔗 Para desvincular, clique em "Desvincular"');

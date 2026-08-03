@@ -12,7 +12,7 @@ const BASE = `http://127.0.0.1:${PORT}`;
 const SERVER_PATH = path.join(__dirname, '..', 'backend', 'server.js');
 
 function startServer(token) {
-    const projectRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'aedificator-test-'));
+    const projectRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'aedificator-ide-test-'));
     const child = spawn(process.execPath, [SERVER_PATH], {
         env: {
             ...process.env,
@@ -156,7 +156,7 @@ test('extractJson extrai JSON de respostas com ruído', () => {
 
 test('resolveSafePath bloqueia path traversal', () => {
     const { resolveSafePath, setProjectRoot } = require(SERVER_PATH);
-    const projectRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'aedificator-safe-'));
+    const projectRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'aedificator-ide-safe-'));
     try {
         assert.ok(setProjectRoot(projectRoot));
         assert.ok(resolveSafePath('src/app.js'));
@@ -170,7 +170,7 @@ test('resolveSafePath bloqueia path traversal', () => {
 
 test('writeFileContent recusa caminho fora do projeto', () => {
     const { writeFileContent, setProjectRoot } = require(SERVER_PATH);
-    const projectRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'aedificator-write-'));
+    const projectRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'aedificator-ide-write-'));
     try {
         setProjectRoot(projectRoot);
         assert.strictEqual(writeFileContent('../evil.js', 'x'), false);
@@ -340,12 +340,12 @@ test('run executa comando e retorna saída', async (t) => {
         const res = await fetch(`${BASE}/api/run`, {
             method: 'POST',
             headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({ command: 'echo aedificator-test' })
+            body: JSON.stringify({ command: 'echo aedificator-ide-test' })
         });
         const data = await res.json();
         assert.ok(data.success);
         assert.strictEqual(data.code, 0);
-        assert.ok(data.output.includes('aedificator-test'));
+        assert.ok(data.output.includes('aedificator-ide-test'));
     } finally {
         stopServer(child, projectRoot);
     }
@@ -381,7 +381,7 @@ test('buildOpenCodePrompt inclui modo e histórico', () => {
 
 test('snapshot/diff detecta criar, modificar e deletar', () => {
     const { snapshotProjectFiles, diffSnapshots, setProjectRoot } = require(SERVER_PATH);
-    const projectRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'aedificator-snap-'));
+    const projectRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'aedificator-ide-snap-'));
     try {
         setProjectRoot(projectRoot);
         fs.writeFileSync(path.join(projectRoot, 'a.txt'), 'v1');

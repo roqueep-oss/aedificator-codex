@@ -1,4 +1,4 @@
-# 🏗️ Aedificator Codex
+# 🏗️ Aedificator Codex IDE
 
 Ferramenta de desenvolvimento assistida por IA que analisa, planeja e aplica alterações em arquivos de um projeto escolhido por você.
 

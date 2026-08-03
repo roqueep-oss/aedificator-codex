@@ -11,7 +11,7 @@ const BASE = `http://127.0.0.1:${PORT}`;
 const SERVER_PATH = path.join(__dirname, '..', 'backend', 'server.js');
 
 function startServer() {
-    const projectRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'aedificator-snap-'));
+    const projectRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'aedificator-ide-snap-'));
     fs.writeFileSync(path.join(projectRoot, 'a.txt'), 'conteudo A');
     fs.mkdirSync(path.join(projectRoot, 'sub'));
     fs.writeFileSync(path.join(projectRoot, 'sub', 'b.txt'), 'conteudo B');

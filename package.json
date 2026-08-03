@@ -1,8 +1,8 @@
 {
-  "name": "aedificator-codex",
+  "name": "aedificator-codex-ide",
   "version": "1.0.0",
-  "description": "Aedificator Codex - Desenvolvimento com agentes de IA orquestrados",
-  "author": "Aedificator Codex",
+  "description": "Aedificator Codex IDE - Desenvolvimento com agentes de IA orquestrados",
+  "author": "Aedificator Codex IDE",
   "license": "MIT",
   "main": "main.js",
   "repository": {
@@ -31,9 +31,9 @@
     "publish:all:linux": "node scripts/publish.js all linux"
   },
   "build": {
-    "appId": "com.aedificator.codex",
-    "productName": "Aedificator Codex",
-    "copyright": "© 2026 Aedificator Codex",
+    "appId": "com.aedificator.codex.ide",
+    "productName": "Aedificator Codex IDE",
+    "copyright": "© 2026 Aedificator Codex IDE",
     "directories": {
       "output": "dist"
     },
@@ -41,7 +41,7 @@
       {
         "provider": "github",
         "owner": "roqueep-oss",
-        "repo": "aedificator-codex"
+        "repo": "aedificator-codex-ide"
       }
     ],
     "files": [
@@ -61,7 +61,7 @@
         }
       ],
       "icon": "build/icon.ico",
-      "publisherName": "Aedificator Codex",
+      "publisherName": "Aedificator Codex IDE",
       "verifyUpdateCodeSignature": false
     },
     "nsis": {
@@ -72,8 +72,8 @@
       "uninstallerIcon": "build/icon.ico",
       "createDesktopShortcut": true,
       "createStartMenuShortcut": true,
-      "shortcutName": "Aedificator Codex",
-      "menuCategory": "Aedificator Codex"
+      "shortcutName": "Aedificator Codex IDE",
+      "menuCategory": "Aedificator Codex IDE"
     },
     "mac": {
       "target": [
