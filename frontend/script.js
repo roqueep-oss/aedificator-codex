@@ -3186,17 +3186,26 @@ function refreshOutline() {
         }
     });
 
-    const model = monacoEditor.getModel();
     monaco.languages.registerDocumentSymbolProvider('*', {
         provideDocumentSymbols: function(m) {
             return refreshOutlineSymbols(m);
         }
-    })(model).then(function(result){});
+    });
 
     setTimeout(() => {
         const symbols = extractOutlineSymbols(monacoEditor.getValue());
         renderOutlinePanel(symbols);
     }, 100);
+}
+
+function refreshOutlineSymbols(model) {
+    const text = model ? model.getValue() : '';
+    const symbols = extractOutlineSymbols(text);
+    return symbols.map(s => {
+        const range = new monaco.Range(s.line, 1, s.line, 1);
+        const kindMap = { 'class': monaco.languages.SymbolKind.Class, 'function': monaco.languages.SymbolKind.Function, 'method': monaco.languages.SymbolKind.Method, 'variable': monaco.languages.SymbolKind.Variable };
+        return { name: s.name, kind: kindMap[s.kind] || monaco.languages.SymbolKind.Property, range: range, selectionRange: range };
+    });
 }
 
 function extractOutlineSymbols(text) {
@@ -5296,6 +5305,25 @@ function showDiffPreview(filePath, newContent) {
         }).catch(e=>out.textContent='❌ '+e.message);
 }
 
+function showDiffModal(originalContent, modifiedContent, title) {
+    const modal = document.getElementById('diffModal');
+    if (!modal) return;
+    modal.style.display = 'flex';
+    document.getElementById('diffEditorTitle').textContent = '📊 ' + (title || 'Diff');
+    const out = document.getElementById('diffOutput');
+    const lines = [];
+    const oLines = (originalContent || '').split('\n');
+    const mLines = (modifiedContent || '').split('\n');
+    const max = Math.max(oLines.length, mLines.length);
+    for (let i = 0; i < max; i++) {
+        const o = i < oLines.length ? oLines[i] : '';
+        const m = i < mLines.length ? mLines[i] : '';
+        if (o === m) lines.push('  ' + (i + 1) + '| ' + o);
+        else { if (i < oLines.length) lines.push('- ' + (i + 1) + '| ' + o); if (i < mLines.length) lines.push('+ ' + (i + 1) + '| ' + m); }
+    }
+    out.textContent = lines.join('\n') || 'Sem alterações';
+}
+
 // Botão regras no header
 setTimeout(() => {
     const header = document.querySelector('.header .controls');
@@ -5362,7 +5390,6 @@ async function compareSelectedFiles() {
         const r2 = await apiFetch('/api/file/read', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ path: modPath }) });
         const d2 = await r2.json();
         showDiffModal(d1.content || '', d2.content || '', origPath.split('/').pop() + ' ↔ ' + modPath.split('/').pop());
-        document.getElementById('diffFileModal').remove();
     } catch (e) { showToast('❌ ' + e.message); }
 }
 
@@ -5970,6 +5997,7 @@ async function provideAedCompletionItems(model, position) {
     const word = model.getWordUntilPosition(position);
     const range = { startLineNumber: position.lineNumber, endLineNumber: position.lineNumber, startColumn: word.startColumn, endColumn: word.endColumn };
     const suggestions = [];
+    const prefix = word.word.toLowerCase();
     const seen = new Set();
     try {
         const now = Date.now();
@@ -5986,7 +6014,6 @@ async function provideAedCompletionItems(model, position) {
                 _aedCompletionCache = [];
             }
         }
-        const prefix = word.word.toLowerCase();
         const filtered = _aedCompletionCache.filter(c => c.label && c.label.toLowerCase().startsWith(prefix));
         for (const item of filtered) {
             if (seen.has(item.label)) continue;
@@ -6742,7 +6769,7 @@ async function toggleGitOnly() {
                 }
                 window._gitChangedFiles = changedFiles;
                 showToast('📊 Mostrando apenas ' + changedFiles.size + ' arquivo(s) alterado(s)');
-                renderFileTree();
+                loadFolderStructure(currentProjectPath);
             } else {
                 gitOnlyFilter = false;
                 showToast('⚠️ Repositório git não detectado');
@@ -6754,7 +6781,7 @@ async function toggleGitOnly() {
     } else {
         window._gitChangedFiles = null;
         showToast('📁 Mostrando todos os arquivos');
-        renderFileTree();
+        loadFolderStructure(currentProjectPath);
     }
 }
 

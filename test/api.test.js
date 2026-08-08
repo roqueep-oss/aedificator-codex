@@ -27,8 +27,12 @@ function startServer(token) {
 }
 
 function stopServer(child, projectRoot) {
-    child.kill();
-    fs.rmSync(projectRoot, { recursive: true, force: true });
+    if (process.platform === 'win32') {
+        try { require('child_process').execSync(`taskkill /F /PID ${child.pid} /T`, { stdio: 'ignore' }); } catch (_) {}
+    } else {
+        child.kill('SIGKILL');
+    }
+    try { fs.rmSync(projectRoot, { recursive: true, force: true }); } catch (_) {}
 }
 
 function waitForPort(timeoutMs = 10000) {
