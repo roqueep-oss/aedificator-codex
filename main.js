@@ -160,7 +160,8 @@ function createWindow() {
     console.log('✅ Janela criada!');
 
     // Menu
-    const menu = Menu.buildFromTemplate([
+    const isProduction = app.isPackaged;
+    const menuTemplate = [
         {
             label: 'Arquivo',
             submenu: [
@@ -168,30 +169,35 @@ function createWindow() {
             ]
         },
         {
+            label: 'Ajuda',
+            submenu: [
+                ...(isProduction ? [] : [{
+                    label: 'Abrir DevTools',
+                    click: () => {
+                        if (mainWindow) mainWindow.webContents.openDevTools();
+                    }
+                }]),
+                {
+                    label: 'Documentação',
+                    click: () => shell.openExternal('https://github.com/roqueep-oss/aedificator-codex')
+                },
+                { role: 'about', label: 'Sobre' }
+            ]
+        }
+    ];
+
+    if (!isProduction) {
+        menuTemplate.splice(1, 0, {
             label: 'Exibir',
             submenu: [
                 { role: 'reload' },
                 { role: 'toggleDevTools' },
                 { role: 'togglefullscreen' }
             ]
-        },
-        {
-            label: 'Ajuda',
-            submenu: [
-                {
-                    label: 'Abrir DevTools',
-                    click: () => {
-                        if (mainWindow) mainWindow.webContents.openDevTools();
-                    }
-                },
-                {
-                    label: 'Documentação',
-                    click: () => shell.openExternal('https://github.com')
-                },
-                { role: 'about', label: 'Sobre' }
-            ]
-        }
-    ]);
+        });
+    }
+
+    const menu = Menu.buildFromTemplate(menuTemplate);
     Menu.setApplicationMenu(menu);
 
     // Carrega o frontend

@@ -7,7 +7,7 @@
   "main": "main.js",
   "repository": {
     "type": "git",
-    "url": ""
+    "url": "https://github.com/roqueep-oss/aedificator-codex.git"
   },
   "scripts": {
     "start": "electron .",
@@ -41,7 +41,7 @@
       {
         "provider": "github",
         "owner": "roqueep-oss",
-        "repo": "aedificator-codex-ide"
+        "repo": "aedificator-codex"
       }
     ],
     "files": [
@@ -103,9 +103,10 @@
     }
   },
   "devDependencies": {
-    "electron": "^30.5.1",
+    "electron": "^33.4.0",
     "electron-builder": "^24.13.3",
-    "eslint": "^8.56.0"
+    "eslint": "^8.56.0",
+    "typescript": "^7.0.2"
   },
   "dependencies": {
     "acorn": "^8.18.0",
@@ -116,7 +117,6 @@
     "merge-descriptors": "^2.0.0",
     "monaco-editor": "^0.56.0",
     "puppeteer-core": "^25.5.0",
-    "typescript": "^7.0.2",
     "ws": "^8.21.1"
   }
 }
