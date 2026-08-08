@@ -1724,7 +1724,34 @@ const AGENT_TOOLS = [
     { name: 'browser_type', description: 'Digita texto em um campo input/textarea.', parameters: { selector: 'string', text: 'string' } },
     { name: 'browser_evaluate', description: 'Executa JavaScript na página e retorna o resultado.', parameters: { js: 'string' } },
     { name: 'browser_console', description: 'Lê os logs do console do browser.', parameters: {} },
-    { name: 'git_publish', description: 'Publica uma release: faz commit (se houver mudanças), cria tag semver e push para o remote. Use após concluir uma feature.', parameters: { mensagem: 'string (opcional, mensagem do commit)' } }
+    { name: 'git_publish', description: 'Publica uma release: faz commit (se houver mudanças), cria tag semver e push para o remote. Use após concluir uma feature.', parameters: { mensagem: 'string (opcional, mensagem do commit)' } },
+    { name: 'git_status', description: 'Mostra o status do git (arquivos modificados, staged, untracked)', parameters: {} },
+    { name: 'git_diff', description: 'Mostra diff das alterações atuais (unstaged)', parameters: {} },
+    { name: 'git_log', description: 'Mostra histórico de commits (últimos 10)', parameters: {} },
+    { name: 'git_commit', description: 'Faz commit das alterações staged. Use git_status antes.', parameters: { mensagem: 'string' } },
+    { name: 'git_push', description: 'Faz push dos commits para o remote', parameters: {} },
+    { name: 'git_pull', description: 'Faz pull do remote', parameters: {} },
+    { name: 'git_branch', description: 'Lista branches locais e remotas', parameters: {} },
+    { name: 'git_stash', description: 'Salva alterações não commitadas no stash (push ou pop)', parameters: { acao: 'string (push ou pop)' } },
+    { name: 'file_rename', description: 'Renomeia ou move um arquivo/pasta', parameters: { origem: 'string', destino: 'string' } },
+    { name: 'file_mkdir', description: 'Cria um diretório (e diretórios pais se necessário)', parameters: { caminho: 'string' } },
+    { name: 'analyzer_validate', description: 'Valida um arquivo de código e retorna erros/avisos', parameters: { caminho: 'string' } },
+    { name: 'analyzer_symbols', description: 'Extrai símbolos (funções, classes, variáveis) de um arquivo', parameters: { caminho: 'string' } },
+    { name: 'test_run', description: 'Executa os testes do projeto e retorna o resultado', parameters: {} },
+    { name: 'snapshot_create', description: 'Cria um snapshot completo do estado atual do projeto', parameters: { rotulo: 'string (opcional, nome do snapshot)' } },
+    { name: 'snapshot_list', description: 'Lista todos os snapshots salvos', parameters: {} },
+    { name: 'snapshot_restore', description: 'Restaura o projeto para um snapshot anterior', parameters: { rotulo: 'string' } },
+    { name: 'debug_start', description: 'Inicia uma sessão de debug Node.js para um arquivo', parameters: { arquivo: 'string' } },
+    { name: 'debug_stop', description: 'Para a sessão de debug atual', parameters: {} },
+    { name: 'debug_step', description: 'Avança um passo no debug (step over)', parameters: {} },
+    { name: 'debug_resume', description: 'Continua a execução até o próximo breakpoint', parameters: {} },
+    { name: 'ssh_exec', description: 'Executa um comando no servidor remoto via SSH', parameters: { comando: 'string' } },
+    { name: 'ssh_status', description: 'Verifica o status da conexão SSH remota', parameters: {} },
+    { name: 'docker_run', description: 'Executa um container Docker com a imagem especificada', parameters: { comando: 'string' } },
+    { name: 'undo', description: 'Desfaz a última alteração de arquivo feita pelo agente', parameters: {} },
+    { name: 'redo', description: 'Refaz a última alteração desfeita', parameters: {} },
+    { name: 'search_replace', description: 'Busca e substitui texto em arquivos do projeto', parameters: { padrao: 'string', substituto: 'string', caminho: 'string (opcional, arquivo ou diretório)' } },
+    { name: 'browser_content', description: 'Obtém o conteúdo HTML/textual da página atual do browser', parameters: {} }
 ];
 
 async function executeAgentTool(name, args) {
@@ -1857,7 +1884,98 @@ async function executeAgentTool(name, args) {
                 return `Erro ao publicar: ${e.message}`;
             }
         }
+        case 'git_status': {
+            try { const r = await runGit(['status'], PROJECT_ROOT); return r.output.trim() || '(working tree limpa)'; } catch (e) { return `Erro: ${e.message}`; }
+        }
+        case 'git_diff': {
+            try { const r = await runGit(['diff'], PROJECT_ROOT); return r.output.slice(0, 5000).trim() || '(sem alterações)'; } catch (e) { return `Erro: ${e.message}`; }
+        }
+        case 'git_log': {
+            try { const r = await runGit(['log', '--oneline', '-10'], PROJECT_ROOT); return r.output.trim() || '(sem commits)'; } catch (e) { return `Erro: ${e.message}`; }
+        }
+        case 'git_commit': {
+            try { await runGit(['add', '-A'], PROJECT_ROOT); const r = await runGit(['commit', '-m', args.mensagem || 'commit'], PROJECT_ROOT); return r.output.trim(); } catch (e) { return `Erro: ${e.message}`; }
+        }
+        case 'git_push': {
+            try { const r = await runGit(['push'], PROJECT_ROOT); return r.output.trim(); } catch (e) { return `Erro: ${e.message}`; }
+        }
+        case 'git_pull': {
+            try { const r = await runGit(['pull'], PROJECT_ROOT); return r.output.trim(); } catch (e) { return `Erro: ${e.message}`; }
+        }
+        case 'git_branch': {
+            try { const r = await runGit(['branch', '-a'], PROJECT_ROOT); return r.output.trim(); } catch (e) { return `Erro: ${e.message}`; }
+        }
+        case 'git_stash': {
+            try { const r = await runGit(['stash', args.acao || 'push'], PROJECT_ROOT); return r.output.trim() || 'ok'; } catch (e) { return `Erro: ${e.message}`; }
+        }
+        case 'file_rename': {
+            const src = resolveSafePath(args.origem || '');
+            const dst = resolveSafePath(args.destino || '');
+            if (!src || !dst) return 'Erro: caminho inválido';
+            if (!fs.existsSync(src)) return 'Erro: arquivo origem não encontrado';
+            try { fs.renameSync(src, dst); return `Renomeado: ${args.origem} → ${args.destino}`; } catch (e) { return `Erro: ${e.message}`; }
+        }
+        case 'file_mkdir': {
+            const dir = resolveSafePath(args.caminho || '');
+            if (!dir) return 'Erro: caminho inválido';
+            try { fs.mkdirSync(dir, { recursive: true }); return `Diretório criado: ${args.caminho}`; } catch (e) { return `Erro: ${e.message}`; }
+        }
+        case 'analyzer_validate': {
+            const f = resolveSafePath(args.caminho || '');
+            if (!f || !fs.existsSync(f)) return 'Erro: arquivo não encontrado';
+            try { const content = fs.readFileSync(f, 'utf-8'); const v = analyzer.validateCode(content, args.caminho, PROJECT_ROOT); return v.errors.length ? v.errors.slice(0, 20).map(e => `Ln ${e.line}: [${e.severity}] ${e.message}`).join('\n') : '✅ Nenhum erro encontrado'; } catch (e) { return `Erro: ${e.message}`; }
+        }
+        case 'analyzer_symbols': {
+            const f = resolveSafePath(args.caminho || '');
+            if (!f || !fs.existsSync(f)) return 'Erro: arquivo não encontrado';
+            try { const content = fs.readFileSync(f, 'utf-8'); const ext = path.extname(args.caminho).toLowerCase(); let sym = []; if (['.js','.ts','.jsx','.tsx'].includes(ext)) sym = analyzer.getTSSymbols(args.caminho, PROJECT_ROOT); else if (ext === '.py') sym = analyzer.getPythonSymbols(args.caminho, PROJECT_ROOT); else if (ext === '.go') sym = analyzer.getGoSymbols(args.caminho, PROJECT_ROOT); return sym.map(s => `${s.kind} ${s.name} (ln ${s.line})`).join('\n') || '(nenhum símbolo)'; } catch (e) { return `Erro: ${e.message}`; }
+        }
+        case 'test_run': {
+            try { const result = runner.runCommandSync ? runner.runCommandSync('npm test', { cwd: PROJECT_ROOT, timeoutMs: 60000 }) : await runner.runCommand({ command: 'npm test', cwd: PROJECT_ROOT, timeoutMs: 60000 }); const r = result.stdout || result.output || ''; return r.slice(0, 5000).trim() || '(sem saída)'; } catch (e) { return `Erro: ${e.message}`; }
+        }
+        case 'snapshot_create': {
+            try { const label = args.rotulo || `snapshot-${Date.now()}`; const snapDir = path.join(PROJECT_ROOT, BACKUP_DIR_NAME, 'snapshots', label); if (fs.existsSync(snapDir)) return 'Erro: snapshot já existe com esse rótulo'; fs.mkdirSync(snapDir, { recursive: true }); copyDirContents(PROJECT_ROOT, snapDir, new Set(['node_modules', '.git', 'dist', 'build', BACKUP_DIR_NAME])); return `✅ Snapshot '${label}' criado`; } catch (e) { return `Erro: ${e.message}`; }
+        }
+        case 'snapshot_list': {
+            try { const snapDir = path.join(PROJECT_ROOT, BACKUP_DIR_NAME, 'snapshots'); if (!fs.existsSync(snapDir)) return '(nenhum snapshot)'; return fs.readdirSync(snapDir).map(d => { const stat = fs.statSync(path.join(snapDir, d)); return `${d} (${stat.mtime.toISOString().slice(0, 10)})`; }).join('\n') || '(nenhum snapshot)'; } catch (e) { return `Erro: ${e.message}`; }
+        }
+        case 'snapshot_restore': {
+            try { const label = args.rotulo; if (!label) return 'Erro: informe o rótulo do snapshot'; const snapDir = path.join(PROJECT_ROOT, BACKUP_DIR_NAME, 'snapshots', label); if (!fs.existsSync(snapDir)) return 'Erro: snapshot não encontrado'; restoreSnapshot(label); return `✅ Projeto restaurado para snapshot '${label}'`; } catch (e) { return `Erro: ${e.message}`; }
+        }
+        case 'debug_start': {
+            try { const f = resolveSafePath(args.arquivo || ''); if (!f || !fs.existsSync(f)) return 'Erro: arquivo não encontrado'; if (debuggerRunner.isRunning()) return 'Erro: já existe debug ativo'; await debuggerRunner.startDebug({ file: f, onEvent: () => {} }); return `✅ Debug iniciado: ${args.arquivo}`; } catch (e) { return `Erro: ${e.message}`; }
+        }
+        case 'debug_stop': {
+            try { const r = debuggerRunner.stopDebug(); return r ? '✅ Debug parado' : 'Nenhum debug ativo'; } catch (e) { return `Erro: ${e.message}`; }
+        }
+        case 'debug_step': {
+            try { if (!debuggerRunner.isRunning()) return 'Erro: nenhum debug ativo'; const r = await debuggerRunner.stepOver(); return JSON.stringify(r); } catch (e) { return `Erro: ${e.message}`; }
+        }
+        case 'debug_resume': {
+            try { if (!debuggerRunner.isRunning()) return 'Erro: nenhum debug ativo'; const r = await debuggerRunner.resume(); return JSON.stringify(r); } catch (e) { return `Erro: ${e.message}`; }
+        }
+        case 'ssh_exec': {
+            try { if (!remote.isConnected()) return 'Erro: nenhuma conexão SSH ativa'; const r = await remote.execRemote(args.comando || ''); return r || '(sem saída)'; } catch (e) { return `Erro: ${e.message}`; }
+        }
+        case 'ssh_status': {
+            try { return JSON.stringify(remote.getStatus()); } catch (e) { return 'Desconectado'; }
+        }
+        case 'docker_run': {
+            try { const r = await runner.runCommand({ command: `docker ${args.comando || 'ps'}`, cwd: PROJECT_ROOT, timeoutMs: 30000 }); return (r.stdout || r.output || '').slice(0, 3000).trim() || '(sem saída)'; } catch (e) { return `Erro: ${e.message}`; }
+        }
+        case 'undo': {
+            try { const r = await undoLastChange(); return r || 'Nada para desfazer'; } catch (e) { return `Erro: ${e.message}`; }
+        }
+        case 'redo': {
+            try { const r = await redoLastChange(); return r || 'Nada para refazer'; } catch (e) { return `Erro: ${e.message}`; }
+        }
+        case 'search_replace': {
+            try { const base = resolveSafePath(args.caminho || ''); const pattern = args.padrao || ''; const replacement = args.substituto || ''; if (!pattern) return 'Erro: informe o padrão'; const files = base && fs.existsSync(base) ? (fs.statSync(base).isDirectory() ? getAllFiles(base, { n: 0 }).slice(0, 50) : [base]) : getAllFiles(PROJECT_ROOT, { n: 0 }).slice(0, 50); let count = 0; for (const f of files) { if (!fs.statSync(f).isFile()) continue; let content = fs.readFileSync(f, 'utf-8'); const regex = new RegExp(pattern, 'g'); const before = content; content = content.replace(regex, replacement); if (content !== before) { backupFromContent(path.relative(PROJECT_ROOT, f), before); fs.writeFileSync(f, content, 'utf-8'); count++; } } return `${count} arquivo(s) alterado(s)`; } catch (e) { return `Erro: ${e.message}`; }
+        }
         default: {
+            if (name === 'browser_content') {
+                try { return await executeBrowserTool(name, {}); } catch (e) { return `Erro Browser: ${e.message}`; }
+            }
             if (name.startsWith('mcp_')) {
                 try { return await mcpManager.executeTool(name, args); }
                 catch (e) { return `Erro MCP: ${e.message}`; }
@@ -3151,6 +3269,78 @@ app.post('/api/redo', (req, res) => {
 app.post('/api/undo/status', (req, res) => {
     res.json({ canUndo: undoStack.length > 0, canRedo: redoStack.length > 0, undoCount: undoStack.length, redoCount: redoStack.length });
 });
+
+async function undoLastChange() {
+    if (!undoStack.length) return null;
+    const entry = undoStack.pop();
+    const redoEntry = { timestamp: Date.now(), files: [] };
+    for (const f of entry.files) {
+        const fullPath = resolveSafePath(f.path);
+        if (!fullPath) continue;
+        try {
+            if (fs.existsSync(fullPath)) {
+                redoEntry.files.push({ path: f.path, content: fs.readFileSync(fullPath, 'utf-8') });
+            }
+            fs.mkdirSync(path.dirname(fullPath), { recursive: true });
+            fs.writeFileSync(fullPath, f.content, 'utf-8');
+        } catch (e) {}
+    }
+    if (redoEntry.files.length) redoStack.push(redoEntry);
+    broadcastAll({ type: 'refresh' });
+    return `${entry.files.length} arquivo(s) restaurado(s)`;
+}
+
+async function redoLastChange() {
+    if (!redoStack.length) return null;
+    const entry = redoStack.pop();
+    const undoEntry = { timestamp: Date.now(), files: [] };
+    for (const f of entry.files) {
+        const fullPath = resolveSafePath(f.path);
+        if (!fullPath) continue;
+        try {
+            if (fs.existsSync(fullPath)) {
+                undoEntry.files.push({ path: f.path, content: fs.readFileSync(fullPath, 'utf-8') });
+            }
+            fs.mkdirSync(path.dirname(fullPath), { recursive: true });
+            fs.writeFileSync(fullPath, f.content, 'utf-8');
+        } catch (e) {}
+    }
+    if (undoEntry.files.length) undoStack.push(undoEntry);
+    broadcastAll({ type: 'refresh' });
+    return `${entry.files.length} arquivo(s) refeito(s)`;
+}
+
+function copyDirContents(srcDir, dstDir, ignore) {
+    for (const entry of fs.readdirSync(srcDir, { withFileTypes: true })) {
+        if (ignore && ignore.has(entry.name)) continue;
+        const src = path.join(srcDir, entry.name);
+        const dst = path.join(dstDir, entry.name);
+        if (entry.isDirectory()) {
+            fs.mkdirSync(dst, { recursive: true });
+            copyDirContents(src, dst, ignore);
+        } else if (entry.isFile()) {
+            try { fs.copyFileSync(src, dst); } catch (e) {}
+        }
+    }
+}
+
+function restoreSnapshot(label) {
+    const root = SNAPSHOT_ROOT();
+    const dir = path.join(root, label);
+    if (!dir.startsWith(root) || !fs.existsSync(dir)) throw new Error('Snapshot não encontrado');
+    let restored = 0;
+    for (const rel of walkSnapshotFiles(dir)) {
+        const src = path.join(dir, rel);
+        const target = resolveSafePath(rel);
+        if (!target) continue;
+        try {
+            fs.mkdirSync(path.dirname(target), { recursive: true });
+            fs.copyFileSync(src, target);
+            restored++;
+        } catch (e) {}
+    }
+    return restored;
+}
 
 // ===== SHARE =====
 function escapeHtml(text) {

@@ -764,8 +764,8 @@ async function openCostDashboard() {
         html += '<table style="width:100%;border-collapse:collapse;font-size:11px;">';
         html += '<thead><tr style="border-bottom:1px solid #30363d;">';
         html += '<th style="text-align:left;padding:4px 8px;color:#8b949e;">Mês</th>';
-        for (var p in data.providers) {
-            html += '<th style="text-align:right;padding:4px 8px;color:#8b949e;">' + p.charAt(0).toUpperCase() + p.slice(1) + '</th>';
+        for (var p2 in data.providers) {
+            html += '<th style="text-align:right;padding:4px 8px;color:#8b949e;">' + p2.charAt(0).toUpperCase() + p2.slice(1) + '</th>';
         }
         html += '<th style="text-align:right;padding:4px 8px;color:#8b949e;">Total</th></tr></thead><tbody>';
         for (var i = 0; i < data.months.length; i++) {
@@ -775,8 +775,8 @@ async function openCostDashboard() {
             var label = monthNames[parseInt(dateLabel[1])-1] + ' ' + dateLabel[0];
             html += '<tr style="border-bottom:1px solid #21262d;">';
             html += '<td style="padding:6px 8px;color:#e6edf3;">' + label + '</td>';
-            for (var p in data.providers) {
-                var pdata = m.providers[p];
+            for (var p2 in data.providers) {
+                var pdata = m.providers[p2];
                 var val = pdata ? pdata.cost_brl : 0;
                 var color = val > 0 ? (val > 5 ? '#f85149' : '#e6edf3') : '#484f58';
                 html += '<td style="text-align:right;padding:6px 8px;color:' + color + ';">' + (val > 0 ? 'R$ ' + val.toFixed(2).replace('.', ',') : '—') + '</td>';
@@ -1652,8 +1652,8 @@ function newProject() {
     xhr.send(JSON.stringify({ path: caminhoCompleto }));
 }
 
-async function createNewProject() { newProject(); }
-function browseNewProjectParent() { newProject(); }
+async function createNewProject() { selectFolder(); }
+function browseNewProjectParent() { selectFolder(); }
             });
 
         } else {
