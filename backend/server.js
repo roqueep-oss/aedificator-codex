@@ -256,9 +256,9 @@ async function fetchUsdBrlRate() {
 
 let _aiPricesLastFetch = 0;
 
-async function fetchAiPrices() {
+async function fetchAiPrices(forceRefresh) {
     const now = Date.now();
-    if (now - _aiPricesLastFetch < 86400000) return TOKEN_PRICES;
+    if (!forceRefresh && now - _aiPricesLastFetch < 3600000) return TOKEN_PRICES;
     _aiPricesLastFetch = now;
 
     const pricingFile = path.join(__dirname, 'pricing.json');
@@ -2865,8 +2865,7 @@ app.get('/api/usage/monthly', (req, res) => {
 
 app.post('/api/pricing/refresh', async (req, res) => {
     try {
-        _aiPricesLastFetch = 0;
-        const prices = await fetchAiPrices();
+        const prices = await fetchAiPrices(true);
         res.json({ success: true, prices, usdBrl: USD_TO_BRL });
     } catch (e) {
         res.status(500).json({ success: false, error: e.message });
