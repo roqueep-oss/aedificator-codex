@@ -105,7 +105,7 @@
   },
   "devDependencies": {
     "electron": "^33.4.0",
-    "electron-builder": "^24.13.3",
+    "electron-builder": "^26.15.3",
     "eslint": "^8.56.0",
     "typescript": "^7.0.2"
   },

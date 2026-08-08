@@ -3583,7 +3583,7 @@ function showApprovalModal(data) {
             });
         }, 100);
 
-        function doExecuteSuggestion(data, pid, sid, customRequest) {
+        const doExecuteSuggestion = function(data, pid, sid, customRequest) {
             pendingApproval = data;
             pendingApproval.planId = pid;
             stopAutoExecCountdown();
@@ -5733,7 +5733,7 @@ document.addEventListener('keydown', (e) => {
 function executeMenuAction(action) {
     switch (action) {
         case 'selectFolder': selectFolder(); break;
-        case 'newProject': newProject(); break;
+        case 'newProject': createNewProject(); break;
         case 'unlinkFolder': unlinkFolder(); break;
         case 'saveFileEditor': saveFileEditor(); break;
         case 'closeFileEditor': closeFileEditor(); break;
