@@ -642,8 +642,7 @@ async function refreshUsage() {
     try {
         var p = document.getElementById('providerSelect').value;
         var m = document.getElementById('modelSelect').value;
-        var url = '/api/usage?provider=' + encodeURIComponent(p) + '&model=' + encodeURIComponent(m);
-        var res = await fetch(url);
+        var res = await apiFetch('/api/usage?provider=' + encodeURIComponent(p) + '&model=' + encodeURIComponent(m));
         var data = await res.json();
         if (data.provider) {
             document.getElementById('usageDisplay').textContent = 'R$ ' + data.cost.brl.toFixed(2).replace('.', ',');
@@ -659,7 +658,7 @@ async function openPricingModal() {
     panel.style.display = panel.style.display === 'none' ? 'block' : 'none';
     if (panel.style.display === 'none') return;
     try {
-        var res = await fetch('/api/pricing');
+        var res = await apiFetch('/api/pricing');
         var d = await res.json();
         document.getElementById('pInlineUsd').textContent = d.usdBrl.toFixed(2).replace('.', ',');
 
@@ -697,7 +696,7 @@ async function savePricing() {
                 opencode: { '__default': { input: parseFloat(document.getElementById('pOcInput').value) || 0, output: parseFloat(document.getElementById('pOcOutput').value) || 0 } }
             }
         };
-        var res = await fetch('/api/pricing', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body) });
+        var res = await apiFetch('/api/pricing', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body) });
         var d = await res.json();
         if (d.success) {
             document.getElementById('pricingPanel').style.display = 'none';
