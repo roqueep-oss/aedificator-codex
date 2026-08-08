@@ -5,6 +5,10 @@
     "browser": true,
     "es2021": true
   },
+  "globals": {
+    "monaco": "readonly",
+    "marked": "readonly"
+  },
   "parserOptions": {
     "ecmaVersion": 2022,
     "sourceType": "module"
@@ -21,6 +25,7 @@
     "dist/",
     "build/",
     ".aedificator-codex-ide-backup/",
+    "frontend/vendor/",
     "*.min.js"
   ]
 }

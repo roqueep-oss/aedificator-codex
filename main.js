@@ -26,6 +26,17 @@ const BACKEND_TOKEN = crypto.randomBytes(32).toString('hex');
 
 // ===== SEGREDO PARA CRIPTOGRAFAR CHAVES API =====
 function getOrCreateBackendSecret() {
+    // Lê do .env primeiro (já configurado)
+    try {
+        const envPath = path.join(__dirname, 'backend', '.env');
+        if (fs.existsSync(envPath)) {
+            const envContent = fs.readFileSync(envPath, 'utf-8');
+            const match = envContent.match(/BACKEND_SECRET\s*=\s*(.+)/);
+            if (match && match[1].trim()) return match[1].trim();
+        }
+    } catch (e) {}
+
+    // Fallback: gera novo
     const secretPath = path.join(app.getPath('userData'), '.backend-secret');
     try {
         if (fs.existsSync(secretPath)) {
@@ -36,9 +47,7 @@ function getOrCreateBackendSecret() {
     try {
         fs.mkdirSync(app.getPath('userData'), { recursive: true });
         fs.writeFileSync(secretPath, secret, { encoding: 'utf-8', mode: 0o600 });
-    } catch (e) {
-        console.error('❌ Erro ao salvar segredo:', e);
-    }
+    } catch (e) {}
     return secret;
 }
 

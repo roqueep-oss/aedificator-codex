@@ -41,6 +41,80 @@
         .header h1 span {
             color: #58a6ff;
         }
+
+        /* ===== MENU BAR ===== */
+        .menu-bar {
+            display: flex;
+            align-items: center;
+            gap: 2px;
+            margin-right: 16px;
+        }
+        .menu-item {
+            position: relative;
+            padding: 4px 10px;
+            font-size: 12px;
+            color: #e6edf3;
+            cursor: pointer;
+            border-radius: 4px;
+            user-select: none;
+            transition: 0.15s;
+        }
+        .menu-item:hover, .menu-item.open {
+            background: #21262d;
+        }
+        .menu-dropdown {
+            display: none;
+            position: absolute;
+            top: 100%;
+            left: 0;
+            background: #161b22;
+            border: 1px solid #30363d;
+            border-radius: 6px;
+            padding: 4px 0;
+            min-width: 220px;
+            z-index: 3000;
+            box-shadow: 0 8px 24px rgba(0,0,0,0.6);
+        }
+        .menu-dropdown.visible {
+            display: block;
+        }
+        .menu-dropdown-item {
+            display: flex;
+            align-items: center;
+            justify-content: space-between;
+            padding: 5px 12px;
+            font-size: 12px;
+            color: #e6edf3;
+            cursor: pointer;
+            transition: 0.1s;
+        }
+        .menu-dropdown-item:hover {
+            background: #1f6feb;
+        }
+        .menu-dropdown-item.disabled {
+            color: #484f58;
+            cursor: default;
+        }
+        .menu-dropdown-item.disabled:hover {
+            background: transparent;
+        }
+        .menu-dropdown-item .shortcut {
+            color: #8b949e;
+            font-size: 11px;
+            margin-left: 16px;
+        }
+        .menu-separator {
+            height: 1px;
+            background: #30363d;
+            margin: 4px 0;
+        }
+        body.theme-light .menu-item { color: #24292f; }
+        body.theme-light .menu-item:hover, body.theme-light .menu-item.open { background: #eaeef2; }
+        body.theme-light .menu-dropdown { background: #fff; border-color: #d0d7de; }
+        body.theme-light .menu-dropdown-item { color: #24292f; }
+        body.theme-light .menu-dropdown-item:hover { background: #0969da; color: #fff; }
+        body.theme-light .menu-dropdown-item.disabled { color: #8b949e; }
+        body.theme-light .menu-dropdown-item.disabled:hover { background: transparent; color: #8b949e; }
         .header .controls {
             display: flex;
             gap: 8px;
@@ -257,11 +331,11 @@
             font-weight: 500;
         }
         .file-item .name {
-            color: #c9d1d9;
+            color: #ffffff;
         }
 
         .file-item.status-normal .name {
-            color: #c9d1d9;
+            color: #ffffff;
         }
         .file-item.status-normal .status-dot {
             display: none;
@@ -341,6 +415,7 @@
             border-bottom: 1px solid #30363d;
             flex-shrink: 0;
             background: #0d1117;
+            gap: 6px;
         }
         .activity-header .activity-title {
             font-size: 11px;
@@ -350,18 +425,417 @@
             letter-spacing: 0.5px;
             margin-right: auto;
         }
+        .activity-header .tab-btn {
+            background: transparent;
+            border: 1px solid #30363d;
+            color: #8b949e;
+            padding: 2px 10px;
+            border-radius: 4px;
+            cursor: pointer;
+            font-size: 11px;
+            transition: 0.15s;
+        }
+        .activity-header .tab-btn:hover { background: #21262d; color: #e6edf3; }
+        .activity-header .tab-btn.active { background: #1f6feb; border-color: #1f6feb; color: #fff; }
+
+        /* ===== WORKFLOW VIEW ===== */
+        #workflowView {
+            display: none;
+            flex: 1;
+            overflow-y: auto;
+            padding: 16px;
+            flex-direction: column;
+            gap: 12px;
+        }
+        #workflowView.active { display: flex; }
+        #terminalView { display: none; flex: 1; overflow: hidden; }
+        #terminalView.active { display: flex; flex-direction: column; }
+
+        .term-output {
+            flex: 1;
+            overflow-y: auto;
+            padding: 8px;
+            font-family: 'Consolas', 'Courier New', monospace;
+            font-size: 12px;
+            line-height: 1.5;
+            background: #0d1117;
+        }
+        .term-line {
+            padding: 1px 4px;
+            white-space: pre-wrap;
+            word-break: break-all;
+            display: flex;
+            gap: 4px;
+        }
+        .term-line.thought { color: #6e7681; }
+        .term-line.tool { color: #58a6ff; }
+        .term-line.output { color: #7d8590; }
+        .term-line.error { color: #f85149; }
+        .term-line.block-start { color: #3fb950; font-weight: 600; padding-top: 4px; }
+        .term-line.block-end { color: #3fb950; font-size: 11px; padding-bottom: 4px; }
+        .term-line .term-time { color: #484f58; font-size: 10px; margin-left: auto; white-space: nowrap; flex-shrink: 0; }
+        .term-line .term-icon { flex-shrink: 0; width: 16px; }
+        .term-line .term-body { flex: 1; }
+        .term-detail {
+            font-size: 11px;
+            color: #484f58;
+            padding: 2px 4px 2px 24px;
+            white-space: pre-wrap;
+            max-height: 200px;
+            overflow-y: auto;
+            display: none;
+            font-family: 'Consolas', 'Courier New', monospace;
+            background: rgba(22,27,34,0.5);
+        }
+        .term-line.expanded + .term-detail { display: block; }
+        .term-empty {
+            text-align: center;
+            color: #484f58;
+            padding: 24px;
+            font-size: 12px;
+        }
+
+        .wf-pipeline {
+            display: flex;
+            flex-direction: column;
+            gap: 2px;
+            padding: 12px 16px;
+            overflow-y: auto;
+            flex: 1;
+        }
+        .wf-stage {
+            display: flex;
+            align-items: center;
+            gap: 10px;
+            padding: 6px 10px;
+            border-radius: 6px;
+            font-size: 12px;
+            color: #484f58;
+            border-left: 3px solid #21262d;
+            transition: all 0.3s;
+        }
+        .wf-stage.active {
+            color: #e6edf3;
+            border-left-color: #58a6ff;
+            background: rgba(88,166,255,0.08);
+        }
+        .wf-stage.done {
+            color: #7d8590;
+            border-left-color: #238636;
+        }
+        .wf-stage.error {
+            color: #f85149;
+            border-left-color: #f85149;
+            background: rgba(248,81,73,0.08);
+        }
+        .wf-stage-icon {
+            font-size: 14px;
+            width: 20px;
+            text-align: center;
+            flex-shrink: 0;
+        }
+        .wf-stage-label {
+            flex: 1;
+            font-weight: 500;
+        }
+        .wf-stage-detail {
+            font-size: 10px;
+            color: #8b949e;
+        }
+        /* ===== ACTIVITY BAR ===== */
+        .activitybar {
+            width: 40px;
+            min-width: 40px;
+            background: #0d1117;
+            border-right: 1px solid #30363d;
+            display: flex;
+            flex-direction: column;
+            align-items: center;
+            padding: 8px 0;
+            gap: 4px;
+            flex-shrink: 0;
+            z-index: 5;
+        }
+        .activitybar-icon {
+            width: 36px;
+            height: 36px;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            font-size: 18px;
+            cursor: pointer;
+            border-radius: 6px;
+            color: #8b949e;
+            transition: all 0.15s;
+            position: relative;
+            user-select: none;
+        }
+        .activitybar-icon:hover { color: #e6edf3; background: #1c2128; }
+        .activitybar-icon.active { color: #e6edf3; }
+        .activitybar-icon.active::before {
+            content: '';
+            position: absolute;
+            left: 0; top: 6px; bottom: 6px;
+            width: 3px;
+            background: #58a6ff;
+            border-radius: 0 2px 2px 0;
+        }
+        .activitybar-icon .badge {
+            position: absolute;
+            top: 1px; right: 1px;
+            background: #da3633; color: #fff;
+            font-size: 8px; padding: 1px 4px; border-radius: 6px;
+            min-width: 14px; text-align: center;
+        }
+
+        /* ===== SIDEBAR PANELS ===== */
+        .sidebar-panel {
+            width: 280px;
+            min-width: 180px;
+            max-width: 900px;
+            background: #161b22;
+            border-right: 1px solid #30363d;
+            display: none;
+            flex-direction: column;
+            flex-shrink: 0;
+            overflow: hidden;
+        }
+        .sidebar-panel.active { display: flex; }
+
         /* ===== DIVISORES REDIMENSIONÁVEIS ===== */
         .resizer {
             width: 5px;
             flex-shrink: 0;
             cursor: col-resize;
-            background: transparent;
+            background: #21262d;
             z-index: 10;
             transition: background 0.15s;
+            margin: 0;
+            border-left: none;
+            border-right: none;
         }
         .resizer:hover,
         .resizer.active {
             background: #58a6ff;
+        }
+
+        /* ===== BOTTOM PANEL ===== */
+        .bottom-panel {
+            height: 0;
+            min-height: 0;
+            background: #0d1117;
+            border-top: 1px solid #30363d;
+            display: flex;
+            flex-direction: column;
+            flex-shrink: 0;
+            overflow: hidden;
+            transition: height 0.2s ease;
+        }
+        .bottom-panel.open { height: 220px; min-height: 60px; }
+        .bottom-panel-tabs {
+            display: flex;
+            background: #161b22;
+            border-bottom: 1px solid #30363d;
+            flex-shrink: 0;
+            padding: 0 8px;
+        }
+        .bottom-tab {
+            padding: 4px 14px;
+            font-size: 11px;
+            color: #8b949e;
+            cursor: pointer;
+            border-bottom: 2px solid transparent;
+            user-select: none;
+            transition: 0.15s;
+        }
+        .bottom-tab:hover { color: #e6edf3; }
+        .bottom-tab.active { color: #e6edf3; border-bottom-color: #58a6ff; }
+        .bottom-panel-content {
+            flex: 1;
+            overflow: hidden;
+            display: flex;
+            flex-direction: column;
+        }
+        .bottom-pane {
+            display: none;
+            flex: 1;
+            overflow-y: auto;
+            font-family: Consolas, monospace;
+            font-size: 12px;
+            color: #c9d1d9;
+        }
+        .bottom-pane.active { display: flex; flex-direction: column; }
+        .bottom-pane .terminal-inner {
+            padding: 8px;
+            flex: 1;
+            overflow-y: auto;
+            white-space: pre-wrap;
+            word-break: break-all;
+            background: #0d1117;
+        }
+        .bottom-pane .terminal-input-row {
+            display: flex;
+            border-top: 1px solid #30363d;
+            flex-shrink: 0;
+        }
+        .bottom-pane .terminal-input-row input {
+            flex: 1;
+            background: #0d1117;
+            color: #c9d1d9;
+            border: none;
+            padding: 6px 10px;
+            font-family: Consolas, monospace;
+            font-size: 12px;
+            outline: none;
+        }
+
+        /* ===== STATUSBAR ===== */
+        .statusbar {
+            display: flex;
+            align-items: center;
+            padding: 2px 8px;
+            background: #161b22;
+            border-top: 1px solid #30363d;
+            font-size: 11px;
+            color: #8b949e;
+            gap: 14px;
+            flex-shrink: 0;
+            user-select: none;
+        }
+        .statusbar span { cursor: default; }
+        .statusbar .status-clickable { cursor: pointer; }
+        .statusbar .status-clickable:hover { color: #e6edf3; }
+
+        /* ===== COMMAND PALETTE ===== */
+        .command-palette {
+            display: none;
+            position: fixed;
+            top: 25%;
+            left: 50%;
+            transform: translateX(-50%);
+            width: 560px;
+            max-width: 90vw;
+            max-height: 60vh;
+            background: #161b22;
+            border: 1px solid #58a6ff;
+            border-radius: 10px;
+            z-index: 9000;
+            flex-direction: column;
+            box-shadow: 0 16px 48px rgba(0,0,0,0.7);
+            overflow: hidden;
+        }
+        .command-palette input {
+            padding: 12px 16px;
+            font-size: 15px;
+            background: #0d1117;
+            color: #e6edf3;
+            border: none;
+            border-bottom: 1px solid #30363d;
+            outline: none;
+            font-family: Consolas, monospace;
+        }
+        .command-palette-results {
+            flex: 1;
+            overflow-y: auto;
+            padding: 4px 0;
+        }
+        .command-palette-item {
+            padding: 6px 16px;
+            font-size: 13px;
+            color: #c9d1d9;
+            cursor: pointer;
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+        }
+        .command-palette-item:hover,
+        .command-palette-item.selected {
+            background: #1f6feb;
+            color: #fff;
+        }
+        .command-palette-item .cp-shortcut {
+            font-size: 11px;
+            color: #8b949e;
+            background: #1c2128;
+            padding: 1px 6px;
+            border-radius: 4px;
+        }
+        .command-palette-item.selected .cp-shortcut { color: #c9d1d9; background: rgba(0,0,0,0.3); }
+
+        /* ===== SIDEBAR SEARCH PANEL ===== */
+        .sidebar-search-input {
+            width: 100%;
+            padding: 8px 12px;
+            background: #0d1117;
+            color: #c9d1d9;
+            border: none;
+            border-bottom: 1px solid #30363d;
+            font-size: 12px;
+            font-family: Consolas, monospace;
+            outline: none;
+            flex-shrink: 0;
+        }
+        .sidebar-search-results {
+            flex: 1;
+            overflow-y: auto;
+            padding: 4px 0;
+        }
+        .sidebar-search-result {
+            padding: 3px 12px;
+            font-size: 11px;
+            font-family: Consolas, monospace;
+            color: #c9d1d9;
+            cursor: pointer;
+            white-space: nowrap;
+            overflow: hidden;
+            text-overflow: ellipsis;
+        }
+        .sidebar-search-result:hover { background: #1c2128; }
+        .sidebar-search-result .match-line { color: #8b949e; margin-left: 8px; }
+
+        /* ===== SIDEBAR GIT PANEL ===== */
+        .sidebar-git-header {
+            padding: 8px 12px;
+            display: flex;
+            align-items: center;
+            gap: 8px;
+            border-bottom: 1px solid #30363d;
+            flex-shrink: 0;
+        }
+        .sidebar-git-header input {
+            flex: 1;
+            background: #0d1117;
+            color: #c9d1d9;
+            border: 1px solid #30363d;
+            padding: 4px 8px;
+            border-radius: 4px;
+            font-size: 11px;
+            font-family: Consolas, monospace;
+        }
+        .sidebar-git-files {
+            flex: 1;
+            overflow-y: auto;
+            font-size: 11px;
+            padding: 4px 0;
+        }
+        .sidebar-git-file {
+            padding: 3px 12px;
+            cursor: pointer;
+            display: flex;
+            gap: 6px;
+            align-items: center;
+            color: #c9d1d9;
+        }
+        .sidebar-git-file:hover { background: #1c2128; }
+        .sidebar-git-file .git-status { width: 14px; text-align: center; font-size: 10px; flex-shrink: 0; }
+
+        /* ===== SIDEBAR DEBUG PANEL ===== */
+        .sidebar-debug-vars {
+            flex: 1;
+            overflow-y: auto;
+            padding: 4px 0;
+            font-size: 11px;
+            font-family: Consolas, monospace;
         }
         .activity-list {
             flex: 1;
@@ -563,33 +1037,42 @@
             font-size: 10px;
             color: #58a6ff;
         }
-        .message .user-badge {
-            background: rgba(31, 111, 235, 0.25);
-            padding: 0 10px;
-            border-radius: 10px;
-            font-size: 10px;
-            color: #d2e3ff;
-        }
         .msg-copy-btn {
-            margin-left: auto;
-            background: none;
-            border: none;
-            cursor: pointer;
-            font-size: 12px;
-            line-height: 1;
-            opacity: 0.45;
-            padding: 3px 7px;
-            border-radius: 6px;
+            background: #21262d;
+            border: 1px solid #30363d;
+            border-radius: 4px;
             color: #8b949e;
+            cursor: pointer;
+            font-size: 11px;
+            padding: 2px 8px;
         }
-        .msg-copy-btn:hover {
-            opacity: 1;
-            background: rgba(255, 255, 255, 0.08);
-            color: #e6edf3;
+        .msg-copy-btn:hover { color: #e6edf3; background: #30363d; border-color: #58a6ff; }
+
+        .sugestao-btn:hover { background: #30363d !important; border-color: #58a6ff !important; }
+
+        #progressBarContainer {
+            position: fixed;
+            top: 0;
+            left: 0;
+            width: 100%;
+            height: 3px;
+            z-index: 9999;
+            pointer-events: none;
         }
-        .msg-copy-btn.copied {
-            opacity: 1;
-            color: #3fb950;
+        #progressBarFill, #progressFill.indeterminate {
+            height: 100%;
+            width: 0%;
+            background: linear-gradient(90deg, #1f6feb, #58a6ff);
+            transition: width 0.3s ease;
+        }
+        #progressBarFill.indeterminate, #progressFill.indeterminate {
+            width: 30% !important;
+            animation: progressPulse 1.5s ease-in-out infinite;
+        }
+        @keyframes progressPulse {
+            0% { width: 5%; opacity: 0.5; }
+            50% { width: 70%; opacity: 1; }
+            100% { width: 5%; opacity: 0.5; }
         }
 
         /* ===== INPUT ===== */
@@ -717,6 +1200,27 @@
         .btn-toolbar:disabled {
             opacity: 0.4;
             cursor: not-allowed;
+        }
+        .header .controls .btn-toolbar {
+            padding: 3px 8px;
+            font-size: 14px;
+            line-height: 1;
+            border: 1px solid #30363d;
+            background: #21262d;
+            border-radius: 4px;
+        }
+        .header .controls .btn-toolbar:hover {
+            border-color: #58a6ff;
+            background: #30363d;
+        }
+        body.theme-light .header .controls .btn-toolbar {
+            background: #f6f8fa;
+            border-color: #d0d7de;
+            color: #1f2328;
+        }
+        body.theme-light .header .controls .btn-toolbar:hover {
+            background: #fff;
+            border-color: #0969da;
         }
         #pickerDriveSelect {
             padding: 6px 8px;
@@ -867,6 +1371,20 @@
             font-size: 11px;
             text-decoration: none;
         }
+        .config-tab {
+            background: none;
+            border: none;
+            color: #8b949e;
+            padding: 6px 14px;
+            cursor: pointer;
+            font-size: 12px;
+            border-bottom: 2px solid transparent;
+        }
+        .config-tab:hover { color: #e6edf3; }
+        .config-tab.active { color: #58a6ff; border-bottom-color: #58a6ff; }
+        body.theme-light .config-tab { color: #57606a; }
+        body.theme-light .config-tab:hover { color: #1f2328; }
+        body.theme-light .config-tab.active { color: #0969da; border-bottom-color: #0969da; }
         #configModal .modal-actions {
             display: flex;
             gap: 10px;
@@ -1159,107 +1677,79 @@
             text-align: center;
             min-height: 16px;
         }
-        .approval-suggestions {
-            flex: 1;
-            overflow-y: auto;
-            border: 1px solid #30363d;
-            border-radius: 8px;
-            min-height: 140px;
-            max-height: 45vh;
+        .approval-wide {
+            max-width: 900px;
+            width: 85vw;
         }
-        .suggestion-item {
-            border-bottom: 1px solid #21262d;
-            padding: 10px 12px;
-            display: flex;
-            flex-direction: column;
-            gap: 6px;
+        .approval-wide .approval-list {
+            max-height: 35vh;
         }
-        .suggestion-item:last-child {
-            border-bottom: none;
+        .approval-file-editor {
+            display: none;
+            border-top: 1px solid #21262d;
+            padding: 8px 12px;
+            background: #0d1117;
         }
-        .suggestion-header {
+        .approval-file:hover .approval-file-editor.active {
+            display: block;
+        }
+        .approval-file.active .approval-file-editor {
+            display: block;
+        }
+        .approval-file-header {
             display: flex;
             align-items: center;
             gap: 8px;
-        }
-        .suggestion-check {
-            display: flex;
-            align-items: flex-start;
-            gap: 8px;
             cursor: pointer;
-            flex: 1;
+            user-select: none;
         }
-        .suggestion-cb {
-            margin-top: 2px;
-            accent-color: #58a6ff;
-            width: 15px;
-            height: 15px;
+        .approval-file-toggle {
+            width: 16px;
+            height: 16px;
+            cursor: pointer;
+            accent-color: #1f6feb;
             flex-shrink: 0;
         }
-        .suggestion-title {
-            color: #e6edf3;
-            font-size: 13px;
-            font-weight: 600;
-        }
-        .suggestion-impact {
+        .approval-file-chevron {
+            font-size: 10px;
+            transition: transform 0.15s;
             flex-shrink: 0;
-            font-size: 11px;
-            font-weight: 600;
-            padding: 2px 8px;
-            border-radius: 10px;
-            white-space: nowrap;
-        }
-        .suggestion-impact.baixo {
-            background: rgba(63, 185, 80, 0.15);
-            color: #3fb950;
-        }
-        .suggestion-impact.médio, .suggestion-impact.medio {
-            background: rgba(210, 153, 34, 0.15);
-            color: #d29922;
-        }
-        .suggestion-impact.alto {
-            background: rgba(248, 81, 73, 0.15);
-            color: #f85149;
-        }
-        .suggestion-desc {
             color: #8b949e;
+        }
+        .approval-file.active .approval-file-chevron {
+            transform: rotate(90deg);
+        }
+        .approval-content-editor {
+            width: 100%;
+            min-height: 120px;
+            background: #0d1117;
+            border: 1px solid #30363d;
+            border-radius: 4px;
+            color: #e6edf3;
+            font-family: 'Consolas', 'Courier New', monospace;
             font-size: 12px;
-            line-height: 1.5;
-            padding-left: 23px;
+            padding: 8px;
+            resize: vertical;
+            box-sizing: border-box;
+            tab-size: 2;
         }
-        .suggestion-files {
-            padding-left: 23px;
+        .approval-note {
+            padding: 8px 0;
+        }
+        .approval-note textarea {
+            width: 100%;
+            background: #1c2128;
+            border: 1px solid #30363d;
+            border-radius: 6px;
+            color: #e6edf3;
             font-size: 12px;
+            padding: 8px;
+            box-sizing: border-box;
+            resize: vertical;
+            font-family: inherit;
         }
-        .suggestion-files summary {
-            color: #58a6ff;
-            cursor: pointer;
-            margin-bottom: 4px;
-        }
-        .suggestion-file {
-            color: #c9d1d9;
-            padding: 3px 0;
-            word-break: break-all;
-            display: flex;
-            align-items: center;
-            gap: 6px;
-        }
-        .suggestion-actions {
-            display: flex;
-            gap: 8px;
-            margin-top: 2px;
-        }
-        .btn-link {
-            background: none;
-            border: none;
-            color: #58a6ff;
-            cursor: pointer;
-            font-size: 12px;
-            padding: 0;
-            text-decoration: underline;
-        }
-        .btn-link:hover {
-            color: #79c0ff;
+        .approval-note textarea::placeholder {
+            color: #484f58;
         }
 
         /* ===== EDITOR DE ARQUIVOS ===== */
@@ -1281,13 +1771,81 @@
             border: 1px solid #30363d;
             border-radius: 12px;
             padding: 24px;
-            max-width: 900px;
+            max-width: 95vw;
             width: 94%;
             height: 88vh;
             display: flex;
             flex-direction: column;
             gap: 12px;
         }
+        #fileEditorModal.split-active .modal-content {
+            max-width: 98vw;
+            width: 98%;
+        }
+        .editor-body {
+            flex: 1;
+            display: flex;
+            gap: 8px;
+            min-height: 0;
+        }
+        .editor-body.split-active {
+            gap: 8px;
+        }
+        #editorSplitRight {
+            min-width: 300px;
+        }
+        .editor-split-tabs {
+            display: flex;
+            gap: 2px;
+            padding: 2px 0;
+            overflow-x: auto;
+            flex-shrink: 0;
+        }
+        .editor-split-tab {
+            background: #21262d;
+            border: 1px solid #30363d;
+            border-bottom: none;
+            border-radius: 4px 4px 0 0;
+            padding: 2px 10px;
+            font-size: 11px;
+            color: #8b949e;
+            cursor: pointer;
+            white-space: nowrap;
+            display: flex;
+            align-items: center;
+            gap: 4px;
+        }
+        .editor-split-tab.active {
+            background: #161b22;
+            color: #e6edf3;
+            border-color: #58a6ff;
+        }
+        .editor-split-tab .split-tab-close {
+            font-size: 12px;
+            color: #8b949e;
+            cursor: pointer;
+            padding: 0 2px;
+        }
+        .editor-split-tab .split-tab-close:hover { color: #f85149; }
+        #outlinePanel .outline-item {
+            padding: 3px 16px;
+            cursor: pointer;
+            color: #c9d1d9;
+            white-space: nowrap;
+            overflow: hidden;
+            text-overflow: ellipsis;
+        }
+        #outlinePanel .outline-item:hover { background: #1f6feb; color: #fff; }
+        #outlinePanel .outline-item.outline-class { color: #d2a8ff; }
+        #outlinePanel .outline-item.outline-method { padding-left: 28px; color: #79c0ff; }
+        #outlinePanel .outline-item.outline-function { color: #7ee787; }
+        #outlinePanel .outline-item.outline-variable { padding-left: 28px; }
+        body.theme-light #outlinePanel { background: #fff; border-color: #d0d7de; }
+        body.theme-light #outlinePanel .outline-item { color: #1f2328; }
+        body.theme-light #outlinePanel .outline-item:hover { background: #0969da; color: #fff; }
+        body.theme-light #outlinePanel .outline-item.outline-class { color: #8250df; }
+        body.theme-light #outlinePanel .outline-item.outline-method { color: #0550ae; }
+        body.theme-light #outlinePanel .outline-item.outline-function { color: #1a7f37; }
         .editor-header {
             display: flex;
             justify-content: space-between;
@@ -1557,6 +2115,9 @@ body.theme-light .chat-area,
         body.theme-light #fileEditorContent:focus {
             border-color: #0969da;
         }
+        body.theme-light #monacoContainer {
+            border-color: #d0d7de;
+        }
         body.theme-light #configModal .modal-desc {
             color: #57606a;
         }
@@ -1642,6 +2203,194 @@ body.theme-light .chat-area,
         .chat-toolbar .btn-theme {
             font-size: 12px;
             padding: 2px 8px;
+        }
+
+        /* ===== PLAN/BUILD TOGGLE ===== */
+        .btn-mode-toggle {
+            display: flex;
+            align-items: center;
+            gap: 4px;
+            background: #161b22;
+            border: 1px solid #30363d;
+            color: #e6edf3;
+            padding: 3px 10px;
+            border-radius: 20px;
+            cursor: pointer;
+            font-size: 11px;
+            font-weight: 600;
+            transition: 0.2s;
+            white-space: nowrap;
+        }
+        .btn-mode-toggle:hover { border-color: #58a6ff; }
+        .btn-mode-toggle.plan-mode { background: #d2992222; border-color: #d29922; }
+        .btn-mode-toggle.plan-mode .mode-indicator { color: #d29922; }
+        .btn-mode-toggle.build-mode { background: #23863622; border-color: #3fb950; }
+        .btn-mode-toggle.build-mode .mode-indicator { color: #3fb950; }
+        .mode-indicator { font-size: 14px; }
+        .mode-label { font-size: 10px; }
+
+        /* ===== @ AUTOCOMPLETE ===== */
+        .autocomplete-dropdown {
+            display: none;
+            position: absolute;
+            bottom: 100%;
+            left: 16px;
+            right: 120px;
+            background: #161b22;
+            border: 1px solid #30363d;
+            border-radius: 8px;
+            box-shadow: 0 4px 20px rgba(0,0,0,0.6);
+            max-height: 200px;
+            overflow-y: auto;
+            z-index: 4000;
+            margin-bottom: 4px;
+        }
+        .autocomplete-dropdown.active { display: block; }
+        .autocomplete-item {
+            padding: 6px 12px;
+            cursor: pointer;
+            font-size: 12px;
+            color: #e6edf3;
+            display: flex;
+            align-items: center;
+            gap: 6px;
+            border-bottom: 1px solid #21262d;
+        }
+        .autocomplete-item:last-child { border-bottom: none; }
+        .autocomplete-item:hover, .autocomplete-item.selected { background: #1f6feb33; }
+        .autocomplete-item .ac-icon { font-size: 13px; flex-shrink: 0; }
+        .autocomplete-item .ac-path { color: #8b949e; font-size: 10px; margin-left: auto; }
+
+        /* ===== DRAG & DROP OVERLAY ===== */
+        .drop-overlay {
+            display: none;
+            position: absolute;
+            top: 0; left: 0; right: 0; bottom: 0;
+            background: rgba(13,17,23,0.92);
+            border: 2px dashed #58a6ff;
+            border-radius: 8px;
+            z-index: 5000;
+            align-items: center;
+            justify-content: center;
+        }
+        .drop-overlay.active { display: flex; }
+        .drop-overlay-content {
+            display: flex;
+            flex-direction: column;
+            align-items: center;
+            gap: 10px;
+            color: #58a6ff;
+            font-size: 14px;
+            font-weight: 600;
+        }
+        .chat-area { position: relative; }
+
+        /* ===== RICH REPORT CARD ===== */
+        .report-card {
+            background: #161b22;
+            border: 1px solid #30363d;
+            border-radius: 10px;
+            padding: 14px;
+            margin: 4px 0;
+            font-size: 12px;
+        }
+        .report-card .report-title {
+            font-size: 14px;
+            font-weight: 700;
+            color: #3fb950;
+            margin-bottom: 8px;
+        }
+        .report-card .report-stats {
+            display: flex;
+            gap: 10px;
+            flex-wrap: wrap;
+            margin-bottom: 8px;
+        }
+        .report-stat {
+            display: flex;
+            align-items: center;
+            gap: 4px;
+            background: #0d1117;
+            border: 1px solid #21262d;
+            border-radius: 6px;
+            padding: 4px 10px;
+            font-size: 11px;
+        }
+        .report-stat.ok { border-color: #238636; color: #3fb950; }
+        .report-stat.warn { border-color: #d29922; color: #d29922; }
+        .report-stat.err { border-color: #f85149; color: #f85149; }
+        .report-card .report-files {
+            display: flex;
+            flex-direction: column;
+            gap: 3px;
+            margin-top: 6px;
+            padding-top: 8px;
+            border-top: 1px solid #21262d;
+        }
+        .report-file {
+            display: flex;
+            align-items: center;
+            gap: 5px;
+            font-size: 11px;
+            color: #8b949e;
+            padding: 2px 0;
+        }
+        .report-file .rf-action { font-size: 10px; padding: 1px 5px; border-radius: 3px; font-weight: 600; }
+        .report-file .rf-action.created { background: #23863622; color: #3fb950; }
+        .report-file .rf-action.modified { background: #1f6feb22; color: #58a6ff; }
+        .report-file .rf-action.deleted { background: #f8514922; color: #f85149; }
+        .report-actions {
+            display: flex;
+            gap: 6px;
+            margin-top: 10px;
+            padding-top: 8px;
+            border-top: 1px solid #21262d;
+        }
+        .report-btn {
+            background: #21262d;
+            border: 1px solid #30363d;
+            color: #e6edf3;
+            padding: 5px 14px;
+            border-radius: 6px;
+            cursor: pointer;
+            font-size: 11px;
+            font-weight: 600;
+            transition: 0.15s;
+        }
+        .report-btn:hover { background: #30363d; }
+        .report-btn.accept { background: #238636; border-color: #238636; }
+        .report-btn.accept:hover { background: #2ea043; }
+        .report-btn.refine { background: #1f6feb; border-color: #1f6feb; }
+        .report-btn.refine:hover { background: #388bfd; }
+        .report-btn.undo { color: #f85149; }
+        .report-btn.undo:hover { background: #f8514922; border-color: #f85149; }
+
+        /* ===== ATTACHMENT PREVIEW ===== */
+        .attachment-preview {
+            display: flex;
+            gap: 4px;
+            flex-wrap: wrap;
+            padding: 4px 16px;
+            background: #0d1117;
+            border-top: 1px solid #30363d;
+            flex-shrink: 0;
+        }
+        .attachment-chip {
+            display: flex;
+            align-items: center;
+            gap: 4px;
+            background: #1f6feb22;
+            border: 1px solid #1f6feb44;
+            border-radius: 12px;
+            padding: 2px 8px;
+            font-size: 10px;
+            color: #58a6ff;
+        }
+        .attachment-chip .remove-attach {
+            cursor: pointer;
+            color: #f85149;
+            font-weight: bold;
+            margin-left: 2px;
         }
 
         /* ===== BARRA DE COMANDOS ===== */
@@ -1787,6 +2536,37 @@ body.theme-light .chat-area,
         body.theme-light .terminal-input-row input:focus {
             border-color: #0969da;
         }
+        .terminal-tabs {
+            display: flex;
+            align-items: center;
+            gap: 2px;
+        }
+        .terminal-tab {
+            padding: 2px 10px;
+            background: #21262d;
+            border: 1px solid #30363d;
+            border-radius: 6px 6px 0 0;
+            font-size: 11px;
+            color: #8b949e;
+            cursor: pointer;
+            user-select: none;
+        }
+        .terminal-tab.active {
+            background: #0d1117;
+            color: #e6edf3;
+            border-bottom-color: #0d1117;
+        }
+        .terminal-tab:hover { color: #e6edf3; }
+        body.theme-light .terminal-tab { background: #d0d7de; border-color: #afb8c1; color: #57606a; }
+        body.theme-light .terminal-tab.active { background: #f6f8fa; color: #1f2328; border-bottom-color: #f6f8fa; }
+
+        /* ===== GIT GUTTER DECORATIONS ===== */
+        .aed-gutter-added { background: rgba(63,185,80,0.4); width: 3px !important; margin-left: 3px; }
+        .aed-gutter-modified { background: rgba(210,168,0,0.4); width: 3px !important; margin-left: 3px; }
+        .aed-gutter-removed { background: rgba(248,81,73,0.4); width: 3px !important; margin-left: 3px; }
+        .aed-line-added { background: rgba(63,185,80,0.08); }
+        .aed-line-modified { background: rgba(210,168,0,0.08); }
+        .aed-line-removed { background: rgba(248,81,73,0.08); }
 
         /* ===== GIT ===== */
         #gitModal {
@@ -2126,6 +2906,30 @@ body.theme-light .chat-area,
             object-fit: contain;
         }
 
+        /* ===== DEBUGGER ===== */
+        .debug-current-line { background: rgba(31, 111, 235, 0.15) !important; }
+        .debug-current-glyph { background: #1f6feb; width: 10px !important; height: 18px !important; border-radius: 3px; margin-left: 5px; }
+        .debug-current-line-decoration { background: #1f6feb; width: 3px !important; margin-left: 2px; }
+        .debug-breakpoint { background: #f85149; width: 8px !important; height: 8px !important; border-radius: 50%; margin-left: 6px; margin-top: 6px; }
+        #debugPanel select, #debugPanel input { background: #0d1117; color: #e6edf3; border: 1px solid #30363d; border-radius: 3px; font-size: 11px; }
+        body.theme-light #debugPanel > div { background: #fff; border-color: #d0d7de; }
+        body.theme-light #debugPanel > div > *:first-child { background: #f6f8fa; color: #0969da; }
+        body.theme-light #debugVars, body.theme-light #debugStack, body.theme-light #debugWatch, body.theme-light #debugConsole { color: #1f2328; }
+        body.theme-light #debugConsole { background: #fff; }
+        body.theme-light .debug-current-line { background: rgba(9, 105, 218, 0.12) !important; }
+
+        /* ===== QUICK OPEN (Ctrl+P) ===== */
+        .quick-open-item:hover,
+        .quick-open-item.selected {
+            background: #1f6feb;
+            color: #fff;
+        }
+        body.theme-light .quick-open-item:hover,
+        body.theme-light .quick-open-item.selected {
+            background: #0969da;
+            color: #fff;
+        }
+
         /* ===== TEMA CLARO (NOVOS) ===== */
         body.theme-light .search-input {
             background: #ffffff;
@@ -2240,61 +3044,201 @@ body.theme-light .chat-area,
                 display: none;
             }
         }
+
+        #browserPanel {
+            display: none;
+            position: fixed;
+            top: 80px;
+            left: 100px;
+            width: 70vw;
+            height: 70vh;
+            min-width: 400px;
+            min-height: 250px;
+            max-width: 100vw;
+            max-height: 100vh;
+            background: #0d1117;
+            z-index: 6000;
+            flex-direction: column;
+            border-radius: 8px;
+            border: 2px solid #30363d;
+            box-shadow: 0 8px 40px rgba(0,0,0,0.7);
+            overflow: hidden;
+            resize: both;
+        }
+        #browserPanel.show { display: flex; }
+        #browserPanel.maximized {
+            top: 0 !important;
+            left: 0 !important;
+            width: 100% !important;
+            height: 100% !important;
+            border-radius: 0;
+            border: none;
+            resize: none;
+        }
+        #browserPanel .terminal-panel-header {
+            display: flex;
+            align-items: center;
+            padding: 8px 16px;
+            background: #161b22;
+            border-bottom: 1px solid #30363d;
+            gap: 8px;
+            flex-shrink: 0;
+            color: #e6edf3;
+            font-size: 13px;
+            cursor: move;
+            user-select: none;
+        }
     </style>
+    <script>
+    // STUBS GARANTIDOS — executam antes do script.js carregar
+    window._API = 'http://localhost:3001';
+
+    function newProject() {
+        var nome = prompt('Nome do novo projeto:', 'meu-app');
+        if (!nome || !nome.trim()) return;
+        nome = nome.trim();
+        var pasta = prompt('Pasta onde criar:', '');
+        if (!pasta || !pasta.trim()) return;
+        pasta = pasta.trim().replace(/\\/g, '/').replace(/\/+$/, '');
+        var xhr = new XMLHttpRequest();
+        xhr.open('POST', window._API + '/api/project/create', true);
+        xhr.setRequestHeader('Content-Type', 'application/json');
+        xhr.onload = function() {
+            var d = JSON.parse(xhr.responseText);
+            if (d.success) { alert('Projeto criado: ' + d.path); location.reload(); }
+            else alert('Erro: ' + (d.error || 'Falha'));
+        };
+        xhr.send(JSON.stringify({ path: pasta + '/' + nome }));
+    }
+
+    function selectFolder() { if(window._openFolderPicker) window._openFolderPicker(); }
+    function clearChat() { var m=document.getElementById('messages'); if(m) m.innerHTML='<div class="message system">Chat limpo.</div>'; }
+    function exportChat() { var m=document.getElementById('messages'); if(m){ var t=''; m.querySelectorAll('.msg-content').forEach(function(c){ t+=c.textContent+'\n---\n'; }); var b=new Blob([t],{type:'text/plain'}); var a=document.createElement('a'); a.href=URL.createObjectURL(b); a.download='chat-export.txt'; a.click(); } }
+    function clearActivity() { var l=document.getElementById('activityList'); if(l) l.innerHTML='<div class="activity-empty">Atividade limpa.</div>'; }
+    function sendMessage() { var i=document.getElementById('chatInput'); if(i&&i.value.trim()){ var e=new KeyboardEvent('keypress',{key:'Enter'}); i.dispatchEvent(e); } }
+    function cancelTask() { if(window._cancelTask) window._cancelTask(); }
+    function pickerSelect() { if(window._pickerSelect) window._pickerSelect(); }
+    function closeFolderPicker() { var m=document.getElementById('folderPickerModal'); if(m) m.style.display='none'; }
+    function unlinkFolder() { if(window._unlinkFolder) window._unlinkFolder(); }
+    function closeFileEditor() { var m=document.getElementById('fileEditorModal'); if(m) m.style.display='none'; }
+    function openTerminal() { var m=document.getElementById('terminalModal'); if(m) { m.style.display='flex'; var o=document.getElementById('terminalOutput'); if(o&&!o.textContent.trim()) o.textContent='Terminal do projeto\nDigite um comando abaixo.\n'; } }
+    function closeTerminal() { var m=document.getElementById('terminalModal'); if(m) m.style.display='none'; }
+    function toggleTheme() { document.body.classList.toggle('theme-light'); }
+    function openConfigModal() { var m=document.getElementById('configModal'); if(m) m.style.display='flex'; }
+    function openGitModal() { var m=document.getElementById('gitModal'); if(m) m.style.display='flex'; }
+    function openTestRunner() { var m=document.getElementById('testRunnerModal'); if(m) m.style.display='flex'; }
+    function openBuildModal() { var d=document.getElementById('buildDropdown'); if(d) d.style.display='block'; }
+    function openRulesModal() { var m=document.getElementById('rulesModal'); if(m) m.style.display='flex'; }
+    function openBackupModal() { var m=document.getElementById('backupModal'); if(m) m.style.display='flex'; }
+    function openSnapshotModal() { var m=document.getElementById('snapshotModal'); if(m) m.style.display='flex'; }
+    function openPublishModal() { var m=document.getElementById('publishModal'); if(m) m.style.display='flex'; }
+    function openHelpModal() { var m=document.getElementById('helpModal'); if(m) m.style.display='flex'; }
+    function showAbout() { alert('Aedificator Codex IDE v1.1.0\nDesenvolvimento com agentes de IA orquestrados\n\n© 2026 Aedificator Codex IDE'); }
+    function toggleLivePreview() { if(window._toggleLivePreview) window._toggleLivePreview(); }
+    function showGitBlame() { alert('Abra um arquivo no editor primeiro'); }
+    function gitShowDiff() { var m=document.getElementById('diffModal'); if(m) m.style.display='flex'; }
+    function analyzeCurrentFile() { alert('Abra um arquivo no editor primeiro'); }
+    function openSnippets() { }
+    function saveFileEditor() { if(window._saveFileEditor) window._saveFileEditor(); }
+    function toggleMarkdownPreview() { if(window._toggleMarkdownPreview) window._toggleMarkdownPreview(); }
+    function runTests() { var m=document.getElementById('testRunnerModal'); if(m) m.style.display='flex'; }
+
+    // FUNÇÃO CENTRAL DO MENU — garante todos os itens
+    function executeMenuAction(a) {
+        switch(a) {
+            case 'selectFolder': selectFolder(); break;
+            case 'newProject': newProject(); break;
+            case 'unlinkFolder': unlinkFolder(); break;
+            case 'saveFileEditor': saveFileEditor(); break;
+            case 'closeFileEditor': closeFileEditor(); break;
+            case 'findInFiles': var s=document.getElementById('searchInput'); if(s) s.focus(); break;
+            case 'openSnippets': openSnippets(); break;
+            case 'openTerminal': openTerminal(); break;
+            case 'toggleBrowser': toggleLivePreview(); break;
+            case 'toggleLivePreview': toggleLivePreview(); break;
+            case 'toggleTheme': toggleTheme(); break;
+            case 'openGitModal': openGitModal(); break;
+            case 'gitShowDiff': gitShowDiff(); break;
+            case 'showGitBlame': showGitBlame(); break;
+            case 'openTestRunner': openTestRunner(); break;
+            case 'analyzeCurrentFile': analyzeCurrentFile(); break;
+            case 'openBuildModal': openBuildModal(); break;
+            case 'openPublishModal': openPublishModal(); break;
+            case 'debugStart': debugStart(); break;
+            case 'openSnapshotModal': openSnapshotModal(); break;
+            case 'openBackupModal': openBackupModal(); break;
+            case 'openConfigModal': openConfigModal(); break;
+            case 'openRulesModal': openRulesModal(); break;
+            case 'openHelpModal': openHelpModal(); break;
+            case 'showAbout': showAbout(); break;
+        }
+    }
+    </script>
 </head>
 <body>
+    <div id="progressBarContainer"><div id="progressBarFill"></div></div>
 
     <!-- ===== HEADER ===== -->
     <div class="header">
+        <div class="menu-bar" id="menuBar">
+            <div class="menu-item" data-menu="file">📁 Arquivo</div>
+            <div class="menu-item" data-menu="edit">✏️ Editar</div>
+            <div class="menu-item" data-menu="view">👁️ Exibir</div>
+            <div class="menu-item" data-menu="tools">🔧 Ferramentas</div>
+            <div class="menu-item" data-menu="config">⚙️ Configurações</div>
+            <div class="menu-item" data-menu="utils">📦 Utilitários</div>
+            <div class="menu-item" data-menu="help">❓ Ajuda</div>
+        </div>
         <h1>🏗️ Aedificator <span>Codex IDE</span></h1>
         <div class="controls">
-            <select id="modelSelect">
-                <option value="gemini">Gemini 3.5</option>
+            <select id="providerSelect">
+                <option value="gemini">Google</option>
                 <option value="deepseek">DeepSeek</option>
-                <option value="opencode">🟣 opencode (padrão)</option>
+                <option value="openai">OpenAI</option>
+                <option value="claude">Anthropic</option>
+                <option value="opencode">opencode</option>
             </select>
-            <label class="oc-toggle" id="ocToggleWrap" title="Usar opencode como provedor de IA">
-                <input type="checkbox" id="ocToggle" checked> opencode
-            </label>
+            <span id="usageDisplay" title="Consumo de tokens" style="font-size:10px;color:#8b949e;cursor:pointer;" onclick="refreshUsage()"></span>
+            <button id="pricingBtn" title="Cotação e preços" style="font-size:10px;background:transparent;border:1px solid #30363d;border-radius:4px;color:#8b949e;cursor:pointer;padding:1px 4px;" onclick="openPricingModal()">💲</button>
+            <select id="modelSelect">
+                <option value="gemini-3.5">Gemini 3.5</option>
+            </select>
             <select id="modeSelect">
+                <option value="agent">🤖 Agente</option>
                 <option value="cowork">🤝 Equipe</option>
                 <option value="clarify">❓ Esclarecer</option>
                 <option value="code">💻 Código</option>
                 <option value="acp">🏗️ Arquitetura</option>
             </select>
-            <!-- ===== PROJETOS RECENTES ===== -->
-            <select id="recentSelect" disabled title="Projetos recentes"></select>
-            <!-- ===== BOTÃO SELECIONAR PASTA ===== -->
-            <button class="btn-folder" id="selectFolderBtn">📁 Selecionar Pasta</button>
-            <!-- ===== NOVO BOTÃO DESVINCULAR ===== -->
-            <button class="btn-unlink" id="unlinkFolderBtn" disabled>🔗 Desvincular</button>
-            <button class="btn-config" id="configBtn">🔑 Chave</button>
-            <!-- ===== TERMINAL ===== -->
-            <button class="btn-theme" id="terminalBtn" title="Abrir terminal do projeto">▶️ Terminal</button>
-            <!-- ===== GIT ===== -->
-            <button class="btn-theme" id="gitBtn" title="Git">🔀</button>
-            <!-- ===== PUBLICAR VERSÃO (GitHub/GitLab) ===== -->
-            <button class="btn-theme" id="publishVersionBtn" title="Detectar repositório e publicar versão" disabled>🚀</button>
-            <!-- ===== BACKUP ===== -->
-            <button class="btn-theme" id="backupBtn" title="Restaurar backup">↩️</button>
-            <!-- ===== SNAPSHOTS ROTULADOS ===== -->
-            <button class="btn-theme" id="snapshotBtn" title="Snapshots rotulados da pasta">📸</button>
-            <!-- ===== EMPACOTAR / BUILD ===== -->
-            <button class="btn-theme" id="buildBtn" title="Empacotar a aplicação em executável">📦</button>
-            <!-- ===== TEMA ===== -->
+            <button class="btn-toolbar" id="buildHeaderBtn" title="Empacotar (Build)">📦</button>
+            <button class="btn-toolbar" id="browserHeaderBtn" title="Navegador Integrado">🌐</button>
+            <button class="btn-toolbar" id="testHeaderBtn" title="Test Runner">🧪</button>
             <button class="btn-theme" id="themeBtn" title="Alternar tema claro/escuro">☀️</button>
+            <select id="recentSelect" disabled title="Projetos recentes"></select>
+            <button class="btn-folder" id="selectFolderBtn" onclick="selectFolder()">📁 Selecionar Pasta</button>
+            <button class="btn-folder" id="newProjectHeaderBtn" onclick="newProject()" style="background:#a371f7;">➕ Novo Projeto</button>
+            <button class="btn-unlink" id="unlinkFolderBtn" disabled>🔗 Desvincular</button>
         </div>
     </div>
 
     <!-- ===== MAIN ===== -->
     <div class="main-container">
 
-        <!-- ===== EXPLORADOR ===== -->
-        <div class="explorer">
+        <!-- ===== ACTIVITY BAR ===== -->
+        <div class="activitybar" id="activityBar">
+            <div class="activitybar-icon active" data-panel="explorer" title="Explorador (Ctrl+Shift+E)">📁</div>
+            <div class="activitybar-icon" data-panel="search" title="Buscar (Ctrl+Shift+F)">🔍</div>
+            <div class="activitybar-icon" data-panel="git" title="Source Control (Ctrl+Shift+G)">⎇<span class="badge" id="gitBadge" style="display:none;">0</span></div>
+            <div class="activitybar-icon" data-panel="debug" title="Debug (Ctrl+Shift+D)">🐛</div>
+            <div class="activitybar-icon" data-panel="docker" title="Docker (Ctrl+Shift+K)">🐳</div>
+            <div class="activitybar-icon" data-panel="ssh" title="SSH Remoto (Ctrl+Shift+R)">🔗</div>
+        </div>
+
+        <!-- ===== SIDEBAR: EXPLORADOR ===== -->
+        <div class="sidebar-panel active" data-panel="explorer" id="sidebarExplorer">
             <div class="explorer-header">
                 <span>📁 EXPLORADOR</span>
                 <span class="path-display" id="currentPathDisplay">Nenhuma pasta</span>
-                <!-- ===== NOVO INDICADOR DE STATUS ===== -->
                 <span class="path-status unlinked" id="pathStatus">🔗 Desvinculado</span>
             </div>
             <input type="text" id="searchInput" class="search-input" placeholder="🔍 Buscar arquivos / código..." disabled>
@@ -2306,14 +3250,93 @@ body.theme-light .chat-area,
             </div>
         </div>
 
+        <!-- ===== SIDEBAR: BUSCA ===== -->
+        <div class="sidebar-panel" data-panel="search" id="sidebarSearch">
+            <div class="explorer-header"><span>🔍 BUSCAR</span></div>
+            <input type="text" class="sidebar-search-input" id="sidebarSearchInput" placeholder="Buscar em arquivos..." onkeydown="if(event.key==='Enter')runSidebarSearch()">
+            <div class="sidebar-search-results" id="sidebarSearchResults" style="flex:1;overflow-y:auto;"></div>
+        </div>
+
+        <!-- ===== SIDEBAR: GIT ===== -->
+        <div class="sidebar-panel" data-panel="git" id="sidebarGit">
+            <div class="explorer-header"><span>⎇ SOURCE CONTROL</span></div>
+            <div class="sidebar-git-header">
+                <input type="text" id="sidebarGitMessage" placeholder="Mensagem do commit...">
+                <button class="btn-save" style="padding:3px 10px;font-size:11px;white-space:nowrap;" onclick="sidebarGitCommit()">✔ Commit</button>
+            </div>
+            <div style="display:flex;gap:4px;padding:4px 12px;font-size:10px;border-bottom:1px solid #30363d;">
+                <button class="btn-toolbar" style="font-size:10px;padding:2px 6px;" onclick="sidebarGitPush()" title="Push">⬆ Push</button>
+                <button class="btn-toolbar" style="font-size:10px;padding:2px 6px;" onclick="sidebarGitPull()" title="Pull">⬇ Pull</button>
+                <button class="btn-toolbar" style="font-size:10px;padding:2px 6px;" onclick="sidebarGitRefresh()" title="Refresh">🔄</button>
+                <button class="btn-toolbar" style="font-size:10px;padding:2px 6px;" onclick="sidebarGitDiff()" title="Diff">📊 Diff</button>
+            </div>
+            <div class="sidebar-git-files" id="sidebarGitFiles">⏳ Carregando...</div>
+        </div>
+
+        <!-- ===== SIDEBAR: DEBUG ===== -->
+        <div class="sidebar-panel" data-panel="debug" id="sidebarDebug">
+            <div class="explorer-header"><span>🐛 DEBUG</span></div>
+            <div style="padding:4px 12px;display:flex;gap:4px;border-bottom:1px solid #30363d;flex-wrap:wrap;">
+                <button class="btn-toolbar" style="font-size:11px;" onclick="debugStart()" title="Iniciar (F5)">▶ Iniciar</button>
+                <button class="btn-toolbar" style="font-size:11px;" onclick="debugStop()" title="Parar">⏹</button>
+                <button class="btn-toolbar" style="font-size:11px;" onclick="debugStep()" title="Step Over (F10)">⬇</button>
+                <button class="btn-toolbar" style="font-size:11px;" onclick="debugStepInto()" title="Step Into (F11)">↘</button>
+                <button class="btn-toolbar" style="font-size:11px;" onclick="debugStepOut()" title="Step Out">↗</button>
+                <button class="btn-toolbar" style="font-size:11px;" onclick="debugResume()" title="Continuar (F5)">▶▶</button>
+            </div>
+            <div style="padding:4px 12px;font-size:11px;color:#8b949e;border-bottom:1px solid #30363d;">
+                <span id="sidebarDebugStatus">⏸ Parado</span>
+            </div>
+            <div class="sidebar-debug-vars" id="sidebarDebugVars">
+                <div style="padding:8px;color:#8b949e;">Breakpoints aparecem como bolinhas vermelhas na gutter do editor. Clique na gutter para alternar.</div>
+            </div>
+        </div>
+
+        <!-- ===== SIDEBAR: DOCKER ===== -->
+        <div class="sidebar-panel" data-panel="docker" id="sidebarDocker">
+            <div class="explorer-header"><span>🐳 DOCKER</span></div>
+            <div style="padding:8px 12px;display:flex;gap:4px;flex-wrap:wrap;border-bottom:1px solid #30363d;">
+                <button class="btn-toolbar" style="font-size:10px;" onclick="sidebarDockerCmd('docker ps')">ps</button>
+                <button class="btn-toolbar" style="font-size:10px;" onclick="sidebarDockerCmd('docker images')">images</button>
+                <button class="btn-toolbar" style="font-size:10px;" onclick="sidebarDockerCmd('docker-compose up -d')">up</button>
+                <button class="btn-toolbar" style="font-size:10px;" onclick="sidebarDockerCmd('docker-compose down')">down</button>
+                <button class="btn-toolbar" style="font-size:10px;" onclick="sidebarDockerRefresh()">🔄</button>
+            </div>
+            <div style="flex:1;overflow-y:auto;padding:8px;font-size:11px;font-family:Consolas,monospace;white-space:pre-wrap;color:#c9d1d9;" id="sidebarDockerOutput">🔍 Verificando Docker...</div>
+        </div>
+
+        <div class="sidebar-panel" data-panel="ssh" id="sidebarSsh">
+            <div class="explorer-header"><span>🔗 SSH REMOTO</span></div>
+            <div style="padding:6px 12px;display:flex;flex-direction:column;gap:4px;border-bottom:1px solid #30363d;">
+                <input id="sshHost" type="text" placeholder="host (ex: user@192.168.1.10)" style="background:#0d1117;border:1px solid #30363d;border-radius:4px;color:#e6edf3;font-size:11px;padding:3px 6px;">
+                <div style="display:flex;gap:4px;">
+                    <input id="sshPort" type="text" placeholder="porta" value="22" style="width:60px;background:#0d1117;border:1px solid #30363d;border-radius:4px;color:#e6edf3;font-size:11px;padding:3px 6px;">
+                    <input id="sshKey" type="text" placeholder="caminho da chave (opcional)" style="flex:1;background:#0d1117;border:1px solid #30363d;border-radius:4px;color:#e6edf3;font-size:11px;padding:3px 6px;">
+                </div>
+                <div style="display:flex;gap:4px;">
+                    <button class="btn-toolbar" style="font-size:10px;flex:1;" onclick="sidebarSshConnect()">🔌 Conectar</button>
+                    <button class="btn-toolbar" style="font-size:10px;flex:1;" onclick="sidebarSshDisconnect()">❌ Desconectar</button>
+                </div>
+                <span id="sshStatus" style="font-size:10px;color:#8b949e;">Desconectado</span>
+            </div>
+            <div style="padding:6px 12px;display:flex;gap:4px;border-bottom:1px solid #30363d;">
+                <input id="sshCmd" type="text" placeholder="comando..." style="flex:1;background:#0d1117;border:1px solid #30363d;border-radius:4px;color:#e6edf3;font-size:11px;padding:3px 6px;" onkeypress="if(event.key==='Enter')sidebarSshExec()">
+                <button class="btn-toolbar" style="font-size:10px;" onclick="sidebarSshExec()">▶</button>
+            </div>
+            <div style="flex:1;overflow-y:auto;padding:8px;font-size:11px;font-family:Consolas,monospace;white-space:pre-wrap;color:#c9d1d9;" id="sidebarSshOutput">⚡ Painel SSH — conecte-se a um servidor remoto</div>
+        </div>
+
         <!-- ===== DIVISOR ESQUERDO ===== -->
-        <div class="resizer" id="resizerLeft" data-target="explorer"></div>
+        <div class="resizer" id="resizerLeft" data-target="sidebarPanel"></div>
 
         <!-- ===== PAINEL DE ATIVIDADE (CENTRO) ===== -->
         <div class="activity">
             <div class="activity-header">
-                <span class="activity-title">⚙️ Atividade da IA</span>
-                <button class="btn-theme" id="clearActivityBtn" title="Limpar atividades">🗑️ Limpar</button>
+                <span class="activity-title" id="activityTitle">⚙️ Atividade da IA</span>
+                <button class="tab-btn active" id="tabActivityBtn" title="Log de atividades" onclick="switchCenterTab('activity')">📋 Log</button>
+                <button class="tab-btn" id="tabWorkflowBtn" title="Pipeline reativo" onclick="switchCenterTab('workflow')">🔄 Pipeline</button>
+                <button class="tab-btn" id="tabTerminalBtn" title="Terminal da IA" onclick="switchCenterTab('terminal')">💻 Terminal</button>
+                <button class="btn-theme" id="clearActivityBtn" title="Limpar atividades" onclick="clearActivity()">🗑️ Limpar</button>
             </div>
             <div class="activity-list" id="activityList">
                 <div class="activity-empty">
@@ -2321,17 +3344,31 @@ body.theme-light .chat-area,
                     <span class="activity-empty-sub">Envie um comando no chat para acompanhar aqui</span>
                 </div>
             </div>
+            <div id="workflowView">
+                <div class="wf-pipeline" id="wfPipeline"></div>
+            </div>
+            <div id="terminalView">
+                <div class="term-output" id="terminalOutput"></div>
+            </div>
         </div>
 
         <!-- ===== DIVISOR DIREITO ===== -->
         <div class="resizer" id="resizerRight" data-target="chat-area"></div>
 
         <!-- ===== CHAT (DIREITA) ===== -->
-        <div class="chat-area">
+        <div class="chat-area" id="chatArea">
             <div class="chat-toolbar">
                 <span class="chat-toolbar-title">💬 Conversa</span>
-                <button class="btn-theme" id="exportChatBtn" title="Exportar conversa">⬇️ Exportar</button>
-                <button class="btn-theme" id="clearChatBtn" title="Limpar conversa">🗑️ Limpar</button>
+                <button class="btn-mode-toggle" id="planModeToggle" title="Alternar Modo Planejar/Executar (TAB)" onclick="togglePlanMode()">
+                    <span class="mode-indicator" id="modeIndicator">🔨</span>
+                    <span class="mode-label" id="modeLabel">Build</span>
+                </button>
+                <button class="btn-theme" id="reviewToggleBtn" title="Revisar alterações antes de aplicar" onclick="toggleReviewMode()" style="font-size:10px;">🚀 Direto</button>
+                <button class="btn-theme" id="undoBtn" title="Desfazer última alteração (Ctrl+Z)" onclick="undoLastChange()" disabled>↩ Desfazer</button>
+                <button class="btn-theme" id="redoBtn" title="Refazer (Ctrl+Y)" onclick="redoLastChange()" disabled>↪ Refazer</button>
+                <button class="btn-theme" id="shareChatBtn" title="Gerar link compartilhável" onclick="shareChat()">🔗 Compartilhar</button>
+                <button class="btn-theme" id="exportChatBtn" title="Exportar conversa" onclick="exportChat()">⬇ Exportar</button>
+                <button class="btn-theme" id="clearChatBtn" title="Limpar conversa" onclick="clearChat()">🗑️ Limpar</button>
             </div>
             <div id="messages">
                 <div class="message system">👋 Bem-vindo ao Aedificator Codex IDE!</div>
@@ -2347,17 +3384,66 @@ body.theme-light .chat-area,
             </div>
 
             <div class="input-area">
-                <input type="text" id="chatInput" placeholder="Digite seu comando...">
-                <button id="cancelButton" style="display:none;">⏹️ Cancelar</button>
-                <button id="sendButton">Enviar</button>
+                <input type="text" id="chatInput" placeholder="Digite seu comando... (@ para referenciar arquivos)">
+                <div class="autocomplete-dropdown" id="autocompleteDropdown"></div>
+                <button id="fixErrorsBtn" style="display:none;background:#d29922;border:none;color:#fff;padding:6px 12px;border-radius:6px;cursor:pointer;font-size:12px;white-space:nowrap;" onclick="fixErrorsWithAI()" title="Corrigir erros automaticamente">🔧 Corrigir erros</button>
+                <button id="cancelButton" style="display:none;" onclick="cancelTask()">⏹️ Cancelar</button>
+                <button id="sendButton" onclick="sendMessage()">Enviar</button>
+            </div>
+            <div class="drop-overlay" id="dropOverlay">
+                <div class="drop-overlay-content">
+                    <span style="font-size:32px;">📎</span>
+                    <span>Solte imagens ou arquivos aqui para anexar ao prompt</span>
+                </div>
             </div>
         </div>
     </div>
 
-    <!-- ===== FOOTER ===== -->
-    <div class="footer">
-        <span id="appVersion">Aedificator Codex IDE v1.0.0</span>
-        <span id="backendStatus" class="status-offline">🔴 Desconectado</span>
+    <!-- ===== BOTTOM PANEL ===== -->
+    <div class="bottom-panel" id="bottomPanel">
+        <div class="bottom-panel-tabs" id="bottomPanelTabs">
+            <span class="bottom-tab active" data-tab="terminal">Terminal</span>
+            <span class="bottom-tab" data-tab="output">Saída</span>
+            <span class="bottom-tab" data-tab="problems">Problemas</span>
+            <span class="bottom-tab" data-tab="debugconsole">Debug Console</span>
+            <span class="bottom-tab" style="margin-left:auto;padding:4px 8px;cursor:pointer;font-size:14px;" id="bottomPanelToggle" title="Fechar painel">✕</span>
+        </div>
+        <div class="bottom-panel-content">
+            <div class="bottom-pane active" data-tab="terminal" id="bottomTerminal">
+                <div class="terminal-inner" id="bottomTerminalOutput" style="padding:8px;flex:1;overflow-y:auto;white-space:pre-wrap;word-break:break-all;">Terminal integrado — Pressione Ctrl+B para abrir/fechar</div>
+                <div class="terminal-input-row">
+                    <span style="padding:6px 4px 6px 10px;color:#58a6ff;flex-shrink:0;font-family:Consolas,monospace;font-size:12px;">$</span>
+                    <input type="text" id="bottomTerminalInput" placeholder="Comando..." onkeydown="if(event.key==='Enter')bottomTerminalSend()">
+                </div>
+            </div>
+            <div class="bottom-pane" data-tab="output" id="bottomOutput">
+                <div style="padding:8px;flex:1;overflow-y:auto;white-space:pre-wrap;font-family:Consolas,monospace;font-size:12px;color:#c9d1d9;" id="bottomOutputContent">Pronto.</div>
+            </div>
+            <div class="bottom-pane" data-tab="problems" id="bottomProblems">
+                <div style="padding:8px;flex:1;overflow-y:auto;font-family:Consolas,monospace;font-size:12px;color:#c9d1d9;" id="bottomProblemsContent">Nenhum problema detectado.</div>
+            </div>
+            <div class="bottom-pane" data-tab="debugconsole" id="bottomDebugConsole">
+                <div style="padding:8px;flex:1;overflow-y:auto;white-space:pre-wrap;font-family:Consolas,monospace;font-size:12px;color:#c9d1d9;" id="bottomDebugConsoleContent">Debug Console</div>
+            </div>
+        </div>
+    </div>
+
+    <!-- ===== STATUS BAR ===== -->
+    <div class="statusbar" id="statusBar">
+        <span id="statusProject">&nbsp;</span>
+        <span class="status-clickable" id="statusGitBranch" onclick="switchActivityBar('git')" title="Source Control">⎇ main</span>
+        <span id="statusErrors" class="status-clickable" onclick="toggleBottomPanel('problems')" title="Problemas">⚠️ 0 erros</span>
+        <span style="margin-left:auto;" id="statusCursor">Ln 1, Col 1</span>
+        <span id="statusEncoding">UTF-8</span>
+        <span id="statusLang">Plaintext</span>
+        <span class="status-clickable" onclick="toggleBottomPanel('terminal')" title="Terminal (Ctrl+B)">▱</span>
+        <span id="statusBackend" style="color:#f85149;">🔴</span>
+    </div>
+
+    <!-- ===== COMMAND PALETTE ===== -->
+    <div class="command-palette" id="commandPalette">
+        <input type="text" id="commandPaletteInput" placeholder="Digite um comando...">
+        <div class="command-palette-results" id="commandPaletteResults"></div>
     </div>
 
     <!-- ===== TOAST ===== -->
@@ -2365,9 +3451,15 @@ body.theme-light .chat-area,
 
     <!-- ===== CONFIG MODAL ===== -->
     <div id="configModal">
-        <div class="modal-content">
-            <h2>🔑 Configurar Chaves API</h2>
-            <p class="modal-desc">Insira suas chaves para usar os modelos.</p>
+        <div class="modal-content" style="max-width:580px;">
+            <h2>⚙️ Configurações</h2>
+            <div style="display:flex;gap:4px;margin-bottom:12px;border-bottom:1px solid #30363d;">
+                <button class="config-tab active" data-tab="api">🔑 API Keys</button>
+                <button class="config-tab" data-tab="editor">📝 Editor</button>
+                <button class="config-tab" data-tab="geral">⚙️ Geral</button>
+            </div>
+            <div class="config-panel" id="configPanelApi">
+            <p class="modal-desc">Insira suas chaves para usar os modelos de IA.</p>
 
             <div class="field-group">
                 <label>Gemini API Key</label>
@@ -2387,11 +3479,77 @@ body.theme-light .chat-area,
                 <a class="helper-link" href="https://opencode.ai" target="_blank">Obter chave →</a>
             </div>
 
+            <div class="field-group">
+                <label>OpenAI (ChatGPT) API Key</label>
+                <input id="openaiKeyInput" type="password" placeholder="Chave OpenAI...">
+                <a class="helper-link" href="https://platform.openai.com/api-keys" target="_blank">Obter chave →</a>
+            </div>
+
+            <div class="field-group">
+                <label>Anthropic (Claude) API Key</label>
+                <input id="claudeKeyInput" type="password" placeholder="Chave Anthropic...">
+                <a class="helper-link" href="https://console.anthropic.com/settings/keys" target="_blank">Obter chave →</a>
+            </div>
+            </div>
+
+            <div class="config-panel" id="configPanelEditor" style="display:none;">
+            <p class="modal-desc">Personalize o editor de código.</p>
+            <div class="field-group">
+                <label>Tamanho da fonte</label>
+                <input id="configFontSize" type="number" min="10" max="24" value="13" style="width:80px;">
+            </div>
+            <div class="field-group">
+                <label>Tamanho do tab</label>
+                <input id="configTabSize" type="number" min="2" max="8" value="4" style="width:80px;">
+            </div>
+            <div class="field-group">
+                <label><input type="checkbox" id="configWordWrap" style="margin-right:6px;">Quebra de linha (word wrap)</label>
+            </div>
+            <div class="field-group">
+                <label><input type="checkbox" id="configMinimap" checked style="margin-right:6px;">Minimapa</label>
+            </div>
+            <div class="field-group">
+                <label><input type="checkbox" id="configFormatOnSave" style="margin-right:6px;">Formatar ao salvar</label>
+            </div>
+            <div class="field-group">
+                <label><input type="checkbox" id="configAutoSave" style="margin-right:6px;">Auto-save (1.5s após editar)</label>
+            </div>
+            </div>
+
+            <div class="config-panel" id="configPanelGeral" style="display:none;">
+            <p class="modal-desc">Configurações gerais da IDE.</p>
+            <div class="field-group">
+                <label>Backend URL</label>
+                <input id="configBackendUrl" type="text" placeholder="http://localhost:3001" value="http://localhost:3001">
+            </div>
+            <div class="field-group">
+                <label><input type="checkbox" id="configAutoCommit" checked style="margin-right:6px;"> Auto-commit após alterações da IA</label>
+            </div>
+            </div>
+
             <div class="modal-actions">
                 <button class="btn-save" id="saveConfigBtn">💾 Salvar</button>
-                <button class="btn-close-modal" id="closeConfigBtn">❌ Fechar</button>
+                <button class="btn-close-modal" id="closeConfigBtn" onclick="document.getElementById('configModal').style.display='none'">❌ Fechar</button>
             </div>
             <div id="configStatus"></div>
+        </div>
+    </div>
+
+    <!-- ===== PREÇOS E COTAÇÃO (painel inline) ===== -->
+    <div id="pricingPanel" style="display:none;position:absolute;top:48px;left:8px;background:#161b22;border:1px solid #30363d;border-radius:6px;padding:8px 10px;z-index:100;min-width:260px;box-shadow:0 4px 12px rgba(0,0,0,0.4);">
+        <div style="font-size:10px;color:#8b949e;margin-bottom:6px;">💲 Preços e Cotação</div>
+        <div style="font-size:9px;color:#58a6ff;margin-bottom:4px;">USD 1 = R$ <span id="pInlineUsd">5,80</span> <span style="color:#3fb950;margin-left:4px;">(automático)</span></div>
+        <div style="font-size:9px;color:#8b949e;margin-bottom:2px;">Preço por 1M tokens (USD):</div>
+        <table style="font-size:9px;color:#c9d1d9;width:100%;border-collapse:collapse;">
+            <tr><td style="padding:1px 4px;color:#484f58;">Provedor</td><td style="padding:1px 4px;color:#484f58;">Input</td><td style="padding:1px 4px;color:#484f58;">Output</td><td style="padding:1px 4px;color:#484f58;">Cache</td></tr>
+            <tr><td style="padding:1px 4px;">DeepSeek</td><td><input id="pDeepInput" type="number" step="0.001" style="width:50px;background:#0d1117;border:1px solid #30363d;color:#e6edf3;font-size:9px;padding:1px 2px;"></td><td><input id="pDeepOutput" type="number" step="0.001" style="width:50px;background:#0d1117;border:1px solid #30363d;color:#e6edf3;font-size:9px;padding:1px 2px;"></td><td><input id="pDeepCache" type="number" step="0.001" style="width:50px;background:#0d1117;border:1px solid #30363d;color:#e6edf3;font-size:9px;padding:1px 2px;"></td></tr>
+            <tr><td style="padding:1px 4px;">Gemini</td><td><input id="pGemInput" type="number" step="0.001" style="width:50px;background:#0d1117;border:1px solid #30363d;color:#e6edf3;font-size:9px;padding:1px 2px;"></td><td><input id="pGemOutput" type="number" step="0.001" style="width:50px;background:#0d1117;border:1px solid #30363d;color:#e6edf3;font-size:9px;padding:1px 2px;"></td><td style="padding:1px 4px;color:#484f58;">—</td></tr>
+            <tr><td style="padding:1px 4px;">OpenAI</td><td><input id="pOaiInput" type="number" step="0.001" style="width:50px;background:#0d1117;border:1px solid #30363d;color:#e6edf3;font-size:9px;padding:1px 2px;"></td><td><input id="pOaiOutput" type="number" step="0.001" style="width:50px;background:#0d1117;border:1px solid #30363d;color:#e6edf3;font-size:9px;padding:1px 2px;"></td><td style="padding:1px 4px;color:#484f58;">—</td></tr>
+            <tr><td style="padding:1px 4px;">Claude</td><td><input id="pClInput" type="number" step="0.001" style="width:50px;background:#0d1117;border:1px solid #30363d;color:#e6edf3;font-size:9px;padding:1px 2px;"></td><td><input id="pClOutput" type="number" step="0.001" style="width:50px;background:#0d1117;border:1px solid #30363d;color:#e6edf3;font-size:9px;padding:1px 2px;"></td><td style="padding:1px 4px;color:#484f58;">—</td></tr>
+        </table>
+        <div style="margin-top:6px;display:flex;gap:4px;">
+            <button style="font-size:9px;background:#1f6feb;border:none;color:#fff;padding:2px 8px;border-radius:3px;cursor:pointer;" id="savePricingInlineBtn">Salvar</button>
+            <button style="font-size:9px;background:#21262d;border:1px solid #30363d;color:#8b949e;padding:2px 8px;border-radius:3px;cursor:pointer;" onclick="document.getElementById('pricingPanel').style.display='none'">Fechar</button>
         </div>
     </div>
 
@@ -2412,33 +3570,24 @@ body.theme-light .chat-area,
             </div>
 
             <div class="modal-actions">
-                <button class="btn-save" id="pickerSelectBtn">✅ Selecionar esta pasta</button>
-                <button class="btn-close-modal" id="pickerCancelBtn">❌ Cancelar</button>
+                <button class="btn-save" id="pickerSelectBtn" onclick="pickerSelect()">✅ Selecionar esta pasta</button>
+                <button class="btn-close-modal" id="pickerCancelBtn" onclick="closeFolderPicker()">❌ Cancelar</button>
             </div>
         </div>
     </div>
 
     <!-- ===== APROVAÇÃO DO PLANO ===== -->
     <div id="approvalModal">
-        <div class="modal-content">
+        <div class="modal-content approval-wide">
             <h2>📋 Aprovar Plano</h2>
-            <p class="modal-desc" id="approvalDesc">A IA gerou o seguinte plano de alterações. Revise e aprove:</p>
+            <p class="modal-desc">A IA gerou o seguinte plano de alterações. Revise, edite e aprove:</p>
 
             <div class="approval-resumo" id="approvalResumo"></div>
 
-            <div class="approval-suggestions" id="approvalSuggestions" style="display:none;"></div>
-
             <div class="approval-list" id="approvalFilesList"></div>
 
-            <div class="suggestion-actions" id="suggestionQuickActions" style="display:none;">
-                <button class="btn-link" id="suggestAllBtn">☑ Selecionar todas</button>
-                <button class="btn-link" id="suggestNoneBtn">☐ Limpar seleção</button>
-            </div>
-
-            <div class="approval-options">
-                <label class="approval-check">
-                    <input type="checkbox" id="autoExecCheckbox"> ⚡ Executar automaticamente após o tempo (não recomendado)
-                </label>
+            <div class="approval-note">
+                <textarea id="approvalNoteInput" rows="2" placeholder="Nota de ajuste (ex: remove a alteração do arquivo X, mantém só o Y)"></textarea>
             </div>
 
             <div class="approval-auto-msg" id="approvalAutoMsg"></div>
@@ -2457,7 +3606,7 @@ body.theme-light .chat-area,
             <p class="modal-desc">Selecione um arquivo para restaurar a versão anterior (antes da última alteração).</p>
             <div class="approval-list" id="backupList"></div>
             <div class="modal-actions">
-                <button class="btn-close-modal" id="backupCloseBtn">❌ Fechar</button>
+                <button class="btn-close-modal" id="backupCloseBtn" onclick="document.getElementById('backupModal').style.display='none'">❌ Fechar</button>
             </div>
         </div>
     </div>
@@ -2473,22 +3622,29 @@ body.theme-light .chat-area,
             </div>
             <div class="approval-list" id="snapshotList"></div>
             <div class="modal-actions">
-                <button class="btn-close-modal" id="snapshotCloseBtn">❌ Fechar</button>
+                <button class="btn-close-modal" id="snapshotCloseBtn" onclick="document.getElementById('snapshotModal').style.display='none'">❌ Fechar</button>
             </div>
         </div>
     </div>
 
     <!-- ===== GIT ===== -->
     <div id="gitModal">
-        <div class="modal-content">
+        <div class="modal-content" style="max-width:650px;">
             <h2>🔀 Git</h2>
             <p class="modal-desc">Status do repositório e commit das alterações.</p>
-            <pre class="git-output" id="gitOutput">⏳ Carregando status...</pre>
+            <pre class="git-output" id="gitOutput" style="max-height:180px;">⏳ Carregando status...</pre>
             <input type="text" id="gitMessageInput" placeholder="Mensagem do commit..." disabled>
+            <div style="display:flex;gap:6px;margin-top:6px;align-items:center;">
+                <span style="font-size:11px;color:#8b949e;">Merge branch:</span>
+                <input type="text" id="gitMergeBranch" placeholder="nome da branch..." style="flex:1;padding:3px 8px;background:#0d1117;color:#e6edf3;border:1px solid #30363d;border-radius:4px;font-size:11px;">
+                <button class="btn-toolbar" id="gitMergeBtn" style="font-size:10px;padding:2px 8px;">🔀 Merge</button>
+            </div>
             <div class="modal-actions">
                 <button class="btn-save" id="gitCommitBtn" disabled>✅ Commit</button>
+                <button class="btn-toolbar" id="gitStashBtn" style="font-size:11px;">📦 Stash</button>
+                <button class="btn-toolbar" id="gitStashPopBtn" style="font-size:11px;">📤 Pop Stash</button>
                 <button class="btn-toolbar" id="gitRefreshBtn">🔄 Atualizar</button>
-                <button class="btn-close-modal" id="gitCloseBtn">❌ Fechar</button>
+                <button class="btn-close-modal" id="gitCloseBtn" onclick="document.getElementById('gitModal').style.display='none'">❌ Fechar</button>
             </div>
         </div>
     </div>
@@ -2541,7 +3697,7 @@ body.theme-light .chat-area,
             <div class="pub-output" id="pubOutput" style="display:none;"></div>
             <div class="modal-actions">
                 <button class="btn-save" id="pubRunBtn" disabled>🚀 Publicar versão</button>
-                <button class="btn-close-modal" id="pubCloseBtn">❌ Fechar</button>
+                <button class="btn-close-modal" id="pubCloseBtn" onclick="document.getElementById('publishModal').style.display='none'">❌ Fechar</button>
             </div>
         </div>
     </div>
@@ -2554,13 +3710,26 @@ body.theme-light .chat-area,
                 <h2 id="fileEditorTitle">Arquivo</h2>
                 <span id="fileEditorStatus"></span>
             </div>
+            <div class="editor-body" id="editorBody">
             <textarea id="fileEditorContent" spellcheck="false" placeholder="Carregando..."></textarea>
+            <div id="monacoContainer" style="display:none;flex:1;border:1px solid #30363d;border-radius:8px;overflow:hidden;"></div>
             <div class="editor-image-wrap" id="fileEditorImageWrap" style="display:none;">
                 <img id="fileEditorImage" alt="Pré-visualização">
             </div>
+            <div id="editorSplitRight" style="display:none;flex:1;flex-direction:column;min-width:0;">
+                <div class="editor-split-tabs" id="editorSplitTabs"></div>
+                <div id="monacoSplitContainer" style="flex:1;border:1px solid #30363d;border-radius:8px;overflow:hidden;min-height:200px;"></div>
+            </div>
+            </div>
+            <div id="outlinePanel" style="display:none;max-height:200px;overflow-y:auto;background:#0d1117;border:1px solid #30363d;border-radius:6px;padding:4px 0;font-size:11px;font-family:Consolas,monospace;"></div>
             <div class="modal-actions">
+                <button class="btn-save" id="fileEditorBlameBtn" title="Git Blame">👤 Blame</button>
+                <button class="btn-save" id="fileEditorPreviewBtn" title="Preview Markdown">👁️ Preview</button>
+                <button class="btn-save" id="fileEditorAnalyzeBtn" title="Analisar código">🔍 Analisar</button>
+                <button class="btn-save" id="fileEditorOutlineBtn" title="Outline / Símbolos">🗂️ Outline</button>
+                <button class="btn-save" id="fileEditorSplitBtn" title="Dividir editor (Split)">↔️ Split</button>
                 <button class="btn-save" id="fileEditorSaveBtn">💾 Salvar</button>
-                <button class="btn-close-modal" id="fileEditorCloseBtn">❌ Fechar</button>
+                <button class="btn-close-modal" id="fileEditorCloseBtn" onclick="closeFileEditor()">❌ Fechar</button>
             </div>
         </div>
     </div>
@@ -2570,9 +3739,12 @@ body.theme-light .chat-area,
         <div class="modal-content terminal-content">
             <div class="terminal-header">
                 <h2>▶️ Terminal do Projeto</h2>
-                <button class="btn-close-modal" id="terminalCloseBtn">❌ Fechar</button>
+                <div id="terminalTabs" class="terminal-tabs" style="display:flex;align-items:center;gap:2px;flex:1;margin-left:12px;">
+                    <span class="terminal-tab active" data-session-id="default" onclick="switchTerminalTab('default')">Term 1</span>
+                    <span id="terminalNewTabBtn" class="terminal-tab" onclick="newTerminalSession()" style="color:#8b949e;cursor:pointer;">+</span>
+                </div>
+                <button class="btn-close-modal" id="terminalCloseBtn" onclick="document.getElementById('terminalModal').style.display='none'">❌ Fechar</button>
             </div>
-            <p class="modal-desc">Execute comandos na pasta do projeto.</p>
             <pre class="cmd-output terminal-output" id="terminalOutput"></pre>
             <div class="terminal-input-row">
                 <input type="text" id="terminalInput" placeholder="Digite um comando (ex: npm test) e pressione Enter...">
@@ -2581,6 +3753,82 @@ body.theme-light .chat-area,
         </div>
     </div>
 
+    <!-- ===== DIFF MODAL ===== -->
+    <div id="diffModal" style="display:none; position:fixed; top:0; left:0; width:100%; height:100%; background:rgba(0,0,0,0.8); z-index:4000; align-items:center; justify-content:center;">
+        <div class="modal-content" style="width:800px;max-width:90vw;max-height:85vh;display:flex;flex-direction:column;">
+            <h2 id="diffEditorTitle">📊 Diff</h2>
+            <pre class="diff-output" id="diffOutput" style="flex:1;overflow:auto;"></pre>
+            <div class="modal-actions">
+                <button class="btn-save" id="diffCloseBtn" onclick="document.getElementById('diffModal').style.display='none'">❌ Fechar</button>
+            </div>
+        </div>
+    </div>
+
+    <!-- ===== TEST RUNNER MODAL ===== -->
+    <div id="testRunnerModal" style="display:none;">
+        <div class="modal-content" style="width:700px;max-width:90vw;">
+            <h2>🧪 Test Runner</h2>
+            <p class="modal-desc">Execute testes do projeto.</p>
+            <div class="snapshot-create-row">
+                <input type="text" id="testCmdInput" placeholder="node --test" value="node --test">
+                <button class="btn-save" id="testRunBtn">▶️ Rodar</button>
+                <button class="btn-toolbar" id="testDiscoverBtn" style="font-size:11px;">🔍 Descobrir</button>
+            </div>
+            <div id="testDiscovered" style="max-height:100px;overflow-y:auto;margin-top:4px;font-size:11px;font-family:Consolas,monospace;color:#c9d1d9;"></div>
+            <div class="test-summary" id="testSummary" style="margin-top:8px;font-size:13px;"></div>
+            <pre class="git-output" id="testOutput" style="max-height:200px;margin-top:8px;font-size:11px;">— saída dos testes —</pre>
+            <div class="approval-list" id="testResultList" style="max-height:300px;"></div>
+            <div class="modal-actions">
+                <button class="btn-toolbar" id="testConfigBtn">💾 Salvar comando</button>
+                <button class="btn-close-modal" id="testCloseBtn" onclick="document.getElementById('testRunnerModal').style.display='none'">❌ Fechar</button>
+            </div>
+        </div>
+    </div>
+
+    <!-- ===== NOVO PROJETO ===== -->
+    <div id="newProjectModal" style="display:none; position:fixed; top:0; left:0; width:100%; height:100%; background:rgba(0,0,0,0.8); z-index:4000; align-items:center; justify-content:center;">
+        <div class="modal-content" style="width:500px;max-width:90vw;">
+            <h2>📁 Novo Projeto</h2>
+            <p class="modal-desc">Crie uma nova pasta para começar um app do zero.</p>
+            <div class="field-group">
+                <label>Nome do projeto</label>
+                <input type="text" id="newProjectName" placeholder="meu-app" style="width:100%;padding:6px 10px;background:#0d1117;color:#e6edf3;border:1px solid #30363d;border-radius:4px;font-size:13px;">
+            </div>
+            <div class="field-group" style="margin-top:10px;">
+                <label>Pasta onde criar</label>
+                <div style="display:flex;gap:6px;">
+                    <input type="text" id="newProjectParent" style="flex:1;padding:6px 10px;background:#0d1117;color:#e6edf3;border:1px solid #30363d;border-radius:4px;font-size:13px;">
+                    <button class="btn-toolbar" id="newProjectBrowseBtn" style="font-size:12px;">📁</button>
+                </div>
+            </div>
+            <div class="modal-actions" style="margin-top:12px;">
+                <button class="btn-save" id="newProjectCreateBtn">✅ Criar Projeto</button>
+                <button class="btn-close-modal" onclick="document.getElementById('newProjectModal').style.display='none'">❌ Cancelar</button>
+            </div>
+        </div>
+    </div>
+
+    <!-- ===== NAVEGADOR INTEGRADO ===== -->
+    <div id="browserPanel">
+        <div class="terminal-panel-header" id="browserHeader" onmousedown="browserStartDrag(event)" ondblclick="browserMaximize()">
+            <span>🌐 Navegador Integrado</span>
+            <div style="display:flex;gap:6px;align-items:center;margin-left:auto;">
+                <input type="text" id="browserUrlInput" placeholder="http://localhost:3000" style="padding:3px 8px;background:#0d1117;color:#e6edf3;border:1px solid #30363d;border-radius:4px;font-size:12px;width:300px;" onkeydown="if(event.key==='Enter')browserNavigate()">
+                <button class="btn-toolbar" id="browserGoBtn" style="font-size:11px;padding:2px 8px;" onclick="browserNavigate()">▶</button>
+                <button class="btn-toolbar" id="browserRefreshBtn" style="font-size:11px;padding:2px 8px;" onclick="browserRefresh()">🔄</button>
+                <button class="btn-toolbar" id="browserMaxBtn" style="font-size:11px;padding:2px 6px;" title="Maximizar" onclick="browserMaximize()">🗖</button>
+                <button class="btn-close-modal" id="browserCloseBtn" onclick="closeBrowser()">✖️</button>
+            </div>
+        </div>
+        <div style="flex:1;background:#fff;position:relative;">
+            <iframe id="browserIframe" src="about:blank" style="width:100%;height:100%;border:none;"></iframe>
+        </div>
+    </div>
+
+    <!-- ===== MONACO EDITOR ===== -->
+    <script>var require = { paths: { vs: '/node_modules/monaco-editor/min/vs' }, 'vs/css': { disabled: true } };</script>
+    <script src="/node_modules/monaco-editor/min/vs/loader.js"></script>
     <script src="script.js"></script>
+    <script src="multi-agent.js"></script>
 </body>
 </html>

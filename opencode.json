@@ -1,5 +1,6 @@
 {
   "$schema": "https://opencode.ai/config.json",
+  "instructions": ["AGENTS.md"],
   "provider": {
     "opencode": {
       "options": {
@@ -7,6 +8,13 @@
         "chunkTimeout": 90000,
         "timeout": 600000
       }
+    }
+  },
+  "mcp": {
+    "filesystem": {
+      "command": "npx",
+      "args": ["-y", "@modelcontextprotocol/server-filesystem", "."],
+      "enabled": true
     }
   }
 }

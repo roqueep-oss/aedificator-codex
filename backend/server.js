@@ -8,6 +8,9 @@ const os = require('os');
 const crypto = require('crypto');
 const { spawn } = require('child_process');
 require('dotenv').config({ path: path.join(__dirname, '.env') });
+const { McpManager } = require('./mcp-client');
+const mcpManager = new McpManager();
+const { browserClient, getBrowserStatus, executeBrowserTool } = require('./browser-client');
 
 // ===== ENCODING UTF-8 (evita acentos corrompidos no console Windows) =====
 process.stdout.setDefaultEncoding('utf8');
@@ -33,10 +36,37 @@ app.use(express.json({ limit: '50mb' }));
 const frontendDir = path.join(__dirname, '..', 'frontend');
 app.use(express.static(frontendDir));
 
+const nodeModulesDir = path.join(__dirname, '..', 'node_modules');
+app.use('/node_modules', express.static(nodeModulesDir));
+
+// ===== SERVE ARQUIVOS DO PROJETO PARA O NAVEGADOR INTEGRADO =====
+app.get('/project/*', (req, res) => {
+    const relPath = req.params[0] || 'index.html';
+    const full = resolveSafePath(relPath);
+    if (!full || !fs.existsSync(full) || fs.statSync(full).isDirectory()) {
+        return res.status(404).send('Arquivo não encontrado');
+    }
+    const ext = path.extname(full).toLowerCase();
+    const mimeTypes = {
+        '.html': 'text/html', '.htm': 'text/html',
+        '.css': 'text/css', '.js': 'application/javascript', '.mjs': 'application/javascript',
+        '.json': 'application/json', '.svg': 'image/svg+xml',
+        '.png': 'image/png', '.jpg': 'image/jpeg', '.jpeg': 'image/jpeg',
+        '.gif': 'image/gif', '.webp': 'image/webp', '.ico': 'image/x-icon',
+        '.woff': 'font/woff', '.woff2': 'font/woff2', '.ttf': 'font/ttf',
+        '.txt': 'text/plain', '.md': 'text/markdown',
+    };
+    res.type(mimeTypes[ext] || 'application/octet-stream');
+    res.sendFile(full);
+});
+
 const server = http.createServer(app);
 const wss = new WebSocket.Server({ server });
 
 const runner = require('./runner');
+const debuggerRunner = require('./debugger');
+const analyzer = require('./analyzer');
+const remote = require('./remote');
 
 const PORT = process.env.PORT || 3001;
 
@@ -110,14 +140,19 @@ console.log(`📁 Diretório do projeto: ${PROJECT_ROOT}`);
 //  FUNÇÃO PARA ATUALIZAR O DIRETÓRIO DO PROJETO
 // =============================================
 function setProjectRoot(newPath) {
+    if (fileWatcher) { fileWatcher.close(); fileWatcher = null; }
     const resolvedPath = path.resolve(newPath);
     if (fs.existsSync(resolvedPath)) {
         PROJECT_ROOT = resolvedPath;
         lastRepoInfo = null;
+        invalidateDeepseekCache();
+        invalidateProjectCache();
+        startFileWatcher();
         console.log(`📁 Diretório do projeto alterado para: ${PROJECT_ROOT}`);
         return true;
     }
     console.log(`❌ Diretório não encontrado: ${resolvedPath}`);
+    PROJECT_ROOT = null;
     return false;
 }
 
@@ -136,8 +171,149 @@ let config = {
     opencode: {
         apiKey: process.env.OPENCODE_API_KEY || '',
         model: OPENCODE_DEFAULT_MODEL
+    },
+    openai: {
+        apiKey: process.env.OPENAI_API_KEY || '',
+        model: 'gpt-4o'
+    },
+    claude: {
+        apiKey: process.env.ANTHROPIC_API_KEY || '',
+        model: 'claude-sonnet-5'
+    },
+    autoCommit: true
+};
+
+const TOKEN_PRICES = {
+    deepseek: {
+        '__default': { input: 0.14, output: 0.28, cache: 0.0028 },
+        models: {
+            'deepseek-v4-flash': { input: 0.14, output: 0.28, cache: 0.0028 },
+            'deepseek-v4-pro': { input: 0.435, output: 0.87, cache: 0.0036 },
+            'deepseek-chat': { input: 0.14, output: 0.28, cache: 0.0028 }
+        }
+    },
+    gemini: {
+        '__default': { input: 0.15, output: 0.60 },
+        models: {
+            'gemini-3.5-flash': { input: 0.15, output: 0.60 },
+            'gemini-3.5-pro': { input: 1.25, output: 5.00 }
+        }
+    },
+    openai: {
+        '__default': { input: 2.50, output: 10.00 },
+        models: {
+            'gpt-4o': { input: 2.50, output: 10.00 },
+            'gpt-4o-mini': { input: 0.15, output: 0.60 }
+        }
+    },
+    claude: {
+        '__default': { input: 3.00, output: 15.00 },
+        models: {
+            'claude-sonnet-5': { input: 3.00, output: 15.00 },
+            'claude-sonnet-4-6': { input: 3.00, output: 15.00 },
+            'claude-haiku-4-5': { input: 1.00, output: 5.00 }
+        }
     }
 };
+
+function getModelPrice(provider, model) {
+    const p = TOKEN_PRICES[provider];
+    if (!p) return { input: 0, output: 0, cache: 0 };
+    if (model && p.models && p.models[model]) return p.models[model];
+    return p['__default'] || { input: 0, output: 0, cache: 0 };
+}
+let USD_TO_BRL = 5.80;
+let _usdBrlLastFetch = 0;
+
+async function fetchUsdBrlRate() {
+    const now = Date.now();
+    if (now - _usdBrlLastFetch < 3600000) return;
+    try {
+        const resp = await fetch('https://economia.awesomeapi.com.br/json/last/USD-BRL');
+        const data = await resp.json();
+        const rate = parseFloat(data.USDBRL?.bid);
+        if (rate && rate > 0) {
+            USD_TO_BRL = rate;
+            _usdBrlLastFetch = now;
+            console.log(`💲 Cotação USD/BRL atualizada: R$ ${rate}`);
+            try {
+                const pricingFile = path.join(__dirname, 'pricing.json');
+                const saved = fs.existsSync(pricingFile) ? JSON.parse(fs.readFileSync(pricingFile, 'utf-8')) : {};
+                saved.usdBrl = rate;
+                fs.writeFileSync(pricingFile, JSON.stringify(saved), 'utf-8');
+            } catch (e) {}
+        }
+    } catch (e) {
+        console.log('💲 Não foi possível atualizar cotação:', e.message);
+    }
+}
+
+const usagePath = path.join(__dirname, 'token_usage.json');
+let tokenUsage = {};
+
+function loadTokenUsage() {
+    try { if (fs.existsSync(usagePath)) tokenUsage = JSON.parse(fs.readFileSync(usagePath, 'utf-8')); } catch (e) {}
+    for (const p of ['deepseek', 'gemini', 'openai', 'claude']) {
+        if (!tokenUsage[p]) tokenUsage[p] = { input: 0, output: 0, cache: 0 };
+    }
+}
+
+function saveTokenUsage() {
+    try { fs.writeFileSync(usagePath, JSON.stringify(tokenUsage), 'utf-8'); } catch (e) {}
+}
+
+function trackTokens(provider, inputTokens, outputTokens, isCacheHit, model) {
+    if (!tokenUsage[provider]) tokenUsage[provider] = { input: 0, output: 0, cache: 0, models: {} };
+    if (isCacheHit) {
+        tokenUsage[provider].cache = (tokenUsage[provider].cache || 0) + (inputTokens || 0);
+    } else {
+        tokenUsage[provider].input = (tokenUsage[provider].input || 0) + (inputTokens || 0);
+    }
+    tokenUsage[provider].output = (tokenUsage[provider].output || 0) + (outputTokens || 0);
+    if (model) {
+        if (!tokenUsage[provider].models) tokenUsage[provider].models = {};
+        if (!tokenUsage[provider].models[model]) tokenUsage[provider].models[model] = { input: 0, output: 0, cache: 0 };
+        if (isCacheHit) {
+            tokenUsage[provider].models[model].cache = (tokenUsage[provider].models[model].cache || 0) + (inputTokens || 0);
+        } else {
+            tokenUsage[provider].models[model].input = (tokenUsage[provider].models[model].input || 0) + (inputTokens || 0);
+        }
+        tokenUsage[provider].models[model].output = (tokenUsage[provider].models[model].output || 0) + (outputTokens || 0);
+    }
+    saveTokenUsage();
+}
+
+function getUsageReport(provider, model) {
+    if (provider && tokenUsage[provider]) {
+        const u = tokenUsage[provider];
+        const price = getModelPrice(provider, model);
+        const inputCost = ((u.input || 0) / 1_000_000) * (price.input || 0);
+        const cacheCost = ((u.cache || 0) / 1_000_000) * (price.cache || price.input || 0);
+        const outputCost = ((u.output || 0) / 1_000_000) * (price.output || 0);
+        const totalUSD = inputCost + cacheCost + outputCost;
+        const totalBRL = totalUSD * USD_TO_BRL;
+        return {
+            provider,
+            model: model || '',
+            tokens: { input: u.input || 0, output: u.output || 0, cache: u.cache || 0 },
+            cost: { usd: Math.round(totalUSD * 10000) / 10000, brl: Math.round(totalBRL * 100) / 100 }
+        };
+    }
+    let totalBRL = 0;
+    const providers = {};
+    for (const [p, u] of Object.entries(tokenUsage)) {
+        const price = getModelPrice(p, null);
+        const inputCost = ((u.input || 0) / 1_000_000) * (price.input || 0);
+        const cacheCost = ((u.cache || 0) / 1_000_000) * (price.cache || price.input || 0);
+        const outputCost = ((u.output || 0) / 1_000_000) * (price.output || 0);
+        const usd = inputCost + cacheCost + outputCost;
+        providers[p] = { tokens: u, cost_usd: Math.round(usd * 10000) / 10000, cost_brl: Math.round(usd * USD_TO_BRL * 100) / 100 };
+        totalBRL += usd * USD_TO_BRL;
+    }
+    return { providers, total_brl: Math.round(totalBRL * 100) / 100 };
+}
+
+loadTokenUsage();
 
 const configPath = path.join(__dirname, 'config.json');
 if (fs.existsSync(configPath)) {
@@ -149,6 +325,10 @@ if (fs.existsSync(configPath)) {
         if (savedConfig.deepseek?.model) config.deepseek.model = savedConfig.deepseek.model;
         if (savedConfig.opencode?.apiKey) config.opencode.apiKey = decryptSecret(savedConfig.opencode.apiKey);
         if (savedConfig.opencode?.model) config.opencode.model = savedConfig.opencode.model;
+        if (savedConfig.openai?.apiKey) config.openai.apiKey = decryptSecret(savedConfig.openai.apiKey);
+        if (savedConfig.openai?.model) config.openai.model = savedConfig.openai.model;
+        if (savedConfig.claude?.apiKey) config.claude.apiKey = decryptSecret(savedConfig.claude.apiKey);
+        if (savedConfig.claude?.model) config.claude.model = savedConfig.claude.model;
         console.log('✅ Configuração carregada');
     } catch (e) {
         console.log('⚠️ Erro ao carregar configuração');
@@ -159,7 +339,9 @@ function saveConfigToFile() {
     const fileConfig = {
         gemini: { apiKey: encryptSecret(config.gemini.apiKey), model: config.gemini.model },
         deepseek: { apiKey: encryptSecret(config.deepseek.apiKey), model: config.deepseek.model },
-        opencode: { apiKey: encryptSecret(config.opencode.apiKey), model: config.opencode.model }
+        opencode: { apiKey: encryptSecret(config.opencode.apiKey), model: config.opencode.model },
+        openai: { apiKey: encryptSecret(config.openai.apiKey), model: config.openai.model },
+        claude: { apiKey: encryptSecret(config.claude.apiKey), model: config.claude.model }
     };
     fs.writeFileSync(configPath, JSON.stringify(fileConfig, null, 2));
 }
@@ -199,6 +381,67 @@ function readFileContent(filePath) {
     }
 }
 
+function buildFallbackSugestoes(task, aiText) {
+    const cleanTask = task
+        .replace(/^(crie|faça|implemente|ative|desenvolva|construa|cria|faz|implementa|ativa|desenvolve|constroi|ative)\s+/i, '')
+        .replace(/^(um|uma|o|a|os|as|todos\s+os|todos)\s+/i, '')
+        .trim()
+        .slice(0, 80);
+
+    function extractKeywords(text, maxLen) {
+        if (!text) return cleanTask.slice(0, maxLen);
+        const cleaned = text
+            .replace(/^(📋\s*|\*\*|__|#+\s*)/gm, '')
+            .replace(/\n{2,}/g, '. ')
+            .replace(/\n/g, ' ')
+            .replace(/\s{2,}/g, ' ')
+            .trim();
+        const sentences = cleaned.split(/[.!?]\s+/);
+        const meaningful = sentences.filter(s => s.length > 15 && !/^(aqui|segue|vamos|iremos|primeiro|antes|depois|então|assim|dessa|nesse|neste)/i.test(s));
+        if (meaningful.length >= 2) {
+            return meaningful.slice(0, 2).join('. ').slice(0, maxLen);
+        }
+        return cleaned.slice(0, maxLen);
+    }
+
+    const context = extractKeywords(aiText, 120);
+    const prefix = context && context !== cleanTask ? context + ' — ' : '';
+
+    return {
+        resumo: aiText || ('Solicitação: ' + cleanTask),
+        sugestoes: [
+            {
+                id: 's1',
+                titulo: 'Opção A (completa): ' + prefix + cleanTask,
+                descricao: 'Implementação robusta com todos os recursos, validações, testes automatizados e cobertura total.',
+                impacto: 'alto',
+                arquivos: []
+            },
+            {
+                id: 's2',
+                titulo: 'Opção B (média): ' + prefix + cleanTask,
+                descricao: 'Funcionalidades principais com cobertura moderada. Bom equilíbrio entre escopo, qualidade e prazo.',
+                impacto: 'médio',
+                arquivos: []
+            },
+            {
+                id: 's3',
+                titulo: 'Opção C (mínima): ' + prefix + cleanTask,
+                descricao: 'Apenas o essencial para funcionar. Ideal para validar a ideia ou prototipar rapidamente.',
+                impacto: 'baixo',
+                arquivos: []
+            },
+            {
+                id: 'custom',
+                titulo: 'Personalizado',
+                descricao: 'Descreva exatamente o que você deseja, com o nível de detalhe que preferir.',
+                impacto: 'médio',
+                arquivos: []
+            }
+        ]
+    };
+}
+
 function writeFileContent(filePath, content) {
     try {
         const fullPath = resolveSafePath(filePath);
@@ -211,6 +454,7 @@ function writeFileContent(filePath, content) {
             fs.mkdirSync(dir, { recursive: true });
         }
         fs.writeFileSync(fullPath, content, 'utf-8');
+        invalidateProjectCache();
         console.log(`✅ Arquivo escrito: ${fullPath}`);
         return true;
     } catch (error) {
@@ -225,6 +469,7 @@ function deleteFileContent(filePath) {
         if (!fullPath) return false;
         if (!fs.existsSync(fullPath)) return false;
         fs.unlinkSync(fullPath);
+        invalidateProjectCache();
         return true;
     } catch (error) {
         return false;
@@ -267,7 +512,7 @@ function trimOldBackups(relativePath) {
     if (versions.length > MAX_BACKUP_VERSIONS) {
         versions.sort((a, b) => a.mtime - b.mtime);
         for (const v of versions.slice(0, versions.length - MAX_BACKUP_VERSIONS)) {
-            try { fs.unlinkSync(path.join(dir, v.name)); } catch (e) {}
+            try { fs.unlinkSync(path.join(dir, v.name)); } catch (e) { console.warn("Backup trim unlink:", e.message); }
         }
     }
 }
@@ -313,7 +558,14 @@ function listDirectory(dirPath) {
         const result = [];
         for (const entry of entries) {
             try {
-                const isDir = entry.isDirectory();
+                let isDir = entry.isDirectory();
+                if (!isDir) {
+                    try {
+                        const target = path.join(fullPath, entry.name);
+                        const st = fs.statSync(target);
+                        isDir = st.isDirectory();
+                    } catch (e) {}
+                }
                 result.push({
                     name: entry.name,
                     isDirectory: isDir,
@@ -408,6 +660,9 @@ async function callGemini(prompt, onChunk, signal) {
 
     if (!response.ok) {
         const error = await response.text();
+        if (response.status === 429 || error.includes('RESOURCE_EXHAUSTED') || error.includes('spending cap')) {
+            throw new Error('Limite da API Gemini atingido. Acesse https://ai.studio/spend para aumentar o spending cap ou troque de provider no Aedificator (DeepSeek, OpenAI, Claude).');
+        }
         throw new Error(`Erro na API Gemini: ${response.status} - ${error}`);
     }
 
@@ -421,6 +676,7 @@ async function callGemini(prompt, onChunk, signal) {
     const decoder = new TextDecoder();
     let fullResponse = '';
     let buffer = '';
+    let lastGeminiUsage = null;
 
     while (true) {
         if (signal && signal.aborted) break;
@@ -443,8 +699,12 @@ async function callGemini(prompt, onChunk, signal) {
                         onChunk(part.text);
                     }
                 }
+                if (parsed.usageMetadata) lastGeminiUsage = parsed.usageMetadata;
             } catch (e) {}
         }
+    }
+    if (lastGeminiUsage) {
+        trackTokens('gemini', lastGeminiUsage.promptTokenCount || 0, lastGeminiUsage.candidatesTokenCount || 0, false, config.gemini.model);
     }
     return fullResponse;
 }
@@ -533,11 +793,15 @@ function ensureOpenCodeAuth(apiKey) {
                 auth = JSON.parse(fs.readFileSync(authFile, 'utf-8'));
             } catch (e) {}
         }
+        let changed = false;
         if (auth.opencode?.key !== apiKey) {
             auth.opencode = { type: 'api', key: apiKey };
+            changed = true;
+        }
+        if (changed) {
             fs.mkdirSync(dataDir, { recursive: true });
             fs.writeFileSync(authFile, JSON.stringify(auth, null, 2), 'utf-8');
-            console.log('✅ Chave opencode gravada no auth.json do CLI');
+            console.log('✅ Chave opencode Zen gravada no auth.json');
         }
         return true;
     } catch (e) {
@@ -558,8 +822,8 @@ function getOpenCodeAuthKey() {
     }
 }
 
-// ===== LISTAR MODELOS OPEncode (APENAS FREE) =====
-function parseOpenCodeModelsVerbose(raw) {
+// ===== LISTAR MODELOS OPEncode (TODOS ou apenas FREE) =====
+function parseOpenCodeModelsVerbose(raw, allModels = false) {
     const models = [];
     const lines = raw.split('\n');
     let i = 0;
@@ -593,8 +857,9 @@ function parseOpenCodeModelsVerbose(raw) {
         try {
             const obj = JSON.parse(jsonLines.join('\n'));
             const name = obj.name || shortId;
-            if (/free/i.test(name) || /free/i.test(shortId)) {
-                models.push({ id: 'opencode/' + shortId, name, provider: 'opencode', free: true });
+            const isFree = /free/i.test(name) || /free/i.test(shortId);
+            if (allModels || isFree) {
+                models.push({ id: 'opencode/' + shortId, name, provider: 'opencode', free: isFree });
             }
         } catch (e) {}
         i = j + 1;
@@ -602,7 +867,70 @@ function parseOpenCodeModelsVerbose(raw) {
     return models;
 }
 
+function parseTextOptions(text) {
+    const lines = text.split('\n');
+    const options = [];
+    const seenIds = new Set();
+
+    const letterPatterns = [
+        /^([A-E])[.)]\s*(.+?)(?:\s*[—–-]\s*(.+))?$/,
+        /^(Op[cç][aã]o\s*\d+)[\s:.)-]+(.+?)(?:\s*[—–-]\s*(.+))?$/i,
+        /^(\d+)[.)]\s*(.+?)(?:\s*[—–-]\s*(.+))?$/
+    ];
+
+    let multiLine = null;
+    for (const line of lines) {
+        if (multiLine) {
+            if (/^[A-E][.)]\s|^Op[cç][aã]o\s*\d+|^\d+[.)]\s|^Qual\s|^$|^[A-Z][a-z].*:$/.test(line.trim())) {
+                options.push(multiLine);
+                multiLine = null;
+            } else {
+                multiLine.descricao += ' ' + line.trim();
+                continue;
+            }
+        }
+        let matched = null;
+        for (const pat of letterPatterns) {
+            const m = line.match(pat);
+            if (m) { matched = m; break; }
+        }
+        if (matched) {
+            const id = 'oc' + (options.length + 1);
+            if (seenIds.has(id)) continue;
+            seenIds.add(id);
+            const titulo = (matched[1] + ': ' + (matched[2] || '')).trim().slice(0, 120);
+            const desc = (matched[3] || matched[2] || '').trim().slice(0, 200);
+            multiLine = { id, titulo, descricao: desc, impacto: 'médio', arquivos: [] };
+        }
+    }
+    if (multiLine) options.push(multiLine);
+
+    if (options.length < 2) {
+        const categoryRegex = /^[A-Z][^:]{2,40}:\s*(.+)/;
+        const seenTitles = new Set();
+        for (const line of lines) {
+            const m = line.match(categoryRegex);
+            if (m) {
+                const title = m[1].trim().slice(0, 100);
+                if (title.length < 10 || seenTitles.has(title)) continue;
+                seenTitles.add(title);
+                const id = 'oc' + (options.length + 1);
+                options.push({ id, titulo: title, descricao: title, impacto: 'médio', arquivos: [] });
+            }
+        }
+    }
+
+    if (options.length >= 2) {
+        options.push({ id: 'custom', titulo: 'Personalizado', descricao: 'Descreva exatamente o que você deseja', impacto: 'médio', arquivos: [] });
+    }
+    return options;
+}
+
 function listOpenCodeFreeModels() {
+    return listOpenCodeModels(false);
+}
+
+function listOpenCodeModels(allModels = false) {
     const binary = resolveOpenCodeBinary();
     return new Promise((resolve, reject) => {
         let child;
@@ -623,7 +951,7 @@ function listOpenCodeFreeModels() {
                 return;
             }
             try {
-                resolve(parseOpenCodeModelsVerbose(out));
+                resolve(parseOpenCodeModelsVerbose(out, allModels));
             } catch (e) {
                 reject(e);
             }
@@ -640,6 +968,8 @@ function buildOpenCodePrompt(message, mode, history) {
 
     return `Você é o Aedificator Codex IDE, um assistente de desenvolvimento prático que opera no diretório atual do projeto.
 
+${getQualityRules()}
+
 MODO ATIVO: ${modeInstruction}
 
 SOLICITAÇÃO DO USUÁRIO: "${message}"
@@ -647,11 +977,47 @@ SOLICITAÇÃO DO USUÁRIO: "${message}"
 HISTÓRICO DA CONVERSA:
 ${historyText}
 
+FERRAMENTAS DISPONÍVEIS NO APP (o app executa automaticamente após suas alterações):
+- Diagnostics: JS/TS/Python/Go/C/C++/Rust — erros aparecem no painel "Problemas"
+- Test Runner: executa testes automaticamente (Jest/pytest/go test/cargo test/make test)
+- Code smells: detecta funções longas, vars não usadas, imports duplicados
+- Git: commit/push/pull/diff — auto-commit após alterações sem erros
+- Docker: containers, compose up/down — sidebar Docker
+- Terminal: comandos shell locais. Prefixe com #remote para comandos SSH
+- Build: npm build, make, cargo build, go build — detectado automaticamente
+- Rollback: se houver erros críticos, alterações são revertidas automaticamente
+
+CICLO DE TRABALHO: você analisa → executa → valida → responde. O usuário não vê modal de aprovação. Apenas faça.
+
+COMPORTAMENTO:
+- Se o pedido for claro: execute direto e responda com um resumo do que fez.
+- Se o pedido for ambíguo (ex: "cria um app" sem dizer o que faz): PERGUNTE. Ex: "Que tipo de app? O que ele deve fazer?"
+- Se for CRIAÇÃO de um app/sistema NOVO: primeiro crie um arquivo APP_SPEC.md com estrutura, telas, banco e stack. Depois implemente módulo por módulo.
+- Se houver mais de uma forma técnica de resolver: ESCOLHA a mais simples e explique sua escolha rapidamente.
+- Após alterar arquivos, responda com um resumo conversacional do que mudou.
+- Se for só uma pergunta/análise, responda sem alterar arquivos.
+
+LOOP DE AUTO-CORREÇÃO (OBRIGATÓRIO após modificar arquivos):
+- Se o projeto tiver build/linter configurado: rode. Se houver erros, corrija e repita até passar.
+- Se NÃO houver build configurado: pule. Não invente comandos.
+- Se houver test runner: execute os testes. Se falharem, corrija e repita.
+
+QUALIDADE (OBRIGATÓRIO ao finalizar cada módulo):
+- Se houver test runner: GERE testes unitários para o código novo/modificado.
+- Revise o código em busca de: tratamento de erro ausente, validação de entrada, SQL injection, XSS, secrets expostos, loops infinitos, memory leaks.
+- Se encontrar algum problema de segurança ou robustez: corrija antes de entregar.
+- Reporte no resumo: "Testes: X criados, Y passaram. Segurança: OK ou [lista de correções]".
+
+AJUSTE FINO (OBRIGATÓRIO ao finalizar cada módulo):
+- Após entregar o módulo, PERGUNTE: "Funcionou como esperado? Quer ajustar algo na interface ou no comportamento?"
+- Se o usuário pedir ajuste de UI/UX (cores, layout, responsividade, fluxo): ajuste e peça feedback novamente.
+- Itere até o usuário confirmar que está bom.
+
 Execute a solicitação no diretório do projeto seguindo estas REGRAS:
-- Se o pedido for uma pergunta, análise ou opinião, APENAS responda sem alterar nenhum arquivo.
+- REGRA DE OURO: pode melhorar o código, mas funções existentes devem continuar funcionando com o mesmo comportamento.
 - Só crie/modifique/delete arquivos se o usuário pedir EXPLICITAMENTE.
-- NUNCA faça mudanças drásticas (refatorações grandes, reescritas completas, reorganização) sem o usuário pedir explicitamente. Prefira alterações mínimas.
-- SEJA CONCISO: responda de forma curta e direta. Nada de explicações longas, listas extensas ou repetições. Vá direto ao ponto.`;
+- NUNCA faça mudanças drásticas (refatorações grandes, reescritas completas) sem o usuário pedir.
+- SEJA CONCISO: responda de forma curta e direta. Nada de explicações longas.`;
 }
 
 // ===== SNAPSHOT DOS ARQUIVOS PARA DETECTAR MUDANÇAS DO OPEncode =====
@@ -745,13 +1111,124 @@ function diffSnapshots(before, after) {
     return changes;
 }
 
-async function callOpenCode(prompt, onChunk, signal, model) {
+function getToolIcon(toolName) {
+    const t = (toolName || '').toLowerCase();
+    const icons = {
+        bash: '⚡', execute_command: '⚡', shell: '⚡',
+        read: '📖', read_file: '📖',
+        write: '✏️', write_file: '✏️', edit: '✏️',
+        glob: '🔍', grep: '🔎',
+        task: '🤖', agent: '🤖', subagent: '🤖',
+        webfetch: '🌐', websearch: '🔎',
+        todowrite: '📝', question: '❓',
+        skill: '🎯', lsp: '🔬',
+        list_files: '📂', delete_file: '🗑️', search_code: '🔎',
+        generate_tests: '🧪', exec_command: '⚡'
+    };
+    return icons[t] || '🔧';
+}
+
+function buildToolLabel(toolName, input) {
+    const inp = input || {};
+    const t = (toolName || '').toLowerCase();
+    const cmd = inp.command || inp.cmd || inp.comando || '';
+    const filePath = inp.filePath || inp.path || inp.file || inp.file_path || inp.caminho || '';
+    const pattern = inp.pattern || inp.regex || inp.padrao || '';
+    const desc = inp.description || inp.desc || inp.prompt || '';
+    const url = inp.url || '';
+    const query = inp.query || '';
+    const name = inp.name || '';
+    const question = inp.question || '';
+    if (!t || t.length < 2) {
+        const firstArg = cmd || filePath || pattern || desc || url || '';
+        return firstArg ? firstArg.slice(0, 50) : 'ferramenta';
+    }
+    switch (t) {
+        case 'bash': case 'execute_command': case 'shell': case 'exec_command':
+            return `Comando: ${(cmd || desc || '...').slice(0, 60)}`;
+        case 'read': case 'read_file':
+            return `Lendo: ${filePath.slice(0, 60) || 'arquivo'}`;
+        case 'write': case 'write_file':
+            return `Escrevendo: ${filePath.slice(0, 60) || 'arquivo'}`;
+        case 'edit':
+            return `Editando: ${filePath.slice(0, 60) || 'arquivo'}`;
+        case 'glob':
+            return `Buscando: ${pattern.slice(0, 60) || '*'}`;
+        case 'grep':
+            return `Procurando: "${(pattern || '').slice(0, 50)}"`;
+        case 'webfetch':
+            return `Acessando: ${(url || '').slice(0, 60)}`;
+        case 'websearch':
+            return `Pesquisando: ${(query || pattern || '').slice(0, 60)}`;
+        case 'task': case 'agent': case 'subagent':
+            return `Sub-agente: ${(desc || prompt || '').slice(0, 60)}`;
+        case 'todowrite':
+            return `Planejando tarefas`;
+        case 'question':
+            return `Perguntando: ${(question || '').slice(0, 60)}`;
+        case 'skill':
+            return `Skill: ${(name || '').slice(0, 60)}`;
+        case 'list_files':
+            return `Listando: ${(filePath || '').slice(0, 50) || 'raiz'}`;
+        case 'delete_file':
+            return `Deletando: ${filePath.slice(0, 60) || 'arquivo'}`;
+        case 'search_code':
+            return `Procurando: "${(pattern || '').slice(0, 50)}"`;
+        case 'generate_tests':
+            return `Gerando testes: ${filePath.slice(0, 50) || '...'}`;
+        default:
+            return `${toolName}: ${(desc || filePath || cmd || '').slice(0, 50) || '...'}`;
+    }
+}
+
+let opencodeServerProcess = null;
+let opencodeServerPort = null;
+
+async function ensureOpenCodeServer() {
+    if (opencodeServerProcess && !opencodeServerProcess.killed) return opencodeServerPort;
+    const binary = resolveOpenCodeBinary();
+    opencodeServerPort = 4099;
+    const env = { ...process.env, OPENCODE_DISABLE_AUTOUPDATE: '1' };
+    opencodeServerProcess = spawn(binary, ['serve', '--port', String(opencodeServerPort), '--hostname', '127.0.0.1'], {
+        cwd: PROJECT_ROOT, stdio: ['ignore', 'pipe', 'pipe'], env
+    });
+    opencodeServerProcess.on('exit', (code) => {
+        console.log(`[opencode server] Encerrado (${code})`);
+        opencodeServerProcess = null;
+    });
+    opencodeServerProcess.stderr.on('data', (d) => console.log(`[opencode server] ${d.toString().trim()}`));
+    await new Promise((resolve, reject) => {
+        const timeout = setTimeout(() => reject(new Error('Timeout opencode server')), 20000);
+        const check = setInterval(async () => {
+            try {
+                const resp = await fetch(`http://127.0.0.1:${opencodeServerPort}/health`);
+                if (resp.ok) { clearTimeout(timeout); clearInterval(check); resolve(); }
+            } catch (e) {}
+        }, 800);
+    });
+    console.log(`[opencode server] ✅ Pronto na porta ${opencodeServerPort}`);
+    return opencodeServerPort;
+}
+
+function stopOpenCodeServer() {
+    if (opencodeServerProcess) { opencodeServerProcess.kill(); opencodeServerProcess = null; }
+}
+
+async function callOpenCode(prompt, onChunk, signal, model, onToolEvent) {
     const binary = resolveOpenCodeBinary();
     ensureOpenCodeConfig();
     ensureOpenCodeAuth(config.opencode.apiKey);
-    const args = ['run', '--format', 'json'];
+
+    let useAttach = false;
+    try { await ensureOpenCodeServer(); useAttach = true; } catch (e) {
+        console.log(`[opencode] Server indisponível, usando modo direto: ${e.message}`);
+    }
+
+    const args = useAttach
+        ? ['run', '--format', 'json', '--attach', `http://127.0.0.1:${opencodeServerPort}`, '--dir', PROJECT_ROOT]
+        : ['run', '--format', 'json'];
     let useModel = model || OPENCODE_DEFAULT_MODEL;
-    if (!useModel.startsWith('opencode/')) {
+    if (!useModel.startsWith('opencode/') && !useModel.startsWith('opencode-go/')) {
         useModel = 'opencode/' + useModel;
     }
     args.push('--model', useModel);
@@ -767,6 +1244,8 @@ async function callOpenCode(prompt, onChunk, signal, model) {
 
     let fullText = '';
     let buffer = '';
+    let stderrBuf = '';
+    let lastError = null;
     const timer = setTimeout(() => {
         try { child.kill(); } catch (e) {}
     }, 300000);
@@ -782,7 +1261,14 @@ async function callOpenCode(prompt, onChunk, signal, model) {
                 try {
                     const event = JSON.parse(trimmed);
                     let text = '';
-                    if (event.type === 'text' && event.part && event.part.type === 'text' && typeof event.part.text === 'string') {
+                    if (event.type === 'error') {
+                        const e = event.error || {};
+                        lastError = e.data?.message || e.data?.error || e.message || e.detail ||
+                            (typeof e.data === 'string' ? e.data : '') ||
+                            (typeof e === 'string' ? e : JSON.stringify(e));
+                        console.log(`[opencode error] ${lastError}`);
+                        if (onChunk) onChunk('Sistema', `❌ ${lastError}\n`);
+                    } else if (event.type === 'text' && event.part && event.part.type === 'text' && typeof event.part.text === 'string') {
                         text = event.part.text;
                     } else if (event.type === 'message' && event.role === 'assistant') {
                         const content = event.content;
@@ -793,8 +1279,49 @@ async function callOpenCode(prompt, onChunk, signal, model) {
                                 if (part && typeof part === 'object') {
                                     if (typeof part.text === 'string') text += part.text;
                                     else if (part.type === 'text' && typeof part.content === 'string') text += part.content;
+                                    else if (part.type === 'tool_use' && onToolEvent) {
+                                        const toolName = part.name || part.tool || '';
+                                        const toolId = part.id || part.tool_use_id || ('msg_tool_' + Date.now());
+                                        const input = part.input || {};
+                                        onToolEvent({
+                                            ev: 'tool_start', id: toolId, tool: toolName,
+                                            label: buildToolLabel(toolName, input), icon: getToolIcon(toolName),
+                                            file: input.filePath || input.path || input.file || ''
+                                        });
+                                    }
+                                    else if (part.type === 'tool_result' && onToolEvent) {
+                                        const toolId = part.tool_use_id || part.id || '';
+                                        onToolEvent({ ev: 'tool_end', id: toolId, isError: !!(part.is_error || part.error) });
+                                    }
                                 }
                             }
+                        }
+                    }
+                    if (onToolEvent) {
+                        if (event.type === 'tool_use') {
+                            const part = event.part || {};
+                            const toolName = part.tool || event.tool || event.name || '';
+                            const toolId = part.callID || event.id || event.tool_use_id || ('tool_' + Date.now() + '_' + Math.random().toString(36).slice(2, 8));
+                            const state = part.state || event.state || {};
+                            const input = state.input || event.input || {};
+                            onToolEvent({
+                                ev: 'tool_start',
+                                id: toolId,
+                                tool: toolName,
+                                label: buildToolLabel(toolName, input),
+                                icon: getToolIcon(toolName),
+                                file: input.filePath || input.path || input.file || ''
+                            });
+                        }
+                        if (event.type === 'tool_result' || (event.tool_use_id && (event.content !== undefined || event.error !== undefined))) {
+                            const toolId = event.tool_use_id || event.id || '';
+                            const isError = !!(event.is_error || event.error);
+                            onToolEvent({
+                                ev: 'tool_end',
+                                id: toolId,
+                                isError,
+                                error: isError ? ((event.error || '').toString().slice(0, 200)) : undefined
+                            });
                         }
                     }
                     if (text) {
@@ -805,8 +1332,9 @@ async function callOpenCode(prompt, onChunk, signal, model) {
             }
         });
         child.stderr.on('data', (d) => {
-            const msg = d.toString();
-            if (msg.trim()) console.log(`[opencode stderr] ${msg.slice(0, 500)}`);
+            stderrBuf += d.toString();
+            const msg = d.toString().trim();
+            if (msg) console.log(`[opencode stderr] ${msg}`);
         });
         child.on('error', (err) => {
             clearTimeout(timer);
@@ -821,9 +1349,18 @@ async function callOpenCode(prompt, onChunk, signal, model) {
                 return;
             }
             if (fullText.trim()) {
-                resolve(fullText.trim());
+                if (lastError) {
+                    const err = new Error(`opencode erro: ${lastError}`);
+                    err.partialText = fullText.trim().slice(0, 500);
+                    reject(err);
+                } else {
+                    resolve(fullText.trim());
+                }
+            } else if (code === 0) {
+                resolve('');
             } else {
-                reject(new Error(`opencode terminou com código ${code} sem resposta.`));
+                const errDetail = lastError || stderrBuf.trim() || `código ${code} sem resposta`;
+                reject(new Error(`opencode erro: ${errDetail.slice(0, 400)}`));
             }
         });
         if (signal) {
@@ -834,12 +1371,29 @@ async function callOpenCode(prompt, onChunk, signal, model) {
     });
 }
 
+let _deepseekCachePrefix = '';
+let _deepseekCacheKey = '';
+
+function getDeepseekCachePrefix() {
+    const key = PROJECT_ROOT + '|' + (config.deepseek.model || 'deepseek-chat');
+    if (_deepseekCachePrefix && _deepseekCacheKey === key) return _deepseekCachePrefix;
+    _deepseekCacheKey = key;
+    _deepseekCachePrefix = getQualityRules() + '\nDIRETÓRIO: ' + PROJECT_ROOT + '\n';
+    return _deepseekCachePrefix;
+}
+
+function invalidateDeepseekCache() {
+    _deepseekCachePrefix = '';
+    _deepseekCacheKey = '';
+}
+
 async function callDeepSeek(prompt, onChunk, signal) {
     const apiKey = config.deepseek.apiKey;
     if (!apiKey) {
         throw new Error('Chave API DeepSeek não configurada!');
     }
 
+    const cachePrefix = getDeepseekCachePrefix();
     const url = 'https://api.deepseek.com/v1/chat/completions';
     const response = await fetchWithTimeout(url, {
         method: 'POST',
@@ -849,18 +1403,29 @@ async function callDeepSeek(prompt, onChunk, signal) {
         },
         body: JSON.stringify({
             model: config.deepseek.model || 'deepseek-chat',
-            messages: [{ role: 'user', content: prompt }],
+            messages: [
+                { role: 'system', content: cachePrefix },
+                { role: 'user', content: prompt }
+            ],
             stream: true
         })
     }, 120000, signal);
 
     if (!response.ok) {
-        throw new Error(`Erro na API DeepSeek: ${response.status}`);
+        const error = await response.text().catch(() => '');
+        if (response.status === 429) {
+            throw new Error('Limite de requisições da API DeepSeek atingido. Aguarde alguns minutos ou troque de provider.');
+        }
+        if (response.status === 402 || error.includes('insufficient_quota')) {
+            throw new Error('Créditos da API DeepSeek esgotados. Recarregue em https://platform.deepseek.com ou troque de provider.');
+        }
+        throw new Error(`Erro na API DeepSeek: ${response.status}${error ? ' - ' + error.slice(0, 200) : ''}`);
     }
 
     const reader = response.body.getReader();
     const decoder = new TextDecoder();
     let fullResponse = '';
+    let lastUsage = null;
 
     while (true) {
         if (signal && signal.aborted) break;
@@ -879,26 +1444,118 @@ async function callDeepSeek(prompt, onChunk, signal) {
                         fullResponse += content;
                         if (onChunk) onChunk(content);
                     }
+                    if (parsed.usage) lastUsage = parsed.usage;
                 } catch (e) {}
             }
         }
     }
+    if (lastUsage) {
+        const cacheHit = !!(lastUsage.prompt_cache_hit_tokens || lastUsage.prompt_tokens_details?.cached_tokens);
+        const input = cacheHit ? (lastUsage.prompt_cache_hit_tokens || lastUsage.prompt_tokens_details?.cached_tokens || lastUsage.prompt_tokens || 0) : (lastUsage.prompt_tokens || 0);
+        trackTokens('deepseek', input, lastUsage.completion_tokens || 0, cacheHit, config.deepseek.model);
+    }
     return fullResponse;
 }
 
-async function callAI(provider, prompt, onChunk, signal) {
+async function callAI(provider, prompt, onChunk, signal, model) {
     if (provider === 'gemini') {
-        return await callGemini(prompt, onChunk, signal);
+        return await callGemini(prompt, onChunk, signal, model);
     } else if (provider === 'deepseek') {
-        return await callDeepSeek(prompt, onChunk, signal);
+        return await callDeepSeek(prompt, onChunk, signal, model);
+    } else if (provider === 'openai') {
+        return await callOpenAI(prompt, onChunk, signal, model);
+    } else if (provider === 'claude') {
+        return await callClaude(prompt, onChunk, signal, model);
     } else if (provider === 'opencode') {
-        return await callOpenCode(prompt, onChunk, signal);
-    } else if (provider && provider.startsWith('opencode/')) {
-        const model = provider.slice('opencode/'.length);
         return await callOpenCode(prompt, onChunk, signal, model);
     } else {
         throw new Error(`Provedor ${provider} não suportado`);
     }
+}
+
+// ===== OpenAI (ChatGPT) =====
+async function callOpenAI(prompt, onChunk, signal) {
+    const apiKey = config.openai.apiKey;
+    if (!apiKey) throw new Error('Chave OpenAI não configurada');
+    const model = config.openai.model || 'gpt-4o';
+
+    return new Promise((resolve, reject) => {
+        const url = new URL('https://api.openai.com/v1/chat/completions');
+        const body = JSON.stringify({
+            model,
+            messages: [
+                { role: 'system', content: 'You are a coding assistant. Respond in the language of the user. Return valid JSON when requested.' },
+                { role: 'user', content: prompt }
+            ],
+            temperature: 0.3,
+            stream: false
+        });
+
+        const abort = new AbortController();
+        if (signal) signal.addEventListener('abort', () => abort.abort());
+
+        fetch(url, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json', 'Authorization': `Bearer ${apiKey}` },
+            body,
+            signal: abort.signal
+        }).then(async (res) => {
+            if (!res.ok) {
+                const err = await res.text();
+                if (res.status === 429) throw new Error('Limite de requisições da API OpenAI atingido. Aguarde ou troque de provider.');
+                if (res.status === 402 || err.includes('insufficient_quota')) throw new Error('Créditos da API OpenAI esgotados. Recarregue em https://platform.openai.com ou troque de provider.');
+                throw new Error(`OpenAI HTTP ${res.status}: ${err.slice(0, 200)}`);
+            }
+            const data = await res.json();
+            const text = data.choices?.[0]?.message?.content || '';
+            if (onChunk) onChunk(text);
+            if (data.usage) trackTokens('openai', data.usage.prompt_tokens || 0, data.usage.completion_tokens || 0, false, config.openai.model);
+            resolve(text);
+        }).catch(reject);
+    });
+}
+
+// ===== Anthropic (Claude) =====
+async function callClaude(prompt, onChunk, signal, forcedModel) {
+    const apiKey = config.claude.apiKey;
+    if (!apiKey) throw new Error('Chave Claude não configurada');
+    const model = forcedModel || config.claude.model || 'claude-sonnet-5';
+
+    return new Promise((resolve, reject) => {
+        const url = new URL('https://api.anthropic.com/v1/messages');
+        const body = JSON.stringify({
+            model,
+            max_tokens: 4096,
+            system: 'You are an IDE agent. You MUST respond ONLY with valid JSON. No explanations, no markdown, no conversation — just the JSON object. The response must start with { and end with }.',
+            messages: [{ role: 'user', content: prompt }]
+        });
+
+        const abort = new AbortController();
+        if (signal) signal.addEventListener('abort', () => abort.abort());
+
+        fetch(url, {
+            method: 'POST',
+            headers: {
+                'Content-Type': 'application/json',
+                'x-api-key': apiKey,
+                'anthropic-version': '2023-06-01'
+            },
+            body,
+            signal: abort.signal
+        }).then(async (res) => {
+            if (!res.ok) {
+                const err = await res.text();
+                if (res.status === 429) throw new Error('Limite de requisições da API Claude atingido. Aguarde ou troque de provider.');
+                if (res.status === 402 || err.includes('insufficient_quota') || err.includes('billing')) throw new Error('Créditos da API Claude esgotados. Recarregue em https://console.anthropic.com ou troque de provider.');
+                throw new Error(`Claude HTTP ${res.status}: ${err.slice(0, 200)}`);
+            }
+            const data = await res.json();
+            const text = data.content?.[0]?.text || '';
+            if (onChunk) onChunk(text);
+            if (data.usage) trackTokens('claude', data.usage.input_tokens || 0, data.usage.output_tokens || 0, !!data.usage.cache_read_input_tokens, config.claude.model);
+            resolve(text);
+        }).catch(reject);
+    });
 }
 
 // =============================================
@@ -906,24 +1563,30 @@ async function callAI(provider, prompt, onChunk, signal) {
 // =============================================
 function extractJson(text) {
     if (!text) return null;
-    const trimmed = text.trim();
+    var trimmed = text.trim();
+
+    // Remove thinking/reasoning blocks (Claude extended thinking)
+    trimmed = trimmed.replace(/<thinking>[\s\S]*?<\/thinking>/g, '');
+    trimmed = trimmed.replace(/<reasoning>[\s\S]*?<\/reasoning>/g, '');
+    trimmed = trimmed.trim();
+
     try { return JSON.parse(trimmed); } catch (e) {}
 
-    const fenced = trimmed.match(/```(?:json)?\s*([\s\S]*?)```/);
+    var fenced = trimmed.match(/```(?:json)?\s*([\s\S]*?)```/);
     if (fenced) {
         try { return JSON.parse(fenced[1].trim()); } catch (e) {}
     }
 
-    let depth = 0;
-    let start = -1;
-    for (let i = 0; i < trimmed.length; i++) {
-        if (trimmed[i] === '{') {
-            if (depth === 0) start = i;
-            depth++;
-        } else if (trimmed[i] === '}') {
+    // Try to find the first complete JSON object
+    var depth = 0;
+    var start = -1;
+    for (var i = 0; i < trimmed.length; i++) {
+        if (trimmed[i] === '{' && depth === 0) { start = i; depth++; }
+        else if (trimmed[i] === '{') { depth++; }
+        else if (trimmed[i] === '}') {
             depth--;
             if (depth === 0 && start >= 0) {
-                try { return JSON.parse(trimmed.slice(start, i + 1)); } catch (e) {}
+                try { return JSON.parse(trimmed.slice(start, i + 1)); } catch (e) { start = -1; }
             }
         }
     }
@@ -935,94 +1598,886 @@ function extractJson(text) {
 // =============================================
 const MODE_INSTRUCTIONS = {
     cowork: 'Modo Equipe (conservador): se o usuário fizer uma pergunta, análise ou pedir opinião/sugestões, responda no "resumo" e NÃO altere arquivos (deixe "arquivos" como []). Só crie/modifique/delete arquivos se o usuário pedir EXPLICITAMENTE. Nunca faça mudanças drásticas (refatorações grandes, reescritas completas, reorganização de pastas, criação de muitos arquivos) a menos que o usuário peça explicitamente. Prefira sempre alterações mínimas e localizadas.',
+    autonomo: 'Modo Autônomo: você tem autonomia para planejar e executar. Analise o pedido, crie um plano de alterações e o backend executará automaticamente. SEMPRE retorne no Formato B (arquivos), nunca no Formato A (sugestoes). Faça as alterações necessárias para atender ao pedido. Seja prático e direto.',
     clarify: 'Modo Esclarecer: NÃO altere nenhum arquivo. Apenas faça perguntas de esclarecimento. Responda com um JSON onde "resumo" contém suas perguntas e "arquivos" é uma lista VAZIA [].',
     code: 'Modo Código: foque exclusivamente em código. Faça apenas as alterações mínimas necessárias e mantenha explicações curtas.',
-    acp: 'Modo Arquitetura: foque na arquitetura do sistema. Prefira criar ou atualizar um documento de arquitetura (ex.: ARQUITETURA.md) descrevendo a solução, em vez de alterar código diretamente.'
+    acp: 'Modo Arquitetura: foque na arquitetura do sistema. Prefira criar ou atualizar um documento de arquitetura (ex.: ARQUITETURA.md) descrevendo a solução, em vez de alterar código diretamente.',
+    agent: 'Modo Agente: você tem acesso a ferramentas (ler arquivos, escrever, listar, executar comandos). Use-as livremente para explorar o código, fazer alterações e verificar o resultado. Itere até resolver o pedido. Seja prático e direto.'
 };
 
 // =============================================
-//  ANÁLISE DO PLANO
+//  MODO AGENTE — FERRAMENTAS
 // =============================================
+const AGENT_TOOLS = [
+    { name: 'read_file', description: 'Lê o conteúdo completo de um arquivo', parameters: { caminho: 'string' } },
+    { name: 'write_file', description: 'Cria ou sobrescreve um arquivo com o conteúdo fornecido', parameters: { caminho: 'string', conteudo: 'string' } },
+    { name: 'delete_file', description: 'Remove um arquivo', parameters: { caminho: 'string' } },
+    { name: 'list_files', description: 'Lista arquivos e pastas de um diretório', parameters: { diretorio: 'string (opcional, padrão: raiz)' } },
+    { name: 'search_code', description: 'Busca por um padrão (regex) nos arquivos do projeto', parameters: { padrao: 'string', diretorio: 'string (opcional)' } },
+    { name: 'exec_command', description: 'Executa um comando shell no diretório do projeto', parameters: { comando: 'string' } },
+    { name: 'generate_tests', description: 'Gera testes unitários para um arquivo de código. O arquivo deve existir. Retorna o caminho do arquivo de teste criado e o resultado da execução.', parameters: { caminho: 'string' } },
+    { name: 'browser_navigate', description: 'Navega o browser para uma URL. Use para testar frontend.', parameters: { url: 'string' } },
+    { name: 'browser_screenshot', description: 'Tira screenshot da página atual do browser.', parameters: {} },
+    { name: 'browser_click', description: 'Clica em um elemento CSS na página.', parameters: { selector: 'string' } },
+    { name: 'browser_type', description: 'Digita texto em um campo input/textarea.', parameters: { selector: 'string', text: 'string' } },
+    { name: 'browser_evaluate', description: 'Executa JavaScript na página e retorna o resultado.', parameters: { js: 'string' } },
+    { name: 'browser_console', description: 'Lê os logs do console do browser.', parameters: {} }
+];
+
+async function executeAgentTool(name, args) {
+    switch (name) {
+        case 'read_file': {
+            const full = resolveSafePath(args.caminho || '');
+            if (!full || !fs.existsSync(full)) return 'Erro: arquivo não encontrado';
+            const content = fs.readFileSync(full, 'utf-8').slice(0, 50000);
+            const ext = path.extname(args.caminho).toLowerCase();
+            if (['.js', '.ts', '.jsx', '.tsx', '.py', '.go', '.rs', '.c', '.cpp', '.h'].includes(ext)) {
+                try {
+                    const validation = analyzer.validateCode(content, args.caminho, PROJECT_ROOT);
+                    if (validation.errors.length > 0) {
+                        const diagText = validation.errors.slice(0, 15).map(e => `Ln ${e.line}: [${e.severity}] ${e.message}`).join('\n');
+                        return `=== CONTEÚDO (${content.length} bytes) ===\n${content}\n=== DIAGNÓSTICOS (${validation.errors.length} encontrados, ${validation.suggestionCount}% confiança) ===\n${diagText}`;
+                    }
+                } catch (e) {}
+            }
+            return content;
+        }
+        case 'write_file': {
+            const full = resolveSafePath(args.caminho || '');
+            if (!full) return 'Erro: caminho inválido';
+            const dir = path.dirname(full);
+            if (!fs.existsSync(dir)) fs.mkdirSync(dir, { recursive: true });
+            fs.writeFileSync(full, args.conteudo || '', 'utf-8');
+            const ext = path.extname(args.caminho).toLowerCase();
+            let result = `Arquivo ${args.caminho} salvo (${(args.conteudo||'').length} bytes)`;
+            if (['.js', '.ts', '.jsx', '.tsx', '.py', '.go', '.rs', '.c', '.cpp', '.h'].includes(ext)) {
+                try {
+                    const validation = analyzer.validateCode(args.conteudo || '', args.caminho, PROJECT_ROOT);
+                    const errs = validation.errors.filter(e => e.severity === 'error');
+                    const warns = validation.errors.filter(e => e.severity === 'warning');
+                    if (errs.length > 0) result += `\n⚠️ ${errs.length} erro(s): ${errs.slice(0, 5).map(e => `Ln ${e.line}: ${e.message}`).join('; ')}`;
+                    if (warns.length > 0) result += `\n💡 ${warns.length} aviso(s): ${warns.slice(0, 3).map(e => `Ln ${e.line}: ${e.message}`).join('; ')}`;
+                    if (validation.errors.length === 0) result += ' ✅ Validação OK';
+                } catch (e) {}
+            }
+            try {
+                const testResult = runQuickTest(args.caminho);
+                if (testResult) result += '\n' + testResult;
+            } catch (e) {}
+            return result;
+        }
+        case 'delete_file': {
+            const full = resolveSafePath(args.caminho || '');
+            if (!full || !fs.existsSync(full)) return 'Erro: arquivo não encontrado';
+            fs.unlinkSync(full);
+            return `Arquivo ${args.caminho} removido`;
+        }
+        case 'list_files': {
+            const dir = args.diretorio || '';
+            const items = listDirectory(dir);
+            return items.map(i => `${i.isDirectory ? '📂' : '📄'} ${i.name}`).join('\n') || '(vazio)';
+        }
+        case 'search_code': {
+            const dir = args.diretorio || '';
+            const basePath = resolveSafePath(dir);
+            if (!basePath) return 'Erro: diretório inválido';
+            const pattern = args.padrao || '';
+            if (!pattern) return 'Erro: padrão vazio';
+            const results = [];
+            try {
+                const allFiles = getAllFiles(basePath, { n: 0 });
+                const regex = new RegExp(pattern, 'gi');
+                for (const file of allFiles.slice(0, 200)) {
+                    try {
+                        const content = fs.readFileSync(file, 'utf-8');
+                        const lines = content.split('\n');
+                        for (let i = 0; i < lines.length; i++) {
+                            if (regex.test(lines[i])) {
+                                results.push(`${path.relative(PROJECT_ROOT, file)}:${i + 1}: ${lines[i].trim().slice(0, 200)}`);
+                                if (results.length >= 30) break;
+                            }
+                        }
+                    } catch (e) {}
+                    if (results.length >= 30) break;
+                }
+            } catch (e) { return 'Erro ao buscar: ' + e.message; }
+            return results.join('\n') || 'Nenhum resultado encontrado';
+        }
+        case 'exec_command': {
+            const cmd = args.comando || '';
+            if (!cmd) return 'Erro: comando vazio';
+            try {
+                const result = require('child_process').execSync(cmd, { cwd: PROJECT_ROOT, timeout: 30000, encoding: 'utf-8', maxBuffer: 1024 * 1024 });
+                return result.slice(0, 10000) || '(sem saída)';
+            } catch (e) {
+                return `Erro (código ${e.status}): ${(e.stderr || e.message || '').slice(0, 2000)}`;
+            }
+        }
+        case 'generate_tests': {
+            const full = resolveSafePath(args.caminho || '');
+            if (!full || !fs.existsSync(full)) return 'Erro: arquivo não encontrado';
+            const content = fs.readFileSync(full, 'utf-8');
+            const ext = path.extname(args.caminho).toLowerCase();
+            const testPath = getTestFilePath(args.caminho);
+            if (fs.existsSync(path.join(PROJECT_ROOT, testPath))) return `Arquivo de teste já existe: ${testPath}`;
+            const testPrompt = buildTestPrompt(args.caminho, content, ext);
+            const provider = 'gemini';
+            try {
+                const testCode = await callAI(provider, testPrompt, null, null);
+                const cleanCode = testCode.replace(/```[\w]*\n?/g, '').replace(/```/g, '').trim();
+                if (!cleanCode || cleanCode.length < 20) return 'Erro: IA não gerou código de teste';
+                const testFull = path.join(PROJECT_ROOT, testPath);
+                const testDir = path.dirname(testFull);
+                if (!fs.existsSync(testDir)) fs.mkdirSync(testDir, { recursive: true });
+                fs.writeFileSync(testFull, cleanCode, 'utf-8');
+                const testResult = runQuickTest(args.caminho);
+                return `✅ Teste criado: ${testPath}\n${testResult || 'Teste executado'}`;
+            } catch (e) {
+                return `Erro ao gerar testes: ${e.message}`;
+            }
+        }
+        default: {
+            if (name.startsWith('mcp_')) {
+                try { return await mcpManager.executeTool(name, args); }
+                catch (e) { return `Erro MCP: ${e.message}`; }
+            }
+            if (name.startsWith('browser_')) {
+                try { return await executeBrowserTool(name, args); }
+                catch (e) { return `Erro Browser: ${e.message}`; }
+            }
+            return 'Erro: ferramenta desconhecida';
+        }
+    }
+}
+
+function getAllToolDeclarations() {
+    const builtin = AGENT_TOOLS.map(t => ({
+        name: t.name,
+        description: t.description,
+        parameters: {
+            type: 'object',
+            properties: Object.fromEntries(Object.entries(t.parameters).map(([k, v]) => [k, { type: 'string', description: v }])),
+            required: Object.keys(t.parameters)
+        }
+    }));
+    const mcpTools = mcpManager.getAllTools().map(t => ({
+        name: t.name,
+        description: t.description,
+        parameters: { type: 'object', properties: t.parameters || {}, required: Object.keys(t.parameters || {}) }
+    }));
+    return [...builtin, ...mcpTools];
+}
+
+function getQualityRules() {
+    const projectRules = loadProjectRules();
+    const langRules = getLanguageQualityRules();
+    return `⚠️ REGRAS DE QUALIDADE (siga rigorosamente):
+- KISS: código mais simples que resolve o problema
+- DRY: nunca duplique lógica — extraia funções
+- Funções pequenas (máx 20 linhas), responsabilidade única
+- Nomes claros: revelar intenção (calcularTotal, nao calc)
+- Trate erros: capture exceções, propague com contexto
+- Valide entrada: Number.isNaN, null/undefined checks
+- Após write_file, use read_file para verificar
+- Use search_code para padrões existentes antes de criar novos
+- Prefira const, arrow functions, template literals
+${langRules}
+${projectRules ? '\nREGRAS DO PROJETO:\n' + projectRules : ''}`;
+}
+
+function getLanguageQualityRules() {
+    try {
+        const idx = analyzer.indexProject(PROJECT_ROOT);
+        const files = Object.keys(idx.files || {});
+        const exts = {};
+        for (const f of files) {
+            const ext = path.extname(f).toLowerCase();
+            if (ext) exts[ext] = (exts[ext] || 0) + 1;
+        }
+        const top = Object.entries(exts).sort((a, b) => b[1] - a[1]).slice(0, 3).map(e => e[0]);
+        let rules = '\nCHECKLIST DE SEGURANÇA POR LINGUAGEM:';
+
+        if (top.some(e => ['.js', '.ts', '.jsx', '.tsx'].includes(e))) {
+            rules += '\n[JavaScript/TypeScript] XSS (innerHTML, dangerouslySetInnerHTML), eval(), secrets no código, SQL injection em queries concatenadas, validação de input, tratamento de Promises, race conditions.';
+        }
+        if (top.some(e => ['.py'].includes(e))) {
+            rules += '\n[Python] SQL injection (string formatting em queries), secrets expostos, eval/exec, pickle.load, path traversal, subprocess shell=True, dependências inseguras.';
+        }
+        if (top.some(e => ['.go'].includes(e))) {
+            rules += '\n[Go] SQL injection, goroutine leaks, defer em loops, panic sem recover, race conditions, secrets hardcoded, validação de input.';
+        }
+        if (top.some(e => ['.rs'].includes(e))) {
+            rules += '\n[Rust] unsafe blocks, unwrap() em produção, panic propagation, secrets hardcoded, SQL injection com raw queries.';
+        }
+        if (top.some(e => ['.php'].includes(e))) {
+            rules += '\n[PHP] SQL injection, XSS (echo sem escape), eval(), file inclusion, secrets em .env exposto, CSRF, password hashing fraco.';
+        }
+        if (top.some(e => ['.rb'].includes(e))) {
+            rules += '\n[Ruby] SQL injection em ActiveRecord raw, eval(), mass assignment, secrets no código, CSRF, regex DoS.';
+        }
+        if (top.some(e => ['.java', '.kt'].includes(e))) {
+            rules += '\n[Java/Kotlin] SQL injection em JDBC, secrets hardcoded, XXE em XML parsers, serialization insegura, path traversal, NPE sem tratamento.';
+        }
+        if (top.some(e => ['.html'].includes(e))) {
+            rules += '\n[HTML/CSS] XSS via innerHTML, atributos unsafe-inline, CSS injection, target="_blank" sem noopener.';
+        }
+        if (top.some(e => ['.css', '.scss', '.less'].includes(e))) {
+            rules += '\n[CSS] CSS injection via user input, z-index stacking, overflow hidden ausente, responsividade quebrada (< 320px).';
+        }
+        rules += '\n[GERAL] Nunca hardcode secrets, tokens, API keys ou senhas. Use variáveis de ambiente.';
+        return rules;
+    } catch (e) {
+        return '';
+    }
+}
+
+function getAgentSystemPrompt(task) {
+    const fileTree = getFileTree('', '', { n: 0 }).slice(0, 2000);
+    return `${getQualityRules()}\n\nDIRETÓRIO: ${PROJECT_ROOT}\n${fileTree ? '\nESTRUTURA:\n' + fileTree : ''}\n\nTAREFA: ${task}\n\nCICLO: 1.Explore 2.Implemente 3.Compile e corrija erros até passar 4.Gere e execute testes 5.Revise segurança (injeção, XSS, secrets, validação) 6.Reporte resultados. Se for app novo: APP_SPEC.md primeiro.\n\nAPÓS ENTREGAR: pergunte se precisa de ajuste de UI/UX.`;
+}
+
+async function runAgentLoopGemini(task, onChunk, signal, mode, history, provider) {
+    const systemPrompt = getAgentSystemPrompt(task);
+    const messages = [{ role: 'user', parts: [{ text: systemPrompt }] }];
+
+    const toolDeclarations = getAllToolDeclarations();
+
+    let iteration = 0;
+    const maxIterations = 15;
+
+    while (iteration < maxIterations) {
+        if (signal && signal.aborted) break;
+        iteration++;
+
+        const geminiKey = config.gemini.apiKey;
+        if (!geminiKey) throw new Error('Chave Gemini não configurada');
+
+        const url = new URL(`https://generativelanguage.googleapis.com/v1beta/models/${config.gemini.model || 'gemini-2.5-flash'}:streamGenerateContent?alt=sse&key=${geminiKey}`);
+        const body = JSON.stringify({
+            contents: messages,
+            tools: [{ functionDeclarations: toolDeclarations }],
+            toolConfig: { functionCallingConfig: { mode: 'AUTO' } }
+        });
+
+        const responseText = await fetchGeminiStreamRaw(url, body, onChunk, signal);
+        const parsed = parseGeminiResponse(responseText, messages, onChunk);
+
+        if (parsed.done) return parsed.summary;
+        if (parsed.toolCalls.length === 0) {
+            return parsed.summary || 'Agente concluído';
+        }
+
+        for (const tc of parsed.toolCalls) {
+            const gemToolId = 'gem_' + tc.name + '_' + Date.now();
+            if (onChunk) onChunk('activity', JSON.stringify({
+                ev: 'tool_start', id: gemToolId,
+                tool: tc.name, label: buildToolLabel(tc.name, tc.args), icon: getToolIcon(tc.name),
+                file: tc.args.filePath || tc.args.path || tc.args.file || tc.args.caminho || ''
+            }));
+            const result = await executeAgentTool(tc.name, tc.args);
+            if (onChunk) onChunk('activity', JSON.stringify({ ev: 'tool_end', id: gemToolId, isError: false }));
+            messages.push({ role: 'model', parts: [{ functionCall: { name: tc.name, args: tc.args } }] });
+            messages.push({ role: 'user', parts: [{ functionResponse: { name: tc.name, response: { result: String(result).slice(0, 8000) } } }] });
+        }
+    }
+    return 'Limite de iterações atingido';
+}
+
+async function fetchGeminiStreamRaw(url, body, onChunk, signal) {
+    const response = await fetchWithTimeout(url, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body
+    }, 120000, signal);
+    if (!response.ok) {
+        const err = await response.text();
+        throw new Error(`Gemini HTTP ${response.status}: ${err.slice(0, 300)}`);
+    }
+    const reader = response.body.getReader();
+    const decoder = new TextDecoder();
+    let fullText = '';
+    while (true) {
+        if (signal && signal.aborted) break;
+        const { done, value } = await reader.read();
+        if (done) break;
+        const chunk = decoder.decode(value, { stream: true });
+        fullText += chunk;
+    }
+    return fullText;
+}
+
+function parseGeminiResponse(rawText, messages, onChunk) {
+    const toolCalls = [];
+    let summary = '';
+    const lines = rawText.split('\n');
+    for (const line of lines) {
+        if (!line.startsWith('data: ')) continue;
+        try {
+            const json = JSON.parse(line.slice(6));
+            const candidate = json.candidates?.[0];
+            if (!candidate) continue;
+            const parts = candidate.content?.parts || [];
+            for (const part of parts) {
+                if (part.functionCall) {
+                    const args = part.functionCall.args || {};
+                    const name = part.functionCall.name;
+                    toolCalls.push({ name, args });
+                    if (onChunk) onChunk('Sistema', `🔧 ${name}(${Object.values(args).join(', ').slice(0, 60)})\n`);
+                }
+                if (part.text) {
+                    summary += part.text;
+                    if (onChunk) onChunk('Assistente', part.text);
+                }
+            }
+        } catch (e) {}
+    }
+    const finishReason = extractFinishReason(rawText);
+    return { toolCalls, summary, done: toolCalls.length === 0 && finishReason !== 'TOOL_CALLS' };
+}
+
+function extractFinishReason(rawText) {
+    const lines = rawText.split('\n');
+    for (const line of lines) {
+        if (!line.startsWith('data: ')) continue;
+        try {
+            const json = JSON.parse(line.slice(6));
+            return json.candidates?.[0]?.finishReason || '';
+        } catch (e) {}
+    }
+    return '';
+}
+
+// =============================================
+//  AGENT LOOP — DEEPSEEK / OPENAI (tool_use)
+// =============================================
+async function runAgentLoopOpenAI(task, onChunk, signal, provider) {
+    const apiKey = provider === 'deepseek' ? config.deepseek.apiKey : config.openai.apiKey;
+    if (!apiKey) throw new Error(`Chave ${provider} não configurada`);
+    const baseUrl = provider === 'deepseek'
+        ? 'https://api.deepseek.com/v1/chat/completions'
+        : 'https://api.openai.com/v1/chat/completions';
+    const model = provider === 'deepseek' ? (config.deepseek.model || 'deepseek-chat') : (config.openai.model || 'gpt-4o');
+
+    const tools = getAllToolDeclarations().map(t => ({
+        type: 'function',
+        function: {
+            name: t.name,
+            description: t.description,
+            parameters: t.parameters
+        }
+    }));
+
+    const messages = [{ role: 'system', content: getAgentSystemPrompt(task) },
+        { role: 'user', content: task }];
+
+    let iteration = 0;
+    const maxIterations = 15;
+
+    while (iteration < maxIterations) {
+        if (signal && signal.aborted) break;
+        iteration++;
+
+        const response = await fetch(baseUrl, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json', 'Authorization': `Bearer ${apiKey}` },
+            body: JSON.stringify({ model, messages, tools, tool_choice: 'auto', max_tokens: 4096 }),
+            signal
+        });
+        if (!response.ok) throw new Error(`${provider} HTTP ${response.status}: ${(await response.text()).slice(0, 300)}`);
+
+        const data = await response.json();
+        const msg = data.choices?.[0]?.message;
+        if (!msg) return 'Sem resposta';
+
+        messages.push(msg);
+
+        if (msg.content && onChunk) onChunk('Assistente', msg.content);
+
+        const toolCalls = msg.tool_calls || [];
+        if (toolCalls.length === 0) {
+            return msg.content || 'Agente concluído';
+        }
+
+        for (const tc of toolCalls) {
+            const args = JSON.parse(tc.function.arguments || '{}');
+            if (onChunk) onChunk('Sistema', `🔧 ${tc.function.name}(${Object.values(args).join(', ').slice(0, 60)})\n`);
+            if (onChunk) onChunk('activity', JSON.stringify({
+                ev: 'tool_start', id: tc.id, tool: tc.function.name,
+                label: buildToolLabel(tc.function.name, args), icon: getToolIcon(tc.function.name),
+                file: args.filePath || args.path || args.file || args.caminho || ''
+            }));
+            const result = await executeAgentTool(tc.function.name, args);
+            if (onChunk) onChunk('activity', JSON.stringify({ ev: 'tool_end', id: tc.id, isError: false }));
+            messages.push({ role: 'tool', tool_call_id: tc.id, content: String(result).slice(0, 8000) });
+        }
+    }
+    return 'Limite de iterações atingido';
+}
+
+// =============================================
+//  AGENT LOOP — CLAUDE (tool_use)
+// =============================================
+async function runAgentLoopClaude(task, onChunk, signal) {
+    const apiKey = config.claude.apiKey;
+    if (!apiKey) throw new Error('Chave Claude não configurada');
+    const model = config.claude.model || 'claude-sonnet-4-6';
+
+    const tools = getAllToolDeclarations().map(t => ({
+        name: t.name,
+        description: t.description,
+        input_schema: t.parameters
+    }));
+
+    const messages = [{ role: 'user', content: getAgentSystemPrompt(task) }];
+
+    let iteration = 0;
+    const maxIterations = 15;
+
+    while (iteration < maxIterations) {
+        if (signal && signal.aborted) break;
+        iteration++;
+
+        const response = await fetch('https://api.anthropic.com/v1/messages', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json', 'x-api-key': apiKey, 'anthropic-version': '2023-06-01' },
+            body: JSON.stringify({ model, max_tokens: 4096, messages, tools }),
+            signal
+        });
+        if (!response.ok) throw new Error(`Claude HTTP ${response.status}: ${(await response.text()).slice(0, 300)}`);
+
+        const data = await response.json();
+        const content = data.content || [];
+
+        let textContent = '';
+        const toolUses = [];
+
+        for (const block of content) {
+            if (block.type === 'text') textContent += block.text;
+            if (block.type === 'tool_use') toolUses.push(block);
+        }
+
+        if (textContent && onChunk) onChunk('Assistente', textContent);
+        messages.push({ role: 'assistant', content });
+
+        if (toolUses.length === 0) return textContent || 'Agente concluído';
+
+        const toolResults = [];
+        for (const tu of toolUses) {
+            if (onChunk) onChunk('Sistema', `🔧 ${tu.name}(${Object.values(tu.input || {}).join(', ').slice(0, 60)})\n`);
+            if (onChunk) onChunk('activity', JSON.stringify({
+                ev: 'tool_start', id: tu.id, tool: tu.name,
+                label: buildToolLabel(tu.name, tu.input || {}), icon: getToolIcon(tu.name),
+                file: (tu.input || {}).filePath || (tu.input || {}).path || (tu.input || {}).file || (tu.input || {}).caminho || ''
+            }));
+            const result = await executeAgentTool(tu.name, tu.input || {});
+            if (onChunk) onChunk('activity', JSON.stringify({ ev: 'tool_end', id: tu.id, isError: false }));
+            toolResults.push({ type: 'tool_result', tool_use_id: tu.id, content: String(result).slice(0, 8000) });
+        }
+        messages.push({ role: 'user', content: toolResults });
+    }
+    return 'Limite de iterações atingido';
+}
+
+// =============================================
+//  AGENT LOOP — DISPATCHER
+// =============================================
+async function runAgentLoop(task, onChunk, signal, mode, history, provider) {
+    if (provider === 'gemini') return await runAgentLoopGemini(task, onChunk, signal, mode, history, provider);
+    if (provider === 'deepseek' || provider === 'openai') return await runAgentLoopOpenAI(task, onChunk, signal, provider);
+    if (provider === 'claude') return await runAgentLoopClaude(task, onChunk, signal);
+    throw new Error(`Modo agente não suportado para ${provider}`);
+}
+
+function runQuickTest(filePath) {
+    try {
+        const ext = path.extname(filePath).toLowerCase();
+        const dir = path.dirname(path.join(PROJECT_ROOT, filePath));
+        const name = path.basename(filePath, ext);
+        let cmd = null;
+        let timeout = 15000;
+
+        if (['.js', '.ts', '.jsx', '.tsx'].includes(ext)) {
+            if (fs.existsSync(path.join(PROJECT_ROOT, 'jest.config.js')) || fs.existsSync(path.join(PROJECT_ROOT, 'jest.config.ts')) || fs.existsSync(path.join(PROJECT_ROOT, 'package.json'))) {
+                const testFile = findTestFile(filePath, '.test.', '.spec.');
+                if (testFile && fs.existsSync(path.join(PROJECT_ROOT, testFile))) {
+                    cmd = `npx jest "${testFile}" --no-coverage --forceExit 2>&1`;
+                } else {
+                    cmd = `npx jest --no-coverage --forceExit --testPathPattern="${name}" 2>&1`;
+                }
+            }
+        } else if (ext === '.py') {
+            const testFile = findTestFile(filePath, 'test_', '_test');
+            if (testFile && fs.existsSync(path.join(PROJECT_ROOT, testFile))) {
+                cmd = `python -m pytest "${testFile}" -x --tb=short 2>&1`;
+            }
+            timeout = 20000;
+        } else if (ext === '.go') {
+            const pkgDir = path.dirname(filePath);
+            cmd = `go test "./${pkgDir}" -count=1 -timeout 10s 2>&1`;
+            timeout = 20000;
+        } else if (ext === '.rs') {
+            cmd = `cargo test --quiet 2>&1`;
+            timeout = 60000;
+        }
+
+        if (!cmd) return null;
+        const result = require('child_process').execSync(cmd, { cwd: PROJECT_ROOT, timeout, encoding: 'utf-8', maxBuffer: 1024 * 512 });
+        const lines = result.split('\n');
+        const summary = lines.filter(l => /pass|fail|error|PASS|FAIL|ERROR|tests?|ok/i.test(l)).slice(-5).join('\n').trim();
+        if (summary) return `🧪 Testes: ${summary.slice(0, 500)}`;
+        return `🧪 Testes executados (${lines.length} linhas de output)`;
+    } catch (e) {
+        const out = (e.stdout || e.stderr || e.message || '').slice(0, 500);
+        if (out.includes('FAIL') || out.includes('fail') || out.includes('Error') || out.includes('error')) {
+            return `🧪 ⚠️ Falha nos testes: ${out.slice(0, 400)}`;
+        }
+        return null;
+    }
+}
+
+function findTestFile(sourcePath, prefix, suffix) {
+    const dir = path.dirname(sourcePath);
+    const ext = path.extname(sourcePath);
+    const base = path.basename(sourcePath, ext);
+    const candidates = [
+        path.join(dir, prefix + base + suffix + ext),
+        path.join(dir, '__tests__', prefix + base + suffix + ext),
+        path.join(dir.replace('src', 'test').replace('src', 'tests'), prefix + base + suffix + ext),
+    ];
+    for (const c of candidates) {
+        if (fs.existsSync(path.join(PROJECT_ROOT, c))) return c;
+    }
+    return null;
+}
+
+function getTestFilePath(sourcePath) {
+    const dir = path.dirname(sourcePath);
+    const ext = path.extname(sourcePath);
+    const base = path.basename(sourcePath, ext);
+    if (['.js', '.jsx'].includes(ext)) return path.join(dir, base + '.test' + ext);
+    if (['.ts', '.tsx'].includes(ext)) return path.join(dir, base + '.test' + ext);
+    if (ext === '.py') {
+        const d = path.dirname(sourcePath); const b = path.basename(sourcePath);
+        return path.join(d, 'test_' + b);
+    }
+    if (ext === '.go') return path.join(dir, base + '_test' + ext);
+    if (ext === '.rs') return sourcePath.replace('/src/', '/tests/').replace('.rs', '_test.rs');
+    return path.join(dir, base + '.test' + ext);
+}
+
+function buildTestPrompt(filePath, content, ext) {
+    const langMap = { '.js': 'JavaScript (Jest)', '.jsx': 'JavaScript/React (Jest)', '.ts': 'TypeScript (Jest)', '.tsx': 'TypeScript/React (Jest)', '.py': 'Python (pytest)', '.go': 'Go (testing)', '.rs': 'Rust (#[test])' };
+    const lang = langMap[ext] || 'JavaScript (Jest)';
+    return `Gere testes unitários para o seguinte arquivo ${lang}:
+
+ARQUIVO: ${filePath}
+
+CONTEÚDO:
+${content.slice(0, 8000)}
+
+REGRAS:
+- Cubra TODAS as funções exportadas
+- Teste casos de sucesso, erro e borda
+- Use mocks para dependências externas (APIs, bancos)
+- Use o framework padrão da linguagem
+- Retorne APENAS o código do arquivo de teste, completo e pronto para salvar
+- Sem explicações, sem markdown, apenas código`;
+}
+
+async function runAgentAndCapture(ws, task, onChunk, streamController, history, provider) {
+    const beforeSnap = snapshotProjectFiles();
+    const beforeContents = snapshotProjectContents();
+    const summary = await runAgentLoop(task, onChunk, streamController.signal, 'agent', history, provider);
+    const changes = diffSnapshots(beforeSnap, snapshotProjectFiles());
+    let reviewMsg = '';
+    for (const change of changes) {
+        if (change.action === 'modificar' || change.action === 'deletar') {
+            const orig = beforeContents.get(change.file);
+            if (orig !== undefined) backupFromContent(change.file, orig);
+        }
+        if (onChunk) onChunk('file-status', JSON.stringify([change]));
+        const icon = change.action === 'criar' ? '🆕' : change.action === 'deletar' ? '🗑️' : '✏️';
+        reviewMsg += `${icon} ${change.file}\n`;
+    }
+    if (reviewMsg && onChunk) {
+        onChunk('Sistema', `📋 REVISÃO — ${changes.length} arquivo(s) alterado(s):\n${reviewMsg}🔍 Executando validação...\n`);
+    }
+    ws.send(JSON.stringify({ type: 'refresh' }));
+
+    const modifiedFiles = changes.filter(c => c.action !== 'deletar').map(c => c.file);
+
+    let testSummary = '';
+    for (const file of modifiedFiles.slice(0, 10)) {
+        const ext = path.extname(file).toLowerCase();
+        if (!['.js', '.ts', '.jsx', '.tsx', '.py', '.go', '.rs'].includes(ext)) continue;
+        if (findTestFile(file, 'test_', '_test') || findTestFile(file, '.test.', '.spec.')) continue;
+        const tp = getTestFilePath(file);
+        if (fs.existsSync(path.join(PROJECT_ROOT, tp))) continue;
+        try {
+            const full = resolveSafePath(file);
+            if (!full || !fs.existsSync(full)) continue;
+            const content = fs.readFileSync(full, 'utf-8');
+            if (content.length < 50) continue;
+            const tPrompt = buildTestPrompt(file, content, ext);
+            const tCode = await callAI('gemini', tPrompt, null, null);
+            const clean = tCode.replace(/```[\w]*\n?/g, '').replace(/```/g, '').trim();
+            if (clean.length >= 20) {
+                const tFull = path.join(PROJECT_ROOT, tp);
+                const tDir = path.dirname(tFull);
+                if (!fs.existsSync(tDir)) fs.mkdirSync(tDir, { recursive: true });
+                fs.writeFileSync(tFull, clean, 'utf-8');
+                if (onChunk) onChunk('Sistema', `🧪 Teste gerado: ${tp}\n`);
+                testSummary += ` ${tp}`;
+            }
+        } catch (e) {}
+    }
+    if (testSummary && onChunk) onChunk('Sistema', `🧪 Testes automáticos gerados:${testSummary}\n`);
+
+    if (modifiedFiles.length > 0) {
+        try {
+            const allErrors = [];
+            for (const file of modifiedFiles.slice(0, 20)) {
+                try {
+                    const full = resolveSafePath(file);
+                    if (full && fs.existsSync(full)) {
+                        const content = fs.readFileSync(full, 'utf-8');
+                        const validation = analyzer.validateCode(content, file, PROJECT_ROOT);
+                        for (const e of validation.errors) {
+                            allErrors.push({ file, line: e.line, column: e.column, message: e.message, severity: e.severity });
+                        }
+                    }
+                } catch (e) {}
+            }
+            if (allErrors.length > 0) {
+                ws.send(JSON.stringify({ type: 'diagnostics', errors: allErrors }));
+                const errCount = allErrors.filter(e => e.severity === 'error').length;
+                const warnCount = allErrors.filter(e => e.severity === 'warning').length;
+                let diagSummary = summary || 'Agente concluído';
+                if (errCount > 0) diagSummary += ` (${errCount} erro(s), ${warnCount} aviso(s))`;
+                ws.send(JSON.stringify({ type: 'done', summary: diagSummary, command: task }));
+                return;
+            }
+        } catch (e) {}
+    }
+    ws.send(JSON.stringify({ type: 'done', summary: summary || 'Agente concluído ✅', command: task }));
+}
+
+// =============================================
+//  AUTO-CORREÇÃO COM IA (loop de correção)
+// =============================================
+async function autoFixWithAI(filePath, code, errors, onChunk, signal) {
+    const errorText = errors.map(e => `Ln ${e.line}: ${e.message}`).join('\n');
+    const prompt = `O seguinte código para o arquivo ${filePath} tem erros:\n\n` +
+        `\`\`\`\n${code}\n\`\`\`\n\n` +
+        `ERROS:\n${errorText}\n\n` +
+        `Corrija APENAS os erros. Retorne SOMENTE o código completo corrigido em um bloco \`\`\`. Não adicione explicações.`;
+
+    try {
+        const response = await analyzeTask(prompt, onChunk, signal, 'code', [], 'gemini');
+        const codeMatch = response.match(/```[\w]*\n([\s\S]*?)```/);
+        if (codeMatch) return codeMatch[1].trim();
+        if (response.trim() && !response.includes('{')) return response.trim();
+    } catch (e) {}
+    return code;
+}
+
+// =============================================
+//  REGRAS DO PROJETO (AGENTS.md)
+// =============================================
+const AGENTS_FILE = '.aedificator-agents.md';
+
+function loadProjectRules() {
+    const filePath = path.join(PROJECT_ROOT, AGENTS_FILE);
+    if (!fs.existsSync(filePath)) return '';
+    try { return fs.readFileSync(filePath, 'utf-8').trim(); } catch (e) { return ''; }
+}
+
+app.get('/api/project/rules', (req, res) => {
+    const filePath = path.join(PROJECT_ROOT, AGENTS_FILE);
+    const content = fs.existsSync(filePath) ? fs.readFileSync(filePath, 'utf-8') : '';
+    const defaultTemplate = `# Regras do Projeto\n\n## REGRA DE OURO\n- Pode melhorar o código (refatorar, otimizar, limpar), mas TODAS as funções existentes devem CONTINUAR FUNCIONANDO.\n- Melhore a qualidade sem alterar o comportamento.\n- Se uma função recebe X e retorna Y, continue recebendo X e retornando Y — mesmo que o código interno mude.\n\n## Convenções de Código\n- Use ponto e vírgula\n- Prefira const a let\n- Use arrow functions\n\n## Arquitetura\n- Separe lógica de negócio da UI\n\n## Preferências\n- Prefira alterações mínimas e seguras\n`;
+    res.json({ success: true, content: content || defaultTemplate, exists: fs.existsSync(filePath) });
+});
+
+app.post('/api/project/rules', (req, res) => {
+    const filePath = path.join(PROJECT_ROOT, AGENTS_FILE);
+    try {
+        fs.writeFileSync(filePath, ((req.body.content || '').trim() || '') + '\n', 'utf-8');
+        res.json({ success: true, path: AGENTS_FILE });
+    } catch (e) {
+        res.status(500).json({ error: e.message });
+    }
+});
+
+// =============================================
+//  CONTEXTO INTELIGENTE (arquivos relevantes)
+// =============================================
+function getRelevantFileContents(message) {
+    const relevant = {};
+    const idx = analyzer.indexProject(PROJECT_ROOT);
+    const keywords = extractKeywords(message);
+    let scoredFiles = [];
+
+    for (const [relPath, parsed] of Object.entries(idx.files)) {
+        let score = 0;
+        const nameLow = relPath.toLowerCase();
+        for (const kw of keywords) {
+            if (nameLow.includes(kw)) score += 3;
+            if (parsed.exports.some(e => e.toLowerCase().includes(kw))) score += 2;
+            if (parsed.functions.some(f => f.name.toLowerCase().includes(kw))) score += 2;
+        }
+        if (score > 0) scoredFiles.push({ path: relPath, score });
+    }
+    scoredFiles.sort((a, b) => b.score - a.score);
+    const topFiles = scoredFiles.slice(0, 15).map(f => f.path);
+
+    for (const ep of ['index.js', 'index.ts', 'main.js', 'main.ts', 'app.js', 'app.ts', 'server.js', 'server.ts']) {
+        if (idx.files[ep] && !topFiles.includes(ep)) topFiles.unshift(ep);
+    }
+
+    for (const f of topFiles.slice(0, 15)) {
+        try {
+            const fullPath = resolveSafePath(f);
+            if (fullPath) relevant[f] = fs.readFileSync(fullPath, 'utf-8').slice(0, 8000);
+        } catch (e) {}
+    }
+    return relevant;
+}
+
+function extractKeywords(message) {
+    const clean = (message || '').toLowerCase().replace(/[.,!?;:(){}[\]"'/\\]/g, ' ');
+    const words = clean.split(/\s+/).filter(w => w.length > 2);
+    const stopWords = new Set(['com', 'que', 'para', 'uma', 'isso', 'este', 'como', 'mas', 'por',
+        'dos', 'das', 'aos', 'tem', 'sua', 'ser', 'não', 'mais', 'tudo', 'era', 'foi']);
+    return [...new Set(words.filter(w => !stopWords.has(w)))].slice(0, 20);
+}
+
+function formatRelevantFiles(files) {
+    if (!files || !Object.keys(files).length) return '(nenhum arquivo)';
+    return Object.entries(files).map(([p, content]) =>
+        `\n### ${p}\n` + '```' + `\n${content}\n` + '```\n'
+    ).join('');
+}
+
+function classifyIntent(message) {
+    const m = (message || '').toLowerCase().trim();
+    if (/(^|\s)(o que é|como funciona|explique|qual a diferença|defina|conceito|significado|por que|porque|what is|how does|explain|what'?s the difference|define|meaning|why|quem|who|quando|when|onde|where)\b/i.test(m)) return 'question';
+    if (m.endsWith('?') && !/(crie|criar|cria|faça|fazer|implemente|implementar|corrija|corrigir|arrume|arrumar|adicione|adicionar|mude|mudar|altere|alterar|delete|deletar|remova|remover|refatore|refatorar|escreva|escrever|build|code|código|arquivo|file|função|function|componente|component|roda|rode|execute|executar|teste|testar)/i.test(m)) return 'question';
+    if (m.length < 15 && m.endsWith('?')) return 'question';
+    return 'task';
+}
+
+let _projectCache = null;
+let _projectCacheMtime = 0;
+
+function getProjectCache() {
+    const now = Date.now();
+    if (_projectCache && (now - _projectCacheMtime) < 30000) return _projectCache;
+    _projectCache = buildProjectCache();
+    _projectCacheMtime = now;
+    return _projectCache;
+}
+
+function invalidateProjectCache() {
+    _projectCache = null;
+    _projectCacheMtime = 0;
+    analyzer.invalidateIndex();
+}
+
+function buildProjectCache() {
+    try {
+        const tree = getFileTree('');
+        const idx = analyzer.indexProject(PROJECT_ROOT);
+        const fileNames = Object.keys(idx.files || {});
+        const dirs = {};
+        for (const f of fileNames) {
+            const d = path.dirname(f).replace(/\\/g, '/');
+            if (!dirs[d]) dirs[d] = [];
+            dirs[d].push(path.basename(f));
+        }
+        const topDirs = Object.keys(dirs).filter(d => d !== '.').sort();
+        const summary = topDirs.slice(0, 20).map(d => {
+            const files = dirs[d].slice(0, 6);
+            return `  ${d}/ (${dirs[d].length} arquivos): ${files.join(', ')}${dirs[d].length > 6 ? '...' : ''}`;
+        }).join('\n');
+        return `${tree || '(pasta vazia)'}\n\nRESUMO: ${fileNames.length} arquivos em ${topDirs.length} diretórios\n${summary}`;
+    } catch (e) {
+        return getFileTree('') || '(pasta vazia)';
+    }
+}
+
 async function analyzeTask(message, onChunk, signal, mode = 'cowork', history = [], provider = 'gemini') {
-    const allFiles = getAllFiles('');
-    const fileTree = getFileTree('');
+    const intent = classifyIntent(message);
     const modeInstruction = MODE_INSTRUCTIONS[mode] || MODE_INSTRUCTIONS.cowork;
+    const projectRules = loadProjectRules();
 
     const historyText = (history && history.length)
         ? history.slice(-15).map(h => `- ${h.role === 'user' ? 'Usuário' : 'Assistente'}: ${String(h.content || '').slice(0, 800)}`).join('\n')
         : '(sem histórico)';
 
+    const isQuestion = intent === 'question';
+    const relevantFiles = isQuestion ? {} : getRelevantFileContents(message);
+    const projectSummary = isQuestion ? '' : getProjectCache();
+
+    if (isQuestion) {
+        if (onChunk) onChunk('Sistema', '💡 Pergunta detectada: respondendo sem análise de arquivos\n');
+    }
+
     console.log(`📁 Projeto: ${PROJECT_ROOT}`);
-    console.log(`📄 Arquivos no contexto: ${allFiles.length}`);
+    console.log(`📄 Arquivos no contexto: ${Object.keys(relevantFiles).length} (intenção: ${intent})`);
 
-    const analysisPrompt = `Você é o Aedificator Codex IDE, um assistente de desenvolvimento prático e CUIDADOSO. O código de um projeto é uma arte: respeite a estrutura existente e nunca imponha mudanças sem o usuário decidir.
+    const projectCtx = isQuestion
+        ? `DIRETÓRIO: ${PROJECT_ROOT}\n\nESTRUTURA DO PROJETO:\n${getFileTree('') || '(pasta vazia)'}`
+        : `DIRETÓRIO: ${PROJECT_ROOT}\n\nESTRUTURA DO PROJETO:\n${projectSummary || getFileTree('') || '(pasta vazia)'}`;
 
-DIRETÓRIO DO PROJETO: ${PROJECT_ROOT}
+    const analysisPrompt = `⚠️ REGRA ABSOLUTA: Sua ÚNICA resposta deve ser um OBJETO JSON puro, começando com { e terminando com }. NADA de texto antes ou depois. NADA de markdown. NADA de explicações fora do JSON. Se você responder com texto em vez de JSON, o sistema quebrará.
 
-ESTRUTURA DO PROJETO:
-${fileTree || '(pasta vazia)'}
+Você é o Aedificator Codex IDE. O código é uma arte: respeite a estrutura existente.
 
-ARQUIVOS DISPONÍVEIS:
-${allFiles.join('\n') || '(nenhum arquivo)'}
+${getQualityRules()}
+
+${projectCtx}
+
+${projectRules ? 'REGRAS DO PROJETO (.aedificator-agents.md):\n' + projectRules + '\n' : ''}${isQuestion ? '' : '\nARQUIVOS RELEVANTES:\n' + formatRelevantFiles(relevantFiles)}
 
 SOLICITAÇÃO DO USUÁRIO: "${message}"
 
-MODO ATIVO: ${modeInstruction}
+MODO: ${modeInstruction}
 
-HISTÓRICO DA CONVERSA:
+HISTÓRICO:
 ${historyText}
 
-DECIDA O FORMATO DA RESPOSTA CONFORME A SOLICITAÇÃO:
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+FORMATOS DE RESPOSTA (escolha UM):
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
-CASO A — SOLICITAÇÃO DE MELHORIA / SUGESTÃO / OPINIÃO (ex.: "existe algo para melhorar?", "o que você sugere?", "tem alguma coisa errada no app?"):
-1. Faça uma análise DETALHADA e cuidadosa do projeto como um todo.
-2. Proponha várias melhorias RELACIONADAS, ORGANIZADAS por categoria (ex.: usabilidade, desempenho, segurança, manutenção, arquitetura, código limpo).
-3. Para CADA sugestão, especifique: titulo (nome curto), descricao (detalhada), impacto ("baixo", "médio" ou "alto") e arquivos (lista dos arquivos que seriam alterados).
-4. Cada sugestão deve ser MÍNIMA e LOCALIZADA. NUNCA sugira reescrever o app inteiro nem mudanças drásticas. Se a mudança afetar muitas áreas, quebre em sugestões menores e independentes.
-5. Apenas PROPOSTAS — você não altera nada por conta própria; o usuário escolherá o que aplicar, item por item.
-6. LIMITE: no máximo 4 sugestões. Cada sugestão altera no máximo 2 arquivos. NUNCA proponha reescrever arquivos que já funcionam — só pequenas melhorias pontuais.
-
-CASO B — PEDIDO EXPLÍCITO DE ALTERAÇÃO (o usuário pediu claramente para criar, corrigir, modificar ou deletar arquivos):
-1. Identifique os arquivos que precisam ser criados ou modificados.
-2. Para CADA arquivo, especifique: caminho, ação, conteúdo completo e explicação.
-3. Faça APENAS o que foi pedido, da forma mais mínima possível.
-4. LIMITE: no máximo 5 arquivos no total, apenas os necessários para atender ao pedido.
-
-Responda APENAS com um JSON válido em UM dos formatos abaixo.
-
-FORMATO A (melhorias/sugestões):
+FORMATO A — Apenas se o pedido for AMBÍGUO e você PRECISAR perguntar algo (ex: "cria um app" sem dizer o que faz):
 {
-  "resumo": "MÁXIMO 2-3 frases curtas com a análise geral",
+  "resumo": "Preciso de uma informação",
   "sugestoes": [
-    {
-      "id": "s1",
-      "titulo": "Título curto da melhoria",
-      "descricao": "MÁXIMO 2 frases",
-      "impacto": "baixo",
-      "arquivos": [
-        { "caminho": "src/index.js", "acao": "modificar", "conteudo": "conteúdo completo do arquivo", "explicacao": "uma frase curta" }
-      ]
-    }
+    {"id":"q1","titulo":"Pergunta","descricao":"O que você quer que o app faça?","impacto":"médio","arquivos":[]}
   ]
 }
 
-FORMATO B (alterações diretas):
+FORMATO B — Para pedidos CLAROS de correção, alteração ou implementação:
 {
-  "resumo": "Resumo curto do que será feito",
+  "resumo": "Resumo do que será feito",
   "arquivos": [
-    { "caminho": "src/index.js", "acao": "modificar", "conteudo": "conteúdo completo do arquivo", "explicacao": "uma frase curta" }
+    { "caminho": "src/index.js", "acao": "modificar", "conteudo": "conteúdo COMPLETO do arquivo", "explicacao": "uma frase" },
+    { "caminho": "src/novo.js", "acao": "criar", "conteudo": "conteúdo COMPLETO", "explicacao": "uma frase" }
   ]
 }
 
-REGRAS GERAIS:
-- SEJA CONCISO E PRECISO: "resumo" com no máximo 2-3 frases. "descricao" com no máximo 2 frases. "explicacao" com uma única frase curta. "titulo" curto (5-8 palavras). Sem introduções longas, sem repetições, sem listar o que não foi pedido.
-- REGRA DE OURO: NUNCA faça mudanças drásticas (refatorações grandes, reescritas completas, reorganização de pastas, alterar o app inteiro) sem o usuário pedir EXPLICITAMENTE. O código é uma arte — seja cuidadoso e conservador.
-- Perguntas de opinião/análise usam o FORMATO A (sugestoes). O usuário decidirá, uma a uma, o que aplicar.
-- Pedidos concretos de alteração usam o FORMATO B e fazem só o que foi pedido.
-- Prefira sempre alterações mínimas e localizadas.
-- O conteúdo deve ser COMPLETO (o arquivo inteiro)
-- Se for criar, inclua todo o conteúdo necessário
-- Se for modificar, inclua o arquivo inteiro com as alterações`;
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+REGRAS:
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+- ⚠️ Se o pedido é claro: SEMPRE use FORMATO B com arquivos e conteúdo completo.
+- ⚠️ Se for CRIAÇÃO de app NOVO: primeiro crie APP_SPEC.md, depois implemente módulo por módulo.
+- ⚠️ Só use FORMATO A se realmente não souber o que fazer e precisar perguntar.
+- ⚠️ Conteúdo dos arquivos deve ser COMPLETO, pronto para salvar.
+- ⚠️ Inclua no "resumo": quantos testes gerou, se build passou, se encontrou problemas de segurança.
+- ⚠️ Após cada módulo, inclua uma pergunta no resumo tipo "Funcionou? Quer ajustar algo?"
+- "resumo": 1-2 frases curtas, conversacionais.`;
 
     if (onChunk) onChunk('Assistente', '🔍 Analisando estrutura do projeto...\n');
 
@@ -1030,7 +2485,8 @@ REGRAS GERAIS:
 
     const plan = extractJson(response);
     if (!plan) {
-        throw new Error('Não foi possível interpretar a resposta da IA.');
+        if (onChunk) onChunk('Assistente', response || '');
+        return { resumo: '', arquivos: [], _rawResponse: response };
     }
 
     if (onChunk) {
@@ -1050,11 +2506,12 @@ REGRAS GERAIS:
             }
         }
         plan.arquivos = [];
+        plan._rawResponse = response;
         return plan;
     }
 
     if (!Array.isArray(plan.arquivos)) {
-        throw new Error('Não foi possível interpretar a resposta da IA.');
+        return { resumo: plan.resumo || '', arquivos: [], _rawResponse: response };
     }
 
     for (const arquivo of plan.arquivos) {
@@ -1064,6 +2521,7 @@ REGRAS GERAIS:
         }
     }
 
+    plan._rawResponse = response;
     return plan;
 }
 
@@ -1078,69 +2536,85 @@ async function executePlan(plan, onChunk, signal) {
     if (onChunk) onChunk('Assistente', '\n📋 Executando alterações...\n');
     if (onChunk) onChunk('plan', String(plan.arquivos.length));
 
-    let modifications = [];
+    const arquivos = plan.arquivos || [];
+    const modifications = [];
     let cancelled = false;
 
-    for (const arquivo of plan.arquivos) {
-        if (signal && signal.aborted) {
-            cancelled = true;
-            break;
+    const phases = { criar: [], modificar: [], deletar: [] };
+    for (const a of arquivos) {
+        const acao = a.acao || 'modificar';
+        (phases[acao] || phases.modificar).push(a);
+    }
+
+    for (const a of phases.deletar) {
+        if (signal && signal.aborted) { cancelled = true; break; }
+        backupRelativePath(a.caminho);
+        if (onChunk) onChunk('Sistema', `🗑️ ${a.caminho}\n`);
+        if (onChunk) onChunk('file-status', JSON.stringify([{ file: a.caminho, action: 'deletar', status: 'editing' }]));
+        modifications.push({ file: a.caminho, action: 'deletar', status: 'pending' });
+    }
+
+    if (!cancelled) {
+        for (const a of phases.modificar) {
+            backupRelativePath(a.caminho);
+            if (onChunk) onChunk('file-status', JSON.stringify([{ file: a.caminho, action: 'modificar', status: 'editing' }]));
+            modifications.push({ file: a.caminho, action: 'modificar', status: 'pending' });
         }
-
-        const { caminho, acao, conteudo, explicacao } = arquivo;
-
-        result += `📄 **${caminho}**\n`;
-        result += `   Ação: ${acao}\n`;
-        result += `   Explicação: ${explicacao || 'N/A'}\n`;
-
-        if (onChunk) onChunk('Sistema', `📄 ${acao.toUpperCase()}: ${caminho}\n`);
-
-        if (acao === 'criar' || acao === 'modificar') {
-            if (onChunk) onChunk('file-status', JSON.stringify([{ file: caminho, action: acao, status: 'editing' }]));
-
-            if (acao === 'modificar') {
-                backupRelativePath(caminho);
-            }
-
-            const success = writeFileContent(caminho, conteudo);
-            const finalStatus = acao === 'criar' ? 'created' : 'modified';
-            modifications.push({ file: caminho, action: acao, status: success ? finalStatus : 'normal' });
-
-            if (success) {
-                result += `   ✅ ${acao === 'criar' ? 'Criado' : 'Modificado'} com sucesso!\n`;
-                if (onChunk) onChunk('Sistema', `✅ ${caminho} ${acao === 'criar' ? 'criado' : 'modificado'}\n`);
-            } else {
-                result += `   ❌ Erro ao ${acao === 'criar' ? 'criar' : 'modificar'} arquivo!\n`;
-                if (onChunk) onChunk('Sistema', `❌ Erro em ${caminho}\n`);
-            }
-            if (onChunk) onChunk('file-status', JSON.stringify([{ file: caminho, action: acao, status: success ? finalStatus : 'normal' }]));
-        } else if (acao === 'deletar') {
-            backupRelativePath(caminho);
-            if (deleteFileContent(caminho)) {
-                result += `   ✅ Deletado com sucesso!\n`;
-                if (onChunk) onChunk('Sistema', `🗑️ ${caminho} deletado\n`);
-            } else {
-                result += `   ⚠️ Arquivo não encontrado (ou fora do projeto) para deletar.\n`;
-            }
-            modifications.push({ file: caminho, action: acao, status: 'deleted' });
-            if (onChunk) onChunk('file-status', JSON.stringify([{ file: caminho, action: acao, status: 'deleted' }]));
-        } else {
-            result += `   ⚠️ Ação desconhecida: ${acao}\n`;
+        for (const a of phases.criar) {
+            if (onChunk) onChunk('file-status', JSON.stringify([{ file: a.caminho, action: 'criar', status: 'editing' }]));
+            modifications.push({ file: a.caminho, action: 'criar', status: 'pending' });
         }
-        result += '\n';
+    }
+
+    if (!cancelled) {
+        const writeOps = phases.deletar.map(a => (async () => {
+            const ok = deleteFileContent(a.caminho);
+            const m = modifications.find(m => m.file === a.caminho);
+            if (m) m.status = ok ? 'deleted' : 'normal';
+        })());
+        writeOps.push(...phases.modificar.map(a => (async () => {
+            const ok = writeFileContent(a.caminho, a.conteudo);
+            const m = modifications.find(m => m.file === a.caminho);
+            if (m) m.status = ok ? 'modified' : 'normal';
+        })()));
+        writeOps.push(...phases.criar.map(a => (async () => {
+            const ok = writeFileContent(a.caminho, a.conteudo);
+            const m = modifications.find(m => m.file === a.caminho);
+            if (m) m.status = ok ? 'created' : 'normal';
+        })()));
+
+        try { await Promise.all(writeOps); } catch (e) {
+            if (onChunk) onChunk('Sistema', `❌ Erro paralelo: ${e.message}\n`);
+        }
+    }
+
+    for (const mod of modifications) {
+        const icon = mod.status === 'created' ? '🆕' : mod.status === 'deleted' ? '🗑️' : mod.status === 'modified' ? '✏️' : '❌';
+        if (onChunk) onChunk('Sistema', `${icon} ${mod.file} (${mod.status})\n`);
+        if (onChunk) onChunk('file-status', JSON.stringify([{ file: mod.file, action: mod.action, status: mod.status }]));
     }
 
     if (cancelled) {
         result += `\n⏹️ **Tarefa cancelada** (${modifications.length} arquivo(s) processado(s)).\n`;
     } else {
-        result += `\n✅ **${modifications.length} arquivo(s) processado(s)!**\n`;
+        result += `\n✅ **${modifications.length} arquivo(s) processado(s) em paralelo!**\n`;
     }
+
+    if (modifications.length > 0) {
+        analyzer.invalidateIndex();
+        invalidateProjectCache();
+    }
+
     return result;
 }
 
 // =============================================
 //  ROTAS DA API
 // =============================================
+
+app.get('/api/browser/status', (req, res) => {
+    res.json(getBrowserStatus());
+});
 
 app.get('/api/health', (req, res) => {
     res.json({ status: 'ok', timestamp: new Date().toISOString() });
@@ -1166,14 +2640,37 @@ app.post('/api/init', async (req, res) => {
     res.json({ success: true, message: `Projeto: ${PROJECT_ROOT}`, repo });
 });
 
+// ===== CRIAR NOVO PROJETO (PASTA ABSOLUTA) =====
+app.post('/api/project/create', (req, res) => {
+    const { path: absPath } = req.body;
+    if (!absPath) return res.status(400).json({ error: 'Caminho não especificado' });
+    const resolved = path.resolve(absPath);
+    try {
+        if (!fs.existsSync(resolved)) {
+            fs.mkdirSync(resolved, { recursive: true });
+        }
+        if (!fs.statSync(resolved).isDirectory()) {
+            return res.status(400).json({ error: 'Caminho já existe e não é uma pasta' });
+        }
+        res.json({ success: true, path: resolved });
+    } catch (e) {
+        res.status(500).json({ error: 'Erro ao criar pasta: ' + e.message });
+    }
+});
+
 app.post('/api/config', (req, res) => {
-    const { geminiKey, deepseekKey, opencodeKey } = req.body;
-    if (geminiKey) config.gemini.apiKey = geminiKey;
-    if (deepseekKey) config.deepseek.apiKey = deepseekKey;
-    if (opencodeKey) {
+    const { geminiKey, deepseekKey, opencodeKey, openaiKey, claudeKey, openaiModel, claudeModel, autoCommit } = req.body;
+    if (geminiKey && geminiKey !== '********') config.gemini.apiKey = geminiKey;
+    if (deepseekKey && deepseekKey !== '********') config.deepseek.apiKey = deepseekKey;
+    if (opencodeKey && opencodeKey !== '********') {
         config.opencode.apiKey = opencodeKey;
         ensureOpenCodeAuth(opencodeKey);
     }
+    if (openaiKey && openaiKey !== '********') config.openai.apiKey = openaiKey;
+    if (openaiModel) config.openai.model = openaiModel;
+    if (claudeKey && claudeKey !== '********') config.claude.apiKey = claudeKey;
+    if (claudeModel) config.claude.model = claudeModel;
+    if (autoCommit !== undefined) config.autoCommit = !!autoCommit;
 
     try {
         saveConfigToFile();
@@ -1183,13 +2680,62 @@ app.post('/api/config', (req, res) => {
     }
 });
 
+app.get('/api/config/get', (req, res) => {
+    res.json({
+        success: true,
+        gemini: config.gemini.apiKey ? '********' : '',
+        deepseek: config.deepseek.apiKey ? '********' : '',
+        opencode: config.opencode.apiKey || getOpenCodeAuthKey() ? '********' : '',
+        openai: config.openai.apiKey ? '********' : '',
+        claude: config.claude.apiKey ? '********' : '',
+        openaiModel: config.openai.model || '',
+        claudeModel: config.claude.model || '',
+        autoCommit: config.autoCommit
+    });
+});
+
 app.get('/api/config/status', (req, res) => {
     res.json({
         gemini: { configured: !!config.gemini.apiKey },
         deepseek: { configured: !!config.deepseek.apiKey },
-        opencode: { configured: !!config.opencode.apiKey || !!getOpenCodeAuthKey() }
+        opencode: { configured: !!config.opencode.apiKey || !!getOpenCodeAuthKey() },
+        openai: { configured: !!config.openai.apiKey },
+        claude: { configured: !!config.claude.apiKey }
     });
 });
+
+app.get('/api/usage', (req, res) => {
+    const provider = req.query.provider || '';
+    const model = req.query.model || '';
+    res.json(getUsageReport(provider, model));
+});
+
+app.get('/api/pricing', (req, res) => {
+    res.json({ usdBrl: USD_TO_BRL, prices: TOKEN_PRICES });
+});
+
+app.post('/api/pricing', (req, res) => {
+    const { usdBrl, prices } = req.body;
+    if (usdBrl && usdBrl > 0) USD_TO_BRL = usdBrl;
+    if (prices) {
+        for (const [p, v] of Object.entries(prices)) {
+            if (TOKEN_PRICES[p]) Object.assign(TOKEN_PRICES[p], v);
+        }
+    }
+    try {
+        fs.writeFileSync(path.join(__dirname, 'pricing.json'), JSON.stringify({ usdBrl: USD_TO_BRL, prices: TOKEN_PRICES }), 'utf-8');
+    } catch (e) {}
+    res.json({ success: true, usdBrl: USD_TO_BRL, prices: TOKEN_PRICES });
+});
+
+try {
+    const pricingFile = path.join(__dirname, 'pricing.json');
+    if (fs.existsSync(pricingFile)) {
+        const saved = JSON.parse(fs.readFileSync(pricingFile, 'utf-8'));
+        if (saved.usdBrl) USD_TO_BRL = saved.usdBrl;
+        if (saved.prices) Object.assign(TOKEN_PRICES, saved.prices);
+    }
+} catch (e) {}
 
 app.get('/api/models/opencode', async (req, res) => {
     try {
@@ -1197,6 +2743,28 @@ app.get('/api/models/opencode', async (req, res) => {
         res.json({ success: true, models });
     } catch (e) {
         res.status(500).json({ error: e.message });
+    }
+});
+
+// ===== LISTAR TODOS OS MODELOS OPEncode (sem filtro free) =====
+app.get('/api/models/opencode-all', async (req, res) => {
+    try {
+        const models = await listOpenCodeModels(true);
+        res.json({ success: true, models });
+    } catch (e) {
+        res.json({
+            success: true,
+            models: [
+                { id: 'opencode/anthropic/claude-sonnet-4-6', name: 'Claude Sonnet 4', provider: 'Anthropic', free: true },
+                { id: 'opencode/anthropic/claude-haiku-4-5', name: 'Claude Haiku 4.5', provider: 'Anthropic', free: true },
+                { id: 'opencode/deepseek/deepseek-v4-pro', name: 'DeepSeek V4 Pro', provider: 'DeepSeek', free: false },
+                { id: 'opencode/deepseek/deepseek-chat', name: 'DeepSeek Chat', provider: 'DeepSeek', free: true },
+                { id: 'opencode/openai/gpt-5.2', name: 'GPT-5.2', provider: 'OpenAI', free: false },
+                { id: 'opencode/openai/gpt-4.1', name: 'GPT-4.1', provider: 'OpenAI', free: false },
+                { id: 'opencode/gemini/gemini-3.0-flash', name: 'Gemini 3.0 Flash', provider: 'Gemini', free: true },
+                { id: 'opencode/gemini/gemini-3.0-pro', name: 'Gemini 3.0 Pro', provider: 'Gemini', free: false }
+            ]
+        });
     }
 });
 
@@ -1238,6 +2806,89 @@ app.post('/api/file/write', (req, res) => {
     res.json({ success: true, message: 'Arquivo salvo!' });
 });
 
+app.post('/api/file/create', (req, res) => {
+    const { path: filePath } = req.body || {};
+    if (!filePath) return res.status(400).json({ error: 'Caminho não especificado' });
+    const full = resolveSafePath(filePath);
+    if (!full) return res.status(400).json({ error: 'Caminho fora do projeto' });
+    if (fs.existsSync(full)) return res.status(409).json({ error: 'Já existe um arquivo com este nome' });
+    try {
+        fs.mkdirSync(path.dirname(full), { recursive: true });
+        fs.writeFileSync(full, '', 'utf-8');
+        res.json({ success: true });
+    } catch (e) {
+        res.status(500).json({ error: 'Falha ao criar arquivo: ' + e.message });
+    }
+});
+
+app.post('/api/file/mkdir', (req, res) => {
+    const { path: dirPath } = req.body || {};
+    if (!dirPath) return res.status(400).json({ error: 'Caminho não especificado' });
+    const full = resolveSafePath(dirPath);
+    if (!full) return res.status(400).json({ error: 'Caminho fora do projeto' });
+    if (fs.existsSync(full)) return res.status(409).json({ error: 'Já existe uma pasta com este nome' });
+    try {
+        fs.mkdirSync(full, { recursive: true });
+        res.json({ success: true });
+    } catch (e) {
+        res.status(500).json({ error: 'Falha ao criar pasta: ' + e.message });
+    }
+});
+
+app.post('/api/file/rename', (req, res) => {
+    const { path: oldPath, newPath } = req.body || {};
+    if (!oldPath || !newPath) return res.status(400).json({ error: 'Caminhos não especificados' });
+    const fullOld = resolveSafePath(oldPath);
+    const fullNew = resolveSafePath(newPath);
+    if (!fullOld || !fullNew) return res.status(400).json({ error: 'Caminho fora do projeto' });
+    if (!fs.existsSync(fullOld)) return res.status(404).json({ error: 'Origem não encontrada' });
+    if (fs.existsSync(fullNew)) return res.status(409).json({ error: 'Já existe um arquivo/pasta com o novo nome' });
+    try {
+        fs.mkdirSync(path.dirname(fullNew), { recursive: true });
+        fs.renameSync(fullOld, fullNew);
+        res.json({ success: true });
+    } catch (e) {
+        res.status(500).json({ error: 'Falha ao renomear: ' + e.message });
+    }
+});
+
+app.post('/api/file/delete', (req, res) => {
+    const { path: filePath } = req.body || {};
+    if (!filePath) return res.status(400).json({ error: 'Caminho não especificado' });
+    const full = resolveSafePath(filePath);
+    if (!full) return res.status(400).json({ error: 'Caminho fora do projeto' });
+    if (!fs.existsSync(full)) return res.status(404).json({ error: 'Arquivo/pasta não encontrado' });
+    try {
+        const stats = fs.statSync(full);
+        if (stats.isDirectory()) {
+            fs.rmSync(full, { recursive: true, force: true });
+        } else {
+            backupRelativePath(filePath);
+            fs.unlinkSync(full);
+        }
+        res.json({ success: true });
+    } catch (e) {
+        res.status(500).json({ error: 'Falha ao excluir: ' + e.message });
+    }
+});
+
+app.post('/api/file/move', (req, res) => {
+    const { path: oldPath, newPath } = req.body || {};
+    if (!oldPath || !newPath) return res.status(400).json({ error: 'Caminhos não especificados' });
+    const fullOld = resolveSafePath(oldPath);
+    const fullNew = resolveSafePath(newPath);
+    if (!fullOld || !fullNew) return res.status(400).json({ error: 'Caminho fora do projeto' });
+    if (!fs.existsSync(fullOld)) return res.status(404).json({ error: 'Origem não encontrada' });
+    if (fs.existsSync(fullNew)) return res.status(409).json({ error: 'Já existe um arquivo/pasta com o novo nome' });
+    try {
+        fs.mkdirSync(path.dirname(fullNew), { recursive: true });
+        fs.renameSync(fullOld, fullNew);
+        res.json({ success: true });
+    } catch (e) {
+        res.status(500).json({ error: 'Falha ao mover: ' + e.message });
+    }
+});
+
 // ===== BACKUP / RESTAURAR =====
 app.post('/api/backup/list', (req, res) => {
     const files = listBackups();
@@ -1264,6 +2915,117 @@ app.post('/api/backup/restore', (req, res) => {
     } catch (e) {
         res.status(500).json({ error: e.message });
     }
+});
+
+// ===== UNDO / REDO =====
+const undoStack = [];
+const redoStack = [];
+
+function pushUndoState(affectedFiles) {
+    if (!Array.isArray(affectedFiles) || !affectedFiles.length) return;
+    const entry = { timestamp: Date.now(), files: [] };
+    for (const f of affectedFiles) {
+        const fullPath = resolveSafePath(typeof f === 'string' ? f : f.caminho || f.file);
+        if (!fullPath || !fs.existsSync(fullPath)) continue;
+        try {
+            entry.files.push({ path: typeof f === 'string' ? f : f.caminho || f.file, content: fs.readFileSync(fullPath, 'utf-8') });
+        } catch (e) {}
+    }
+    if (entry.files.length) {
+        undoStack.push(entry);
+        if (undoStack.length > 50) undoStack.shift();
+        redoStack.length = 0;
+    }
+}
+
+app.post('/api/undo', (req, res) => {
+    if (!undoStack.length) return res.json({ success: false, message: 'Nada para desfazer' });
+    const entry = undoStack.pop();
+    const redoEntry = { timestamp: Date.now(), files: [] };
+    for (const f of entry.files) {
+        const fullPath = resolveSafePath(f.path);
+        if (!fullPath) continue;
+        try {
+            if (fs.existsSync(fullPath)) {
+                redoEntry.files.push({ path: f.path, content: fs.readFileSync(fullPath, 'utf-8') });
+            }
+            fs.mkdirSync(path.dirname(fullPath), { recursive: true });
+            fs.writeFileSync(fullPath, f.content, 'utf-8');
+        } catch (e) {}
+    }
+    if (redoEntry.files.length) redoStack.push(redoEntry);
+    broadcastAll({ type: 'refresh' });
+    broadcastAll({ type: 'undo-done', message: `${entry.files.length} arquivo(s) restaurado(s)` });
+    res.json({ success: true, files: entry.files.length, message: `${entry.files.length} arquivo(s) restaurado(s)` });
+});
+
+app.post('/api/redo', (req, res) => {
+    if (!redoStack.length) return res.json({ success: false, message: 'Nada para refazer' });
+    const entry = redoStack.pop();
+    const undoEntry = { timestamp: Date.now(), files: [] };
+    for (const f of entry.files) {
+        const fullPath = resolveSafePath(f.path);
+        if (!fullPath) continue;
+        try {
+            if (fs.existsSync(fullPath)) {
+                undoEntry.files.push({ path: f.path, content: fs.readFileSync(fullPath, 'utf-8') });
+            }
+            fs.mkdirSync(path.dirname(fullPath), { recursive: true });
+            fs.writeFileSync(fullPath, f.content, 'utf-8');
+        } catch (e) {}
+    }
+    if (undoEntry.files.length) undoStack.push(undoEntry);
+    broadcastAll({ type: 'refresh' });
+    broadcastAll({ type: 'redo-done', message: `${entry.files.length} arquivo(s) refeito(s)` });
+    res.json({ success: true, files: entry.files.length, message: `${entry.files.length} arquivo(s) refeito(s)` });
+});
+
+app.post('/api/undo/status', (req, res) => {
+    res.json({ canUndo: undoStack.length > 0, canRedo: redoStack.length > 0, undoCount: undoStack.length, redoCount: redoStack.length });
+});
+
+// ===== SHARE =====
+function escapeHtml(text) {
+    return (text || '').replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;');
+}
+
+const sharedConversations = new Map();
+
+app.post('/api/share', (req, res) => {
+    const { messages } = req.body;
+    if (!Array.isArray(messages) || !messages.length) {
+        return res.status(400).json({ error: 'Nenhuma mensagem para compartilhar' });
+    }
+    const id = crypto.randomBytes(6).toString('hex');
+    sharedConversations.set(id, { messages, createdAt: Date.now() });
+    if (sharedConversations.size > 100) {
+        const oldest = [...sharedConversations.keys()].sort((a, b) =>
+            sharedConversations.get(a).createdAt - sharedConversations.get(b).createdAt)[0];
+        sharedConversations.delete(oldest);
+    }
+    res.json({ success: true, id, url: `http://127.0.0.1:${PORT}/share/${id}` });
+});
+
+app.get('/share/:id', (req, res) => {
+    const conv = sharedConversations.get(req.params.id);
+    if (!conv) return res.status(404).send('<h2 style="color:#f85149;font-family:sans-serif;text-align:center;margin-top:60px;">Conversa não encontrada ou expirada</h2>');
+    let html = `<!DOCTYPE html><html lang="pt"><head><meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1.0"><title>Aedificator Codex - Conversa Compartilhada</title>
+<style>*{margin:0;padding:0;box-sizing:border-box}body{font-family:'Segoe UI',sans-serif;background:#0d1117;color:#e6edf3;padding:20px;max-width:900px;margin:0 auto}
+h1{font-size:18px;color:#58a6ff;margin-bottom:8px;border-bottom:1px solid #30363d;padding-bottom:12px}
+.msg{margin:8px 0;padding:10px 14px;border-radius:8px;line-height:1.5}
+.msg.user{background:#1f6feb22;border-left:3px solid #58a6ff}
+.msg.agent{background:#23863622;border-left:3px solid #3fb950}
+.msg.system{background:#30363d44;border-left:3px solid #484f58;font-size:13px}
+.role{font-size:10px;font-weight:700;text-transform:uppercase;margin-bottom:4px;opacity:0.7}
+pre{background:#161b22;padding:10px;border-radius:6px;overflow-x:auto;font-size:12px}
+.footer{text-align:center;margin-top:24px;font-size:11px;color:#484f58}footer a{color:#58a6ff}
+</style></head><body><h1>Aedificator Codex IDE - Conversa Compartilhada</h1>`;
+    for (const m of conv.messages) {
+        const role = m.role || 'system';
+        html += `<div class="msg ${role}"><div class="role">${role === 'user' ? 'Usuário' : role === 'agent' ? 'Assistente' : 'Sistema'}</div>${escapeHtml(m.content).replace(/\n/g, '<br>').replace(/```([\s\S]*?)```/g, '<pre><code>$1</code></pre>')}</div>`;
+    }
+    html += `<div class="footer">${new Date(conv.createdAt).toLocaleString()} · <a href="/">Aedificator Codex IDE</a></div></body></html>`;
+    res.type('html').send(html);
 });
 
 // ===== SNAPSHOTS ROTULADOS (versões completas da pasta) =====
@@ -1436,6 +3198,668 @@ app.post('/api/run', async (req, res) => {
     }
 });
 
+// ===== TERMINAL PERSISTENTE (SHELL SESSION) =====
+app.post('/api/shell/start', (req, res) => {
+    const broadcast = (line) => {
+        const payload = JSON.stringify({ type: 'run-output', line });
+        for (const client of wss.clients) {
+            if (client.readyState === WebSocket.OPEN) {
+                try { client.send(payload); } catch (e) {}
+            }
+        }
+    };
+    try {
+        const result = runner.startShellSession(PROJECT_ROOT, broadcast);
+        res.json(result);
+    } catch (e) {
+        res.status(500).json({ error: e.message });
+    }
+});
+
+app.post('/api/shell/send', (req, res) => {
+    const { command } = req.body || {};
+    if (!command) return res.status(400).json({ error: 'Comando vazio' });
+    try {
+        const result = runner.sendToShell(command);
+        res.json(result);
+    } catch (e) {
+        res.status(500).json({ error: e.message });
+    }
+});
+
+// Remote shell: encaminha comando para o servidor remoto
+app.post('/api/remote/shell', async (req, res) => {
+    const { command } = req.body || {};
+    if (!command) return res.status(400).json({ error: 'Comando vazio' });
+    if (!remote.isConnected()) return res.status(400).json({ error: 'Nenhuma conexão remota ativa' });
+    try {
+        const result = await remote.execRemote(command);
+        res.json({ success: true, output: result.stdout || result.stderr, cwd: '', code: result.code });
+    } catch (e) {
+        res.status(500).json({ error: e.message });
+    }
+});
+
+app.post('/api/shell/stop', (req, res) => {
+    try {
+        res.json(runner.stopShellSession());
+    } catch (e) {
+        res.status(500).json({ error: e.message });
+    }
+});
+
+// ===== DOCKER =====
+app.post('/api/docker/run', async (req, res) => {
+    const { command } = req.body || {};
+    if (!command) return res.status(400).json({ error: 'Comando Docker obrigatório' });
+    if (!command.startsWith('docker')) return res.status(400).json({ error: 'Apenas comandos docker são permitidos' });
+    try {
+        const result = await runner.runCommand({ command, cwd: PROJECT_ROOT, timeoutMs: 300000 });
+        res.json({ success: true, output: result.stdout || result.stderr, code: result.code });
+    } catch (e) {
+        res.status(500).json({ error: e.message });
+    }
+});
+
+app.post('/api/docker/status', async (req, res) => {
+    try {
+        const r1 = await runner.runCommand({ command: 'docker --version', cwd: PROJECT_ROOT, timeoutMs: 5000 });
+        const r2 = await runner.runCommand({ command: 'docker ps --format "{{.Names}}"', cwd: PROJECT_ROOT, timeoutMs: 5000 });
+        const containers = r2.stdout ? r2.stdout.trim().split('\n').filter(Boolean) : [];
+        res.json({ success: true, installed: r1.code === 0 && !!r1.stdout, containers });
+    } catch (e) {
+        res.json({ success: true, installed: false, containers: [] });
+    }
+});
+
+// ===== REMOTE DEV (SSH) =====
+app.post('/api/remote/connect', async (req, res) => {
+    const { host, user, port, keyFile } = req.body || {};
+    try {
+        const result = await remote.connect({ host, user, port: port || 22, keyFile });
+        res.json(result);
+    } catch (e) {
+        res.status(500).json({ error: e.message });
+    }
+});
+
+app.post('/api/remote/disconnect', (req, res) => {
+    res.json(remote.disconnect());
+});
+
+app.post('/api/remote/status', (req, res) => {
+    res.json(remote.getStatus());
+});
+
+app.post('/api/remote/ls', async (req, res) => {
+    const { path: remotePath } = req.body || {};
+    try {
+        const result = await remote.listDir(remotePath || '.');
+        res.json(result);
+    } catch (e) {
+        res.status(500).json({ error: e.message });
+    }
+});
+
+app.post('/api/remote/exec', async (req, res) => {
+    const { command } = req.body || {};
+    if (!command) return res.status(400).json({ error: 'Comando obrigatório' });
+    try {
+        const result = await remote.execRemote(command);
+        res.json({ success: true, output: result.stdout || result.stderr, code: result.code });
+    } catch (e) {
+        res.status(500).json({ error: e.message });
+    }
+});
+
+app.post('/api/remote/upload', async (req, res) => {
+    const { localPath, remotePath } = req.body || {};
+    if (!localPath || !remotePath) return res.status(400).json({ error: 'Caminhos obrigatórios' });
+    const fullLocal = resolveSafePath(localPath) || localPath;
+    try {
+        const result = await remote.uploadFile(fullLocal, remotePath);
+        res.json(result);
+    } catch (e) {
+        res.status(500).json({ error: e.message });
+    }
+});
+
+app.post('/api/remote/download', async (req, res) => {
+    const { remotePath, localPath } = req.body || {};
+    if (!remotePath) return res.status(400).json({ error: 'Caminho remoto obrigatório' });
+    const fullLocal = localPath ? (resolveSafePath(localPath) || path.join(PROJECT_ROOT || process.cwd(), path.basename(remotePath))) : path.join(PROJECT_ROOT || process.cwd(), path.basename(remotePath));
+    try {
+        const result = await remote.downloadFile(remotePath, fullLocal);
+        res.json(result);
+    } catch (e) {
+        res.status(500).json({ error: e.message });
+    }
+});
+
+app.post('/api/remote/deploy', async (req, res) => {
+    const { remotePath } = req.body || {};
+    if (!remotePath) return res.status(400).json({ error: 'Caminho remoto obrigatório' });
+    try {
+        const result = await remote.deployProject(remotePath);
+        broadcastAll({ type: 'deploy-done', message: 'Deploy concluído: ' + remotePath });
+        res.json(result);
+    } catch (e) {
+        res.status(500).json({ error: e.message });
+    }
+});
+
+// ===== SETTINGS SYNC =====
+const SETTINGS_FILE = () => path.join(PROJECT_ROOT, '.aedificator-settings.json');
+const KEYBINDINGS_FILE = () => path.join(PROJECT_ROOT, '.aedificator-keybindings.json');
+
+app.post('/api/settings/export', (req, res) => {
+    if (!PROJECT_ROOT) return res.status(400).json({ error: 'Nenhum projeto aberto' });
+    try {
+        const { settings } = req.body || {};
+        if (!settings && !req.body.id) return res.status(400).json({ error: 'Envie as configurações como { settings: {...} }' });
+        const toSave = settings || req.body;
+        toSave.exportedAt = new Date().toISOString();
+        fs.writeFileSync(SETTINGS_FILE(), JSON.stringify(toSave, null, 2), 'utf-8');
+        res.json({ success: true, file: '.aedificator-settings.json' });
+    } catch (e) {
+        res.status(500).json({ error: e.message });
+    }
+});
+
+app.post('/api/settings/import', (req, res) => {
+    if (!PROJECT_ROOT) return res.status(400).json({ error: 'Nenhum projeto aberto' });
+    try {
+        const file = SETTINGS_FILE();
+        if (!fs.existsSync(file)) return res.status(404).json({ error: 'Arquivo .aedificator-settings.json não encontrado. Exporte primeiro.' });
+        const settings = JSON.parse(fs.readFileSync(file, 'utf-8'));
+        res.json({ success: true, settings });
+    } catch (e) {
+        res.status(500).json({ error: e.message });
+    }
+});
+
+app.post('/api/keybindings/list', (req, res) => {
+    if (!PROJECT_ROOT) return res.json({ success: true, bindings: [] });
+    try {
+        const file = KEYBINDINGS_FILE();
+        let bindings = [];
+        if (fs.existsSync(file)) {
+            bindings = JSON.parse(fs.readFileSync(file, 'utf-8'));
+        }
+        res.json({ success: true, bindings });
+    } catch (e) {
+        res.json({ success: true, bindings: [] });
+    }
+});
+
+app.post('/api/keybindings/save', (req, res) => {
+    const { bindings } = req.body || {};
+    if (!PROJECT_ROOT || !Array.isArray(bindings)) return res.status(400).json({ error: 'Dados inválidos' });
+    try {
+        fs.writeFileSync(KEYBINDINGS_FILE(), JSON.stringify(bindings, null, 2), 'utf-8');
+        res.json({ success: true });
+    } catch (e) {
+        res.status(500).json({ error: e.message });
+    }
+});
+
+// ===== TAREFAS DE BUILD =====
+const TASKS_FILE = () => path.join(PROJECT_ROOT, '.aedificator-tasks.json');
+
+app.post('/api/tasks/list', (req, res) => {
+    const file = TASKS_FILE();
+    let tasks = [];
+    try {
+        if (fs.existsSync(file)) {
+            tasks = JSON.parse(fs.readFileSync(file, 'utf-8'));
+        }
+    } catch (e) {}
+    res.json({ success: true, tasks });
+});
+
+app.post('/api/tasks/save', (req, res) => {
+    const { tasks } = req.body;
+    if (!Array.isArray(tasks)) return res.status(400).json({ error: 'Lista de tarefas inválida' });
+    try {
+        fs.writeFileSync(TASKS_FILE(), JSON.stringify(tasks, null, 2), 'utf-8');
+        res.json({ success: true });
+    } catch (e) {
+        res.status(500).json({ error: e.message });
+    }
+});
+
+// =============================================
+//  ANALYZER — validação e indexação de código
+// =============================================
+app.post('/api/analyzer/validate', (req, res) => {
+    const { code, file: filePath } = req.body || {};
+    if (!code || !filePath) return res.status(400).json({ error: 'Código e caminho do arquivo são obrigatórios' });
+    try {
+        const ext = (path.extname(filePath) || '.js').toLowerCase();
+        const isTS = ['.ts', '.tsx'].includes(ext);
+        const isPy = ['.py', '.pyw'].includes(ext);
+        const isGo = ['.go'].includes(ext);
+        const isCpp = ['.c', '.h', '.cpp', '.cxx', '.cc', '.hpp', '.hh'].includes(ext);
+        const isRs = ext === '.rs';
+        let errors = [];
+        const fullPath = resolveSafePath(filePath);
+        if (fullPath) {
+            try { fs.writeFileSync(fullPath, code, 'utf-8'); } catch (e) {}
+        }
+        if (isTS && fullPath) {
+            try {
+                errors = analyzer.validateWithTSProgram(filePath, PROJECT_ROOT);
+            } catch (e) {
+                errors.push({ type: 'typescript', line: 1, column: 1, message: 'Type-check indisponível: ' + e.message, severity: 'warning' });
+            }
+        } else if (isPy && fullPath) {
+            try {
+                errors = analyzer.validateWithPythonAST(filePath, PROJECT_ROOT);
+            } catch (e) {
+                errors.push({ type: 'python', line: 1, column: 1, message: 'Python AST falhou: ' + e.message, severity: 'warning' });
+            }
+        } else if (isGo && fullPath) {
+            try {
+                errors = analyzer.validateWithGoVet(filePath, PROJECT_ROOT);
+            } catch (e) {
+                errors.push({ type: 'go', line: 1, column: 1, message: 'go vet falhou: ' + e.message, severity: 'warning' });
+            }
+        } else if (isCpp && fullPath) {
+            try {
+                errors = analyzer.validateWithGCC(filePath, PROJECT_ROOT);
+            } catch (e) {
+                errors.push({ type: 'c/c++', line: 1, column: 1, message: 'gcc indisponível: ' + e.message, severity: 'warning' });
+            }
+        } else if (isRs && fullPath) {
+            try {
+                errors = analyzer.validateWithRustc(filePath, PROJECT_ROOT);
+            } catch (e) {
+                errors.push({ type: 'rust', line: 1, column: 1, message: 'rustc indisponível: ' + e.message, severity: 'warning' });
+            }
+        }
+        if (!errors.length) {
+            const result = analyzer.validateCode(code, filePath, PROJECT_ROOT);
+            errors = result.errors;
+        }
+        const valid = errors.filter(e => e.severity === 'error').length === 0;
+        const fixes = errors.length ? analyzer.suggestFix(errors[0], code) : [];
+        res.json({ errors, valid, filePath, suggestionCount: errors.filter(e => e.severity === 'warning').length, fixes });
+    } catch (e) {
+        res.status(500).json({ error: e.message });
+    }
+});
+
+app.post('/api/analyzer/ts-symbols', (req, res) => {
+    const { file } = req.body || {};
+    if (!PROJECT_ROOT || !file) return res.status(400).json({ error: 'Arquivo não especificado' });
+    try {
+        const symbols = analyzer.getTSSymbols(file, PROJECT_ROOT);
+        res.json({ success: true, symbols });
+    } catch (e) {
+        res.status(500).json({ error: e.message });
+    }
+});
+
+app.post('/api/analyzer/python-symbols', (req, res) => {
+    const { file } = req.body || {};
+    if (!PROJECT_ROOT || !file) return res.status(400).json({ error: 'Arquivo não especificado' });
+    try {
+        const symbols = analyzer.getPythonSymbols(file, PROJECT_ROOT);
+        res.json({ success: true, symbols });
+    } catch (e) {
+        res.status(500).json({ error: e.message });
+    }
+});
+
+app.post('/api/analyzer/python-validate', (req, res) => {
+    const { file } = req.body || {};
+    if (!PROJECT_ROOT || !file) return res.status(400).json({ error: 'Arquivo não especificado' });
+    try {
+        const errors = analyzer.validateWithPythonAST(file, PROJECT_ROOT);
+        res.json({ success: true, errors });
+    } catch (e) {
+        res.status(500).json({ error: e.message });
+    }
+});
+
+app.post('/api/analyzer/go-symbols', (req, res) => {
+    const { file } = req.body || {};
+    if (!PROJECT_ROOT || !file) return res.status(400).json({ error: 'Arquivo não especificado' });
+    try {
+        const symbols = analyzer.getGoSymbols(file, PROJECT_ROOT);
+        res.json({ success: true, symbols });
+    } catch (e) {
+        res.status(500).json({ error: e.message });
+    }
+});
+
+app.post('/api/analyzer/go-validate', (req, res) => {
+    const { file } = req.body || {};
+    if (!PROJECT_ROOT || !file) return res.status(400).json({ error: 'Arquivo não especificado' });
+    try {
+        const errors = analyzer.validateWithGoVet(file, PROJECT_ROOT);
+        res.json({ success: true, errors });
+    } catch (e) {
+        res.status(500).json({ error: e.message });
+    }
+});
+
+app.post('/api/analyzer/index', (req, res) => {
+    try {
+        const idx = analyzer.indexProject(PROJECT_ROOT);
+        const stats = {
+            files: Object.keys(idx.files).length,
+            totalFunctions: 0,
+            totalClasses: 0,
+            totalExports: 0
+        };
+        for (const f of Object.values(idx.files)) {
+            stats.totalFunctions += f.functions.length;
+            stats.totalClasses += f.classes.length;
+            stats.totalExports += f.exports.length;
+        }
+        res.json({ success: true, stats, files: Object.keys(idx.files).slice(0, 100) });
+    } catch (e) {
+        res.status(500).json({ error: e.message });
+    }
+});
+
+app.post('/api/analyzer/invalidate', (req, res) => {
+    invalidateProjectCache();
+    res.json({ success: true });
+});
+
+app.post('/api/analyzer/symbols', (req, res) => {
+    if (!PROJECT_ROOT) return res.status(400).json({ error: 'Nenhum projeto aberto' });
+    const idx = analyzer.indexProject(PROJECT_ROOT);
+    const all = [];
+    for (const [relPath, parsed] of Object.entries(idx.files || {})) {
+        for (const exp of (parsed.exports || [])) {
+            all.push({ name: exp, kind: 'export', file: relPath, line: 1 });
+        }
+        for (const fn of (parsed.functions || [])) {
+            all.push({ name: fn.name, kind: 'function', file: relPath, line: 1, params: fn.params });
+        }
+        for (const cls of (parsed.classes || [])) {
+            all.push({ name: cls, kind: 'class', file: relPath, line: 1 });
+        }
+        for (const vt of (parsed.variables || [])) {
+            all.push({ name: vt, kind: 'variable', file: relPath, line: 1 });
+        }
+    }
+    res.json({ success: true, symbols: all, stats: { files: Object.keys(idx.files || {}).length, total: all.length } });
+});
+
+app.post('/api/analyzer/definition', (req, res) => {
+    const { file, symbol, wordUnderCursor } = req.body || {};
+    if (!PROJECT_ROOT) return res.status(400).json({ error: 'Nenhum projeto aberto' });
+    const idx = analyzer.indexProject(PROJECT_ROOT);
+    const searchName = symbol || wordUnderCursor || '';
+    if (!searchName) return res.json({ success: true, locations: [] });
+    const results = [];
+    for (const [relPath, parsed] of Object.entries(idx.files || {})) {
+        if (parsed.exports && parsed.exports.includes(searchName)) {
+            results.push({ file: relPath, line: 1, name: searchName, kind: 'export' });
+        }
+        for (const fn of (parsed.functions || [])) {
+            if (fn.name === searchName) {
+                results.push({ file: relPath, line: 1, name: searchName, kind: 'function' });
+            }
+        }
+        for (const cls of (parsed.classes || [])) {
+            if (cls === searchName) {
+                results.push({ file: relPath, line: 1, name: searchName, kind: 'class' });
+            }
+        }
+    }
+    res.json({ success: true, locations: results });
+});
+
+app.post('/api/analyzer/references', (req, res) => {
+    const { file, symbol, wordUnderCursor } = req.body || {};
+    if (!PROJECT_ROOT) return res.status(400).json({ error: 'Nenhum projeto aberto' });
+    const searchName = symbol || wordUnderCursor || '';
+    if (!searchName) return res.json({ success: true, locations: [] });
+    const results = [];
+    const idx = analyzer.indexProject(PROJECT_ROOT);
+    for (const [relPath, parsed] of Object.entries(idx.files || {})) {
+        for (const imp of (parsed.imports || [])) {
+            if (imp.name === searchName) {
+                results.push({ file: relPath, line: 1, name: searchName, kind: 'import' });
+            }
+        }
+        for (const fn of (parsed.functions || [])) {
+            if (fn.name === searchName) {
+                results.push({ file: relPath, line: 1, name: searchName, kind: 'function' });
+            }
+        }
+    }
+    try {
+        const relFile = file || '';
+        if (relFile) {
+            const fullPath = resolveSafePath(relFile);
+            if (fullPath && fs.existsSync(fullPath)) {
+                const content = fs.readFileSync(fullPath, 'utf-8');
+                const escapedName = searchName.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+                const refRegex = new RegExp(String.raw`\b${escapedName}\b`);
+                const lines = content.split('\n');
+                lines.forEach((line, idxLine) => {
+                    if (refRegex.test(line)) {
+                        results.push({ file: relFile, line: idxLine + 1, name: searchName, kind: 'reference' });
+                    }
+                });
+            }
+        }
+    } catch (e) {}
+    res.json({ success: true, locations: results });
+});
+
+app.post('/api/analyzer/completions', (req, res) => {
+    const { prefix, file } = req.body || {};
+    if (!PROJECT_ROOT) return res.status(400).json({ error: 'Nenhum projeto aberto' });
+    const searchPrefix = (prefix || '').toLowerCase();
+    const idx = analyzer.indexProject(PROJECT_ROOT);
+    const items = [];
+    const seen = new Set();
+    for (const [relPath, parsed] of Object.entries(idx.files || {})) {
+        for (const exp of (parsed.exports || [])) {
+            if (exp.toLowerCase().startsWith(searchPrefix) && !seen.has(exp)) {
+                seen.add(exp);
+                items.push({ label: exp, kind: 'property', detail: 'export de ' + relPath, insertText: exp });
+            }
+        }
+        for (const fn of (parsed.functions || [])) {
+            if (fn.name.toLowerCase().startsWith(searchPrefix) && !seen.has(fn.name)) {
+                seen.add(fn.name);
+                items.push({
+                    label: fn.name, kind: 'function', detail: '(' + (fn.params || []).join(', ') + ')',
+                    insertText: fn.name + '($0)', insertTextRules: 4
+                });
+            }
+        }
+        for (const cls of (parsed.classes || [])) {
+            if (cls.toLowerCase().startsWith(searchPrefix) && !seen.has(cls)) {
+                seen.add(cls);
+                items.push({ label: cls, kind: 'class', detail: 'classe em ' + relPath, insertText: cls });
+            }
+        }
+        for (const vt of (parsed.variables || [])) {
+            if (vt.toLowerCase().startsWith(searchPrefix) && !seen.has(vt)) {
+                seen.add(vt);
+                items.push({ label: vt, kind: 'variable', detail: 'var em ' + relPath, insertText: vt });
+            }
+        }
+    }
+    res.json({ success: true, completions: items });
+});
+
+// ===== UPLOAD DE ARQUIVO (drag & drop) =====
+app.post('/api/file/upload', (req, res) => {
+    const { name, content, encoding, targetDir } = req.body || {};
+    if (!name || !content) return res.status(400).json({ error: 'Nome e conteúdo são obrigatórios' });
+    const dir = targetDir || '';
+    const relPath = dir ? dir.replace(/\\/g, '/').replace(/\/+$/, '') + '/' + name : name;
+    const fullPath = resolveSafePath(relPath);
+    if (!fullPath) return res.status(400).json({ error: 'Caminho fora do projeto' });
+    try {
+        const dirName = path.dirname(fullPath);
+        if (!fs.existsSync(dirName)) fs.mkdirSync(dirName, { recursive: true });
+        if (encoding === 'base64') {
+            fs.writeFileSync(fullPath, Buffer.from(content, 'base64'));
+        } else {
+            fs.writeFileSync(fullPath, content, 'utf-8');
+        }
+        res.json({ success: true, path: relPath });
+    } catch (e) {
+        res.status(500).json({ error: e.message });
+    }
+});
+
+app.post('/api/file/stat', (req, res) => {
+    const { path: filePath } = req.body || {};
+    if (!filePath) return res.status(400).json({ error: 'Caminho não especificado' });
+    const fullPath = resolveSafePath(filePath);
+    if (!fullPath) return res.status(400).json({ error: 'Caminho fora do projeto' });
+    try {
+        const stat = fs.statSync(fullPath);
+        res.json({ success: true, isDirectory: stat.isDirectory(), size: stat.size, mtime: stat.mtimeMs });
+    } catch (e) {
+        res.status(404).json({ success: false, error: 'Arquivo não encontrado' });
+    }
+});
+
+// ===== DEBUGGER (CDP - passo a passo) =====
+function broadcastDebug(type, payload) {
+    const msg = JSON.stringify({ type, ...payload });
+    for (const client of wss.clients) {
+        if (client.readyState === WebSocket.OPEN) {
+            try { client.send(msg); } catch (e) {}
+        }
+    }
+}
+
+const DEBUG_EXTENSIONS = new Set(['.js', '.cjs', '.mjs', '.ts', '.tsx']);
+
+app.post('/api/debug/start', async (req, res) => {
+    const { path: filePath, breakpoints } = req.body || {};
+    if (!filePath) {
+        return res.status(400).json({ error: 'Arquivo não especificado' });
+    }
+    const fullPath = resolveSafePath(filePath);
+    if (!fullPath) {
+        return res.status(400).json({ error: 'Caminho fora do projeto' });
+    }
+    const ext = path.extname(fullPath).toLowerCase();
+    if (!DEBUG_EXTENSIONS.has(ext)) {
+        return res.status(400).json({ error: `Depuração suportada apenas para: ${[...DEBUG_EXTENSIONS].join(', ')}` });
+    }
+    if (!fs.existsSync(fullPath)) {
+        return res.status(404).json({ error: 'Arquivo não encontrado' });
+    }
+    if (debuggerRunner.isRunning()) {
+        return res.status(409).json({ error: 'Já existe uma sessão de debug em andamento' });
+    }
+
+    const onEvent = (ev) => broadcastDebug(ev.type, ev);
+    try {
+        await debuggerRunner.startDebug({
+            file: fullPath,
+            breakpoints,
+            onEvent
+        });
+        broadcastDebug('debug-started', { file: filePath });
+        res.json({ success: true, file: filePath });
+    } catch (e) {
+        res.status(e.status || 500).json({ success: false, error: e.message });
+    }
+});
+
+app.post('/api/debug/chrome', async (req, res) => {
+    if (debuggerRunner.isRunning()) return res.status(409).json({ error: 'Já existe uma sessão de debug em andamento' });
+    const { url } = req.body || {};
+    try {
+        await debuggerRunner.startChromeDebug({ url: url || 'about:blank', onEvent: (ev) => broadcastDebug(ev.type, ev) });
+        broadcastDebug('debug-started', { type: 'chrome' });
+        res.json({ success: true, type: 'chrome' });
+    } catch (e) {
+        res.status(e.status || 500).json({ success: false, error: e.message });
+    }
+});
+
+app.post('/api/debug/python', async (req, res) => {
+    const { file, breakpoints } = req.body || {};
+    if (!file) return res.status(400).json({ error: 'Arquivo não especificado' });
+    const fullPath = resolveSafePath(file);
+    if (!fullPath) return res.status(400).json({ error: 'Caminho fora do projeto' });
+    if (!fs.existsSync(fullPath)) return res.status(404).json({ error: 'Arquivo não encontrado' });
+    if (debuggerRunner.isRunning()) return res.status(409).json({ error: 'Já existe uma sessão de debug em andamento' });
+    try {
+        await debuggerRunner.startPythonDebug({ file: fullPath, breakpoints, onEvent: (ev) => broadcastDebug(ev.type, ev) });
+        broadcastDebug('debug-started', { file, type: 'python' });
+        res.json({ success: true, file, type: 'python' });
+    } catch (e) {
+        res.status(e.status || 500).json({ success: false, error: e.message });
+    }
+});
+
+app.post('/api/debug/go', async (req, res) => {
+    const { file, breakpoints } = req.body || {};
+    if (!file) return res.status(400).json({ error: 'Arquivo não especificado' });
+    const fullPath = resolveSafePath(file);
+    if (!fullPath) return res.status(400).json({ error: 'Caminho fora do projeto' });
+    const cwd = path.dirname(fullPath);
+    if (!fs.existsSync(fullPath)) return res.status(404).json({ error: 'Arquivo não encontrado' });
+    if (debuggerRunner.isRunning()) return res.status(409).json({ error: 'Já existe uma sessão de debug em andamento' });
+    try {
+        await debuggerRunner.startGoDebug({ file: fullPath, cwd, breakpoints, onEvent: (ev) => broadcastDebug(ev.type, ev) });
+        broadcastDebug('debug-started', { file, type: 'go' });
+        res.json({ success: true, file, type: 'go' });
+    } catch (e) {
+        res.status(e.status || 500).json({ success: false, error: e.message });
+    }
+});
+
+app.post('/api/debug/resume', async (req, res) => {
+    try { res.json(await debuggerRunner.resume()); } catch (e) { res.status(500).json({ success: false, error: e.message }); }
+});
+
+app.post('/api/debug/step', async (req, res) => {
+    try { res.json(await debuggerRunner.stepOver()); } catch (e) { res.status(500).json({ success: false, error: e.message }); }
+});
+
+app.post('/api/debug/stepInto', async (req, res) => {
+    try { res.json(await debuggerRunner.stepInto()); } catch (e) { res.status(500).json({ success: false, error: e.message }); }
+});
+
+app.post('/api/debug/stepOut', async (req, res) => {
+    try { res.json(await debuggerRunner.stepOut()); } catch (e) { res.status(500).json({ success: false, error: e.message }); }
+});
+
+app.post('/api/debug/stop', (req, res) => {
+    try {
+        const r = debuggerRunner.stopDebug();
+        broadcastDebug('debug-ended', { code: -1 });
+        res.json(r);
+    } catch (e) {
+        res.status(500).json({ success: false, error: e.message });
+    }
+});
+
+// ===== DEBUGGER: AVALIAR EXPRESSÃO =====
+app.post('/api/debug/evaluate', async (req, res) => {
+    if (!debuggerRunner.isRunning()) {
+        return res.status(400).json({ success: false, error: 'Depurador não está em execução' });
+    }
+    const { expression } = req.body;
+    if (!expression) return res.status(400).json({ success: false, error: 'Expressão vazia' });
+    try {
+        const result = await debuggerRunner.evaluate(expression);
+        res.json({ success: true, value: result });
+    } catch (e) {
+        res.status(500).json({ success: false, error: e.message });
+    }
+});
+
 // ===== BUSCA NO PROJETO =====
 function isBinaryExtension(name) {
     const bin = new Set(['png', 'jpg', 'jpeg', 'gif', 'ico', 'bmp', 'webp', 'pdf', 'zip', 'rar', '7z', 'tar', 'gz', 'exe', 'dll', 'msi', 'mp3', 'mp4', 'woff', 'woff2', 'ttf', 'otf', 'node']);
@@ -1444,9 +3868,25 @@ function isBinaryExtension(name) {
 }
 
 app.post('/api/search', (req, res) => {
-    const { query, inContent } = req.body;
-    const q = String(query || '').trim().toLowerCase();
+    const { query, inContent, caseSensitive, useRegex } = req.body;
+    const q = String(query || '').trim();
     if (!q) return res.status(400).json({ error: 'Busca vazia' });
+
+    let testFn;
+    try {
+        if (useRegex) {
+            const flags = caseSensitive ? 'g' : 'gi';
+            const re = new RegExp(q, flags);
+            testFn = (str) => re.test(str);
+        } else if (caseSensitive) {
+            testFn = (str) => str.includes(q);
+        } else {
+            const lower = q.toLowerCase();
+            testFn = (str) => str.toLowerCase().includes(lower);
+        }
+    } catch (e) {
+        return res.status(400).json({ error: 'Regex inválida: ' + e.message });
+    }
 
     const results = [];
     const count = { n: 0 };
@@ -1464,7 +3904,7 @@ app.post('/api/search', (req, res) => {
             }
             const relPath = rel ? `${rel}/${entry.name}` : entry.name;
             count.n++;
-            const nameMatch = entry.name.toLowerCase().includes(q);
+            const nameMatch = testFn(entry.name);
             let matches = [];
 
             if (inContent) {
@@ -1475,7 +3915,7 @@ app.post('/api/search', (req, res) => {
                         if (!content.includes('\u0000')) {
                             const lines = content.split('\n');
                             for (let i = 0; i < lines.length && matches.length < 20; i++) {
-                                if (lines[i].toLowerCase().includes(q)) {
+                                if (testFn(lines[i])) {
                                     matches.push({ line: i + 1, text: lines[i].trim().slice(0, 200) });
                                 }
                             }
@@ -1494,7 +3934,501 @@ app.post('/api/search', (req, res) => {
     res.json({ success: true, results: results.slice(0, 100) });
 });
 
-// ===== IMAGENS =====
+// ===== BUSCA E SUBSTITUIÇÃO EM MÚLTIPLOS ARQUIVOS =====
+app.post('/api/replace', (req, res) => {
+    const { search, replace, caseSensitive, useRegex } = req.body;
+    const q = String(search || '');
+    if (!q) return res.status(400).json({ error: 'Busca vazia' });
+    
+    const results = [];
+    const count = { n: 0 };
+    const affectedFiles = [];
+    
+    let searchPattern;
+    try {
+        if (useRegex) {
+            const flags = caseSensitive ? 'g' : 'gi';
+            searchPattern = new RegExp(q, flags);
+        } else {
+            searchPattern = caseSensitive ? q : q.toLowerCase();
+        }
+} catch (e) {
+        return res.status(400).json({ error: 'Regex inválida: ' + e.message });
+    }
+
+    const walk = (dir, rel) => {
+        if (count.n >= MAX_CONTEXT_FILES) return;
+        let items;
+        try { items = fs.readdirSync(dir, { withFileTypes: true }); } catch (e) { return; }
+        for (const entry of items) {
+            if (count.n >= MAX_CONTEXT_FILES) return;
+            if (entry.isDirectory()) {
+                if (IGNORED_DIRS.has(entry.name)) continue;
+                walk(path.join(dir, entry.name), rel ? `${rel}/${entry.name}` : entry.name);
+                continue;
+            }
+            const relPath = rel ? `${rel}/${entry.name}` : entry.name;
+            count.n++;
+            if (isBinaryExtension(entry.name)) return;
+            
+            const full = path.join(dir, entry.name);
+            try {
+                if (fs.statSync(full).size > 2 * 1024 * 1024) return;
+                const content = fs.readFileSync(full, 'utf-8');
+                if (content.includes('\u0000')) return;
+                
+                const lines = content.split('\n');
+                const matches = [];
+                for (let i = 0; i < lines.length; i++) {
+                    const matches_ = useRegex 
+                        ? (lines[i].match(searchPattern) || [])
+                        : (caseSensitive ? lines[i].split(q).length - 1 : lines[i].toLowerCase().split(q).length - 1);
+                    const hitCount = Array.isArray(matches_) ? matches_.length : matches_;
+                    if (hitCount > 0 && matches.length < 20) {
+                        matches.push({ line: i + 1, text: lines[i].trim().slice(0, 200), count: hitCount });
+                    }
+                }
+                
+                if (matches.length > 0) {
+                    results.push({ 
+                        path: relPath, 
+                        name: entry.name, 
+                        matches,
+                        totalMatches: matches.reduce((s, m) => s + m.count, 0)
+                    });
+                    affectedFiles.push({ path: relPath, fullPath: full });
+                }
+            } catch (e) {}
+        }
+    };
+    
+    walk(PROJECT_ROOT, '');
+    
+    // If replace provided, execute replacement
+    if (replace !== undefined && replace !== null) {
+        let totalReplaced = 0;
+        for (const file of affectedFiles) {
+            try {
+                const content = fs.readFileSync(file.fullPath, 'utf-8');
+                let newContent;
+                if (useRegex) {
+                    newContent = content.replace(searchPattern, replace);
+                } else if (caseSensitive) {
+                    newContent = content.split(q).join(replace);
+                } else {
+                    const escaped = q.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+                    newContent = content.replace(new RegExp(escaped, 'gi'), replace);
+                }
+                if (newContent !== content) {
+                    backupRelativePath(file.path);
+                    fs.writeFileSync(file.fullPath, newContent, 'utf-8');
+                    const replaced = useRegex ? (content.match(searchPattern) || []).length : 
+                        (caseSensitive ? (content.split(q).length - 1) : (content.toLowerCase().split(q.toLowerCase()).length - 1));
+                    totalReplaced += replaced;
+                }
+            } catch (e) {}
+        }
+        res.json({ success: true, results: results.slice(0, 100), replaced: totalReplaced, filesAffected: affectedFiles.length });
+    } else {
+        res.json({ success: true, results: results.slice(0, 100) });
+    }
+});
+
+// ===== PREVIEW DA SUBSTITUIÇÃO (DIFF ANTES DE APLICAR) =====
+app.post('/api/replace/preview', (req, res) => {
+    const { search, replace, caseSensitive, useRegex } = req.body;
+    const q = String(search || '');
+    if (!q) return res.status(400).json({ error: 'Busca vazia' });
+
+    let searchPattern;
+    try {
+        if (useRegex) {
+            const flags = caseSensitive ? 'g' : 'gi';
+            searchPattern = new RegExp(q, flags);
+        } else {
+            searchPattern = caseSensitive ? q : q.toLowerCase();
+        }
+    } catch (e) {
+        return res.status(400).json({ error: 'Regex inválida: ' + e.message });
+    }
+
+    const results = [];
+    const count = { n: 0 };
+
+    const walk = (dir, rel) => {
+        if (count.n >= MAX_CONTEXT_FILES) return;
+        let items;
+        try { items = fs.readdirSync(dir, { withFileTypes: true }); } catch (e) { return; }
+        for (const entry of items) {
+            if (count.n >= MAX_CONTEXT_FILES) return;
+            if (entry.isDirectory()) {
+                if (IGNORED_DIRS.has(entry.name)) continue;
+                walk(path.join(dir, entry.name), rel ? `${rel}/${entry.name}` : entry.name);
+                continue;
+            }
+            const relPath = rel ? `${rel}/${entry.name}` : entry.name;
+            count.n++;
+            if (isBinaryExtension(entry.name)) return;
+
+            const full = path.join(dir, entry.name);
+            try {
+                if (fs.statSync(full).size > 2 * 1024 * 1024) return;
+                const content = fs.readFileSync(full, 'utf-8');
+                if (content.includes('\u0000')) return;
+
+                let newContent;
+                let changeCount = 0;
+                if (useRegex) {
+                    const matches = content.match(searchPattern);
+                    changeCount = matches ? matches.length : 0;
+                    newContent = content.replace(searchPattern, replace || '');
+                } else if (caseSensitive) {
+                    changeCount = content.split(q).length - 1;
+                    newContent = content.split(q).join(replace || '');
+                } else {
+                    const escaped = q.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+                    const re = new RegExp(escaped, 'gi');
+                    const matches = content.match(re);
+                    changeCount = matches ? matches.length : 0;
+                    newContent = content.replace(re, replace || '');
+                }
+
+                if (changeCount > 0) {
+                    var previewLines = [];
+                    var oldLines = content.split('\n');
+                    var newLines = newContent.split('\n');
+                    var maxLine = Math.min(Math.max(oldLines.length, newLines.length), 80);
+                    for (var i = 0; i < maxLine; i++) {
+                        var ol = oldLines[i] || '';
+                        var nl = newLines[i] || '';
+                        if (ol !== nl) {
+                            if (ol) previewLines.push('- ' + ol.slice(0, 120));
+                            if (nl) previewLines.push('+ ' + nl.slice(0, 120));
+                        }
+                    }
+                    var preview = previewLines.slice(0, 60).join('\n');
+
+                    results.push({
+                        file: relPath,
+                        changes: changeCount,
+                        preview: preview
+                    });
+                }
+            } catch (e) {}
+        }
+    };
+
+    walk(PROJECT_ROOT, '');
+    res.json({ success: true, results: results.slice(0, 50) });
+});
+
+// ===== VALIDAÇÃO EM LOTE (pós-execução da IA) =====
+app.post('/api/analyzer/validate-batch', (req, res) => {
+    const { files } = req.body || {};
+    if (!Array.isArray(files) || !files.length) return res.json({ success: true, errors: [] });
+    const allErrors = [];
+    for (const filePath of files) {
+        const fullPath = resolveSafePath(filePath);
+        if (!fullPath || !fs.existsSync(fullPath)) continue;
+        try {
+            const code = fs.readFileSync(fullPath, 'utf-8');
+            const ext = (path.extname(filePath) || '.js').toLowerCase();
+            let errors = [];
+            if (['.ts', '.tsx'].includes(ext)) {
+                errors = analyzer.validateWithTSProgram(filePath, PROJECT_ROOT);
+            } else if (['.py', '.pyw'].includes(ext)) {
+                errors = analyzer.validateWithPythonAST(filePath, PROJECT_ROOT);
+            } else if (['.go'].includes(ext)) {
+                errors = analyzer.validateWithGoVet(filePath, PROJECT_ROOT);
+            } else if (['.c', '.h', '.cpp', '.cxx', '.cc', '.hpp', '.hh'].includes(ext)) {
+                errors = analyzer.validateWithGCC(filePath, PROJECT_ROOT);
+            } else if (ext === '.rs') {
+                errors = analyzer.validateWithRustc(filePath, PROJECT_ROOT);
+            }
+            if (!errors.length) {
+                const result = analyzer.validateCode(code, filePath, PROJECT_ROOT);
+                errors = result.errors;
+            }
+            for (const e of errors) {
+                allErrors.push({ file: filePath, line: e.line, column: e.column, message: e.message, severity: e.severity || 'error', type: e.type || 'syntax' });
+            }
+        } catch (e) {}
+    }
+    res.json({ success: true, errors: allErrors });
+});
+
+async function runPostExecutionDiagnostics(affectedFiles, planResumo) {
+    if (!PROJECT_ROOT || !Array.isArray(affectedFiles) || !affectedFiles.length) return;
+    pushUndoState(affectedFiles);
+    const allErrors = [];
+    const allSmells = [];
+    const allSecurity = [];
+    const allLint = [];
+    for (const filePath of affectedFiles) {
+        const fullPath = resolveSafePath(filePath);
+        if (!fullPath || !fs.existsSync(fullPath)) continue;
+        try {
+            const code = fs.readFileSync(fullPath, 'utf-8');
+            const ext = (path.extname(filePath) || '.js').toLowerCase();
+
+            const result = analyzer.validateCode(code, filePath, PROJECT_ROOT);
+            for (const e of result.errors || []) {
+                allErrors.push({ file: filePath, line: e.line, column: e.column, message: e.message, severity: e.severity || 'error', type: e.type || 'syntax' });
+            }
+
+            const smells = analyzer.detectCodeSmellsEnhanced(filePath, PROJECT_ROOT);
+            for (const s of smells) {
+                allSmells.push({ file: filePath, line: s.line, column: s.column || 1, message: s.message, severity: s.severity || 'warning', type: s.type || 'smell' });
+            }
+
+            const securityErrors = analyzer.scanSecurity(filePath, PROJECT_ROOT);
+            for (const se of securityErrors) {
+                allSecurity.push({ file: filePath, line: se.line, column: se.column, message: se.message, severity: se.severity || 'warning', type: 'security' });
+            }
+
+            const lintErrors = analyzer.runLinter(filePath, PROJECT_ROOT);
+            for (const le of lintErrors) {
+                allLint.push({ file: filePath, line: le.line, column: le.column, message: le.message, severity: le.severity || 'warning', type: le.type || 'linter' });
+            }
+        } catch (e) {}
+    }
+
+    const combined = [...allErrors, ...allSmells, ...allSecurity, ...allLint];
+    if (combined.length) broadcastDiagnostics(combined);
+
+    const hasErrors = allErrors.some(e => e.severity === 'error') || allSecurity.some(e => e.severity === 'error');
+
+    function doRollback(reason) {
+        broadcastAll({ type: 'rollback', message: reason });
+        for (const filePath of affectedFiles) {
+            try {
+                const backupDir = path.join(PROJECT_ROOT, '.aedificator-codex-ide-backup');
+                const relBackupDir = path.join(backupDir, filePath);
+                if (fs.existsSync(relBackupDir)) {
+                    const entries = fs.readdirSync(relBackupDir).sort().reverse();
+                    if (entries.length) {
+                        const latest = entries[0];
+                        const backupFile = path.join(relBackupDir, latest);
+                        const target = path.join(PROJECT_ROOT, filePath);
+                        fs.copyFileSync(backupFile, target);
+                    }
+                }
+            } catch (e) {}
+        }
+        return true;
+    }
+
+    if (hasErrors) {
+        const errCount = allErrors.filter(e => e.severity === 'error').length + allSecurity.filter(e => e.severity === 'error').length;
+        doRollback('Revertendo alteracoes — IA introduziu ' + errCount + ' erro(s)');
+        return { rolledBack: true, errorCount: errCount };
+    }
+
+    try {
+        const detectedFramework = detectTestFramework();
+        const testFiles = [];
+        const walkTests = (dir, rel) => {
+            let items;
+            try { items = fs.readdirSync(dir, { withFileTypes: true }); } catch (e) { return; }
+            for (const entry of items) {
+                if (entry.isDirectory()) { if (!IGNORED_DIRS.has(entry.name)) walkTests(path.join(dir, entry.name), rel ? `${rel}/${entry.name}` : entry.name); continue; }
+                const name = entry.name;
+                if (name.match(/\.(test|spec)\.(js|ts|tsx|mjs|cjs|py|go|rs|java|rb|php|kt|swift|dart|scala|ex|exs)$/) || (rel && rel.includes('__tests__'))) {
+                    testFiles.push(rel ? `${rel}/${name}` : name);
+                }
+            }
+        };
+        walkTests(PROJECT_ROOT, '');
+        if (testFiles.length && detectedFramework) {
+            const { command, args } = detectedFramework;
+            broadcastAll({ type: 'test-status', status: 'running', message: '[' + command + '] ' + testFiles.length + ' teste(s)...' });
+            const result = await new Promise((resolve) => {
+                const child = require('child_process').spawn(command, args, { cwd: PROJECT_ROOT, shell: true, stdio: ['ignore', 'pipe', 'pipe'], windowsHide: true });
+                let output = '';
+                child.stdout.on('data', d => output += d.toString());
+                child.stderr.on('data', d => output += d.toString());
+                child.on('close', code => {
+                    const parsed = parseTestOutput(output);
+                    resolve({ passed: parsed.pass, failed: parsed.fail, total: parsed.total, output: output.slice(0, 3000), results: parsed });
+                });
+                child.on('error', () => resolve({ passed: 0, failed: 0, total: 0, output: 'Erro ao executar testes', results: { total: 0, pass: 0, fail: 0 } }));
+            });
+            const testMsg = '[' + command + '] Passaram: ' + result.passed + (result.failed ? ', Falharam: ' + result.failed : '') + ' (' + result.total + ' total)';
+            broadcastAll({ type: 'test-status', status: result.failed ? 'failed' : 'passed', message: testMsg, results: result.results });
+
+            if (result.failed > 0) {
+                broadcastAll({ type: 'test-failed', message: result.output });
+                doRollback('Revertendo alteracoes — ' + result.failed + ' teste(s) falhou(ram)');
+                return { rolledBack: true, testsFailed: true, testDetails: result };
+            }
+        }
+    } catch (e) {}
+
+    try {
+        if (planResumo && config.autoCommit) {
+            const commitMsg = 'feat(ia): ' + (planResumo.length > 72 ? planResumo.slice(0, 72) + '...' : planResumo);
+            const filesToStage = (affectedFiles && affectedFiles.length)
+                ? affectedFiles.filter(f => typeof f === 'string').map(f => f.replace(/\\/g, '/'))
+                : [];
+            if (filesToStage.length > 0) {
+                await new Promise((resolve) => {
+                    const addArgs = ['add', ...filesToStage];
+                    const child = require('child_process').spawn('git', addArgs, { cwd: PROJECT_ROOT, stdio: 'ignore', windowsHide: true });
+                    child.on('close', () => {
+                        require('child_process').spawn('git', ['commit', '-m', commitMsg], { cwd: PROJECT_ROOT, stdio: 'ignore', windowsHide: true })
+                            .on('close', () => resolve());
+                    });
+                });
+            } else {
+                await new Promise((resolve) => {
+                    require('child_process').spawn('git', ['commit', '-am', commitMsg], { cwd: PROJECT_ROOT, stdio: 'ignore', windowsHide: true })
+                        .on('close', () => resolve());
+                });
+            }
+            broadcastAll({ type: 'auto-commit', message: 'Commit automatico: ' + commitMsg });
+        }
+    } catch (e) {}
+
+    return { rolledBack: false };
+}
+
+function broadcastDiagnostics(errors) {
+    broadcastAll({ type: 'diagnostics', errors });
+}
+
+function broadcastAll(payload) {
+    const data = JSON.stringify(payload);
+    for (const client of wss.clients) {
+        if (client.readyState === WebSocket.OPEN) {
+            try { client.send(data); } catch (e) {}
+        }
+    }
+}
+
+// ===== AUTO-DETECÇÃO DE TEST FRAMEWORK =====
+function detectTestFramework() {
+    if (!PROJECT_ROOT) return null;
+    try {
+        const pkgPath = path.join(PROJECT_ROOT, 'package.json');
+        if (fs.existsSync(pkgPath)) {
+            const pkg = JSON.parse(fs.readFileSync(pkgPath, 'utf-8'));
+            if (pkg.devDependencies || pkg.dependencies) {
+                const deps = { ...(pkg.devDependencies || {}), ...(pkg.dependencies || {}) };
+                if (deps.jest) return { command: 'npx', args: ['jest', '--passWithNoTests'] };
+                if (deps.mocha) return { command: 'npx', args: ['mocha', '**/*.test.js', '**/*.spec.js', '--exit'] };
+                if (deps.vitest) return { command: 'npx', args: ['vitest', 'run', '--passWithNoTests'] };
+            }
+            if (pkg.scripts && pkg.scripts.test) return { command: 'npm', args: ['test'] };
+        }
+        if (fs.existsSync(path.join(PROJECT_ROOT, 'pom.xml')) || fs.existsSync(path.join(PROJECT_ROOT, 'build.gradle'))) {
+            if (fs.existsSync(path.join(PROJECT_ROOT, 'mvnw'))) return { command: 'mvnw', args: ['test'] };
+            if (fs.existsSync(path.join(PROJECT_ROOT, 'gradlew'))) return { command: 'gradlew', args: ['test'] };
+            return { command: 'mvn', args: ['test', '-q'] };
+        }
+        if (fs.existsSync(path.join(PROJECT_ROOT, 'Gemfile'))) return { command: 'bundle', args: ['exec', 'rspec'] };
+        if (fs.existsSync(path.join(PROJECT_ROOT, 'composer.json'))) return { command: 'php', args: ['vendor/bin/phpunit'] };
+        if (fs.existsSync(path.join(PROJECT_ROOT, 'mix.exs'))) return { command: 'mix', args: ['test'] };
+        if (fs.existsSync(path.join(PROJECT_ROOT, 'go.mod'))) return { command: 'go', args: ['test', './...'] };
+        if (fs.existsSync(path.join(PROJECT_ROOT, 'Cargo.toml'))) return { command: 'cargo', args: ['test'] };
+        if (fs.existsSync(path.join(PROJECT_ROOT, 'build.sbt'))) return { command: 'sbt', args: ['test'] };
+        if (fs.existsSync(path.join(PROJECT_ROOT, 'Makefile'))) {
+            const mk = fs.readFileSync(path.join(PROJECT_ROOT, 'Makefile'), 'utf-8');
+            if (/^test\s*:/m.test(mk)) return { command: 'make', args: ['test'] };
+        }
+        if (fs.existsSync(path.join(PROJECT_ROOT, 'pyproject.toml')) || fs.existsSync(path.join(PROJECT_ROOT, 'setup.py'))) {
+            return { command: 'python', args: ['-m', 'pytest', '-x'] };
+        }
+        if (fs.existsSync(path.join(PROJECT_ROOT, 'pubspec.yaml'))) return { command: 'dart', args: ['test'] };
+        if (fs.existsSync(path.join(PROJECT_ROOT, 'stack.yaml')) || fs.existsSync(path.join(PROJECT_ROOT, 'package.yaml'))) {
+            return { command: 'stack', args: ['test'] };
+        }
+        return { command: 'node', args: ['--test'] };
+    } catch (e) { return { command: 'node', args: ['--test'] }; }
+}
+
+// ===== TASK RUNNER MULTI-LINGUAGEM =====
+function detectBuildCommands() {
+    const commands = [];
+    if (!PROJECT_ROOT) return commands;
+    try {
+        const pkgPath = path.join(PROJECT_ROOT, 'package.json');
+        if (fs.existsSync(pkgPath)) {
+            const pkg = JSON.parse(fs.readFileSync(pkgPath, 'utf-8'));
+            if (pkg.scripts) {
+                if (pkg.scripts.build) commands.push({ label: 'npm build', command: 'npm', args: ['run', 'build'] });
+                if (pkg.scripts.dev) commands.push({ label: 'npm dev', command: 'npm', args: ['run', 'dev'] });
+                if (pkg.scripts.lint) commands.push({ label: 'npm lint', command: 'npm', args: ['run', 'lint'] });
+            }
+        }
+        if (fs.existsSync(path.join(PROJECT_ROOT, 'Makefile'))) { commands.push({ label: 'make', command: 'make', args: [] }); }
+        if (fs.existsSync(path.join(PROJECT_ROOT, 'go.mod'))) { commands.push({ label: 'go build', command: 'go', args: ['build', './...'] }); }
+        if (fs.existsSync(path.join(PROJECT_ROOT, 'Cargo.toml'))) { commands.push({ label: 'cargo build', command: 'cargo', args: ['build'] }); }
+        if (fs.existsSync(path.join(PROJECT_ROOT, 'pyproject.toml'))) { commands.push({ label: 'pip install', command: 'pip', args: ['install', '-e', '.'] }); }
+    } catch (e) {}
+    return commands;
+}
+
+// ===== ENDPOINT: PROJECT SUMMARY =====
+app.post('/api/project/summary', (req, res) => {
+    if (!PROJECT_ROOT) return res.json({ success: false, error: 'Nenhum projeto aberto' });
+    try {
+        const extCounts = {};
+        let totalFiles = 0;
+        const walk = (dir) => {
+            let items;
+            try { items = fs.readdirSync(dir, { withFileTypes: true }); } catch (e) { return; }
+            for (const entry of items) {
+                if (entry.isDirectory()) { if (!IGNORED_DIRS.has(entry.name)) walk(path.join(dir, entry.name)); continue; }
+                totalFiles++;
+                const ext = path.extname(entry.name).toLowerCase();
+                extCounts[ext] = (extCounts[ext] || 0) + 1;
+            }
+        };
+        walk(PROJECT_ROOT);
+        const buildCommands = detectBuildCommands();
+        const testFramework = detectTestFramework();
+        const pkgPath = path.join(PROJECT_ROOT, 'package.json');
+        let pkgName = '', pkgVersion = '';
+        if (fs.existsSync(pkgPath)) {
+            try { const p = JSON.parse(fs.readFileSync(pkgPath, 'utf-8')); pkgName = p.name || ''; pkgVersion = p.version || ''; } catch (e) {}
+        }
+        res.json({
+            success: true,
+            projectRoot: PROJECT_ROOT,
+            name: pkgName || path.basename(PROJECT_ROOT),
+            version: pkgVersion,
+            totalFiles,
+            languages: extCounts,
+            buildCommands,
+            testFramework: testFramework ? testFramework.command : null,
+            timestamp: new Date().toISOString()
+        });
+    } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
+// ===== ENDPOINT: BUILD TASK =====
+app.post('/api/project/build', async (req, res) => {
+    const { command, args } = req.body || {};
+    if (!command) return res.status(400).json({ error: 'Comando não especificado' });
+    try {
+        const result = await runner.runCommand({ command, args: args || [], cwd: PROJECT_ROOT, timeoutMs: 120000 });
+        res.json({ success: true, output: result.stdout || result.stderr, code: result.code });
+    } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
+// ===== FILE WATCHER (mudanças externas) =====
+let fileWatcher = null;
+function startFileWatcher() {
+    if (!PROJECT_ROOT || fileWatcher) return;
+    try {
+        fileWatcher = fs.watch(PROJECT_ROOT, { recursive: true }, (eventType, filename) => {
+            if (!filename || IGNORED_DIRS.has(filename.split(path.sep)[0])) return;
+            if (filename.includes('.aedificator-codex-ide-backup')) return;
+            broadcastAll({ type: 'file-changed', file: filename, event: eventType });
+        });
+    } catch (e) {}
+}
+
 app.post('/api/file/image', (req, res) => {
     const { path: filePath } = req.body;
     const full = resolveSafePath(filePath);
@@ -1522,6 +4456,93 @@ app.post('/api/file/image', (req, res) => {
     }
 });
 
+// ===== FORMATAÇÃO DE CÓDIGO (Prettier) =====
+function formatCode(language, code) {
+    const prettierPath = path.join(PROJECT_ROOT, 'node_modules', '.bin', 'prettier');
+    const isWin = process.platform === 'win32';
+    const bin = isWin ? prettierPath + '.cmd' : prettierPath;
+    
+    return new Promise((resolve, reject) => {
+        if (!fs.existsSync(bin)) {
+            try {
+                const formatted = basicFormat(language, code);
+                resolve(formatted);
+            } catch (e) {
+                reject(new Error('Prettier não encontrado: ' + e.message));
+            }
+            return;
+        }
+        
+        let parser = 'babel';
+        if (language === 'typescript' || language === 'typescriptreact') parser = 'typescript';
+        else if (language === 'json') parser = 'json';
+        else if (language === 'css' || language === 'scss' || language === 'less') parser = 'css';
+        else if (language === 'html') parser = 'html';
+        else if (language === 'markdown') parser = 'markdown';
+        else if (language === 'yaml') parser = 'yaml';
+        
+        const child = spawn(bin, ['--parser', parser, '--stdin-filepath', 'file.' + (language === 'typescript' ? 'ts' : language === 'json' ? 'json' : 'js')], {
+            stdio: ['pipe', 'pipe', 'pipe'],
+            cwd: PROJECT_ROOT
+        });
+        
+        let out = '';
+        let err = '';
+        const timer = setTimeout(() => { try { child.kill(); } catch(e) {} }, 15000);
+        
+        child.stdout.on('data', (d) => { out += d.toString(); });
+        child.stderr.on('data', (d) => { err += d.toString(); });
+        child.on('error', (e) => { clearTimeout(timer); try { resolve(basicFormat(language, code)); } catch(x) { resolve(code); } });
+        child.on('close', (code) => {
+            clearTimeout(timer);
+            if (code === 0 && out.trim()) {
+                resolve(out);
+            } else {
+                try { resolve(basicFormat(language, code)); } catch(e) { resolve(code); }
+            }
+        });
+        child.stdin.write(code);
+        child.stdin.end();
+    });
+}
+
+function basicFormat(language, code) {
+    const lines = code.split('\n');
+    let formatted = '';
+    let indentLevel = 0;
+    const indent = '    ';
+    
+    for (let i = 0; i < lines.length; i++) {
+        const line = lines[i];
+        const trimmed = line.trim();
+        if (!trimmed) { formatted += '\n'; continue; }
+        
+        if (trimmed.startsWith('}') || trimmed.startsWith(')') || trimmed.startsWith(']')) {
+            indentLevel = Math.max(0, indentLevel - 1);
+        }
+        
+        formatted += indent.repeat(indentLevel) + trimmed + '\n';
+        
+        if (trimmed.endsWith('{') || trimmed.endsWith('(') || trimmed.endsWith('[')) {
+            indentLevel++;
+        }
+    }
+    return formatted.trimEnd() + '\n';
+}
+
+app.post('/api/file/format', async (req, res) => {
+    const { path: filePath, content, language } = req.body;
+    if (!filePath || typeof content !== 'string') {
+        return res.status(400).json({ error: 'Parâmetros inválidos' });
+    }
+    try {
+        const formatted = await formatCode(language || 'javascript', content);
+        res.json({ success: true, content: formatted });
+    } catch (e) {
+        res.status(500).json({ error: e.message });
+    }
+});
+
 // ===== GIT =====
 function runGit(args, cwd) {
     return new Promise((resolve) => {
@@ -1539,7 +4560,7 @@ function runGit(args, cwd) {
         });
         child.on('close', (code) => {
             clearTimeout(timer);
-            resolve({ code, output: out || err });
+            resolve({ code, output: out || err, errOutput: err });
         });
     });
 }
@@ -1564,6 +4585,321 @@ app.post('/api/git/commit', async (req, res) => {
         const add = await runGit(['add', '-A'], PROJECT_ROOT);
         const commit = await runGit(['commit', '-m', message.trim()], PROJECT_ROOT);
         res.json({ success: true, addOutput: add.output, commitOutput: commit.output, code: commit.code });
+    } catch (e) {
+        res.status(500).json({ error: e.message });
+    }
+});
+
+app.post('/api/git/diff', async (req, res) => {
+    const { file } = req.body || {};
+    try {
+        const args = ['diff', '--no-color', '--'];
+        if (file) args.push(file);
+        const diff = await runGit(args, PROJECT_ROOT);
+        const staged = await runGit(['diff', '--cached', '--no-color', '--'], PROJECT_ROOT);
+        const stat = await runGit(['diff', '--stat', '--no-color', '--'], PROJECT_ROOT);
+        res.json({ success: true, output: diff.output, staged: staged.output, stat: stat.output });
+    } catch (e) {
+        res.status(500).json({ error: e.message });
+    }
+});
+
+app.post('/api/git/stage', async (req, res) => {
+    const { file, all } = req.body || {};
+    try {
+        const args = all ? ['add', '-A'] : ['add', '--', file];
+        const r = await runGit(args, PROJECT_ROOT);
+        res.json({ success: r.code === 0, output: r.output || r.errOutput, code: r.code });
+    } catch (e) {
+        res.status(500).json({ error: e.message });
+    }
+});
+
+app.post('/api/git/unstage', async (req, res) => {
+    const { file } = req.body || {};
+    try {
+        const r = await runGit(['reset', 'HEAD', '--', file], PROJECT_ROOT);
+        res.json({ success: r.code === 0, output: r.output || r.errOutput, code: r.code });
+    } catch (e) {
+        res.status(500).json({ error: e.message });
+    }
+});
+
+app.post('/api/git/push', async (req, res) => {
+    const { branch } = req.body || {};
+    try {
+        const current = (await runGit(['rev-parse', '--abbrev-ref', 'HEAD'], PROJECT_ROOT)).output.trim();
+        const args = ['push', 'origin', branch || current];
+        const r = await runGit(args, PROJECT_ROOT);
+        res.json({ success: r.code === 0, output: r.output || r.errOutput, code: r.code });
+    } catch (e) {
+        res.status(500).json({ error: e.message });
+    }
+});
+
+app.post('/api/git/pull', async (req, res) => {
+    try {
+        const r = await runGit(['pull'], PROJECT_ROOT);
+        res.json({ success: r.code === 0, output: r.output || r.errOutput, code: r.code });
+    } catch (e) {
+        res.status(500).json({ error: e.message });
+    }
+});
+
+app.post('/api/git/branches', async (req, res) => {
+    try {
+        const r = await runGit(['branch', '-a'], PROJECT_ROOT);
+        const current = (await runGit(['rev-parse', '--abbrev-ref', 'HEAD'], PROJECT_ROOT)).output.trim();
+        res.json({ success: true, output: r.output, current, code: r.code });
+    } catch (e) {
+        res.status(500).json({ error: e.message });
+    }
+});
+
+app.post('/api/git/checkout', async (req, res) => {
+    const { branch } = req.body || {};
+    if (!branch) return res.status(400).json({ error: 'Branch não especificada' });
+    try {
+        const r = await runGit(['checkout', branch], PROJECT_ROOT);
+        res.json({ success: r.code === 0, output: r.output || r.errOutput, code: r.code });
+    } catch (e) {
+        res.status(500).json({ error: e.message });
+    }
+});
+
+app.post('/api/git/log', async (req, res) => {
+    try {
+        const r = await runGit(['log', '--oneline', '-20'], PROJECT_ROOT);
+        res.json({ success: true, output: r.output, code: r.code });
+    } catch (e) {
+        res.status(500).json({ error: e.message });
+    }
+});
+
+// ===== GIT MERGE =====
+app.post('/api/git/merge', async (req, res) => {
+    const { branch } = req.body || {};
+    if (!branch) return res.status(400).json({ error: 'Branch não especificada' });
+    try {
+        const r = await runGit(['merge', branch], PROJECT_ROOT);
+        res.json({ success: r.code === 0, output: r.output, error: r.stderr, code: r.code });
+    } catch (e) {
+        res.status(500).json({ error: e.message });
+    }
+});
+
+// ===== GIT STASH =====
+app.post('/api/git/stash', async (req, res) => {
+    const { action, message } = req.body || {};
+    try {
+        const args = ['stash'];
+        if (action === 'list') args.push('list');
+        else if (action === 'pop') args.push('pop');
+        else if (action === 'drop') {
+            if (message) { args.push('drop', message); } else args.push('drop');
+        } else if (action === 'apply') {
+            if (message) { args.push('apply', message); } else args.push('apply');
+        } else {
+            if (message) { args.push('push', '-m', message); } else args.push('push');
+        }
+        const r = await runGit(args, PROJECT_ROOT);
+        res.json({ success: r.code === 0, output: r.output, error: r.stderr, code: r.code });
+    } catch (e) {
+        res.status(500).json({ error: e.message });
+    }
+});
+
+// =============================================
+//  TEST RUNNER
+// =============================================
+app.post('/api/test/discover', (req, res) => {
+    const testPatterns = [/\.test\.(js|ts|jsx|tsx|mjs|cjs)$/i, /\.spec\.(js|ts|jsx|tsx|mjs|cjs)$/i, /__tests__\/.*\.(js|ts|jsx|tsx)$/i];
+    const results = [];
+    const walk = (dir, rel) => {
+        let items;
+        try { items = fs.readdirSync(dir, { withFileTypes: true }); } catch (e) { return; }
+        for (const entry of items) {
+            if (entry.isDirectory()) {
+                if (IGNORED_DIRS.has(entry.name)) continue;
+                walk(path.join(dir, entry.name), rel ? `${rel}/${entry.name}` : entry.name);
+            } else if (testPatterns.some(p => p.test(entry.name))) {
+                results.push(rel ? `${rel}/${entry.name}` : entry.name);
+            }
+        }
+    };
+    walk(PROJECT_ROOT, '');
+    res.json({ success: true, tests: results });
+});
+
+app.post('/api/test/run', async (req, res) => {
+    const { command } = req.body || {};
+    const cmdStr = command || 'node --test';
+    const [cmd, ...args] = cmdStr.split(/\s+/);
+    try {
+        const proc = spawn(cmd, args, { cwd: PROJECT_ROOT, shell: true });
+        let output = '';
+        proc.stdout.on('data', (d) => { output += d.toString('utf8'); });
+        proc.stderr.on('data', (d) => { output += d.toString('utf8'); });
+        proc.on('close', (code) => {
+            res.json({
+                success: true,
+                exitCode: code,
+                output,
+                results: parseTestOutput(output)
+            });
+        });
+        proc.on('error', (err) => {
+            res.json({ success: false, error: err.message });
+        });
+    } catch (e) {
+        res.status(500).json({ error: e.message });
+    }
+});
+
+function parseTestOutput(output) {
+    const results = { total: 0, pass: 0, fail: 0, details: [], suites: [] };
+    const lines = output.split('\n');
+    const suiteStack = [{ name: 'root', tests: [] }];
+
+    for (const line of lines) {
+        const trimmed = line.trim();
+
+        const suiteStart = trimmed.match(/^▶\s+(.+)$/);
+        if (suiteStart) {
+            const newSuite = { name: suiteStart[1].trim(), tests: [] };
+            suiteStack[suiteStack.length - 1].tests.push(newSuite);
+            suiteStack.push(newSuite);
+            continue;
+        }
+
+        const suiteEnd = trimmed.match(/^✔\s+.+\s+\(([\d.]+)ms\)$/);
+        if (suiteEnd && suiteStack.length > 1) {
+            suiteStack.pop();
+            continue;
+        }
+
+        const passMatch = trimmed.match(/^([✔✓])\s+(.+?)(?:\s+\(([\d.]+)ms\))?$/);
+        if (passMatch) {
+            results.pass++;
+            results.total++;
+            const name = passMatch[2] || '';
+            const duration = passMatch[3] || '';
+            const entry = { name, status: 'pass', duration };
+            results.details.push(entry);
+            if (suiteStack.length > 1) {
+                suiteStack[suiteStack.length - 1].tests.push(entry);
+            }
+            continue;
+        }
+
+        const failMatch = trimmed.match(/^([✖✘✗])\s+(.+?)(?:\s+\(([\d.]+)ms\))?$/);
+        if (failMatch) {
+            results.fail++;
+            results.total++;
+            const name = failMatch[2] || '';
+            const duration = failMatch[3] || '';
+            const entry = { name, status: 'fail', duration, error: '' };
+            results.details.push(entry);
+            if (suiteStack.length > 1) {
+                suiteStack[suiteStack.length - 1].tests.push(entry);
+            }
+            continue;
+        }
+
+        const failHeaderMatch = trimmed.match(/^[✖✘✗]\s+failing tests/);
+        if (failHeaderMatch) continue;
+
+        const failNameMatch = trimmed.match(/^test\s+at\s+(.+?):(\d+):\d+$/);
+        if (failNameMatch) {
+            const last = results.details[results.details.length - 1];
+            if (last && last.status === 'fail') {
+                last.file = failNameMatch[1];
+                last.line = parseInt(failNameMatch[2]);
+            }
+            continue;
+        }
+
+        const errorMatch = trimmed.match(/^\s*\[(Error|TypeError|ReferenceError|SyntaxError|AssertionError)[:\]]/);
+        if (errorMatch) {
+            const last = results.details[results.details.length - 1];
+            if (last && last.status === 'fail' && !last.error) {
+                last.error = trimmed;
+                last.errorType = errorMatch[1];
+            }
+            continue;
+        }
+
+        if (trimmed.startsWith('{') || trimmed.startsWith('error:')) {
+            const last = results.details[results.details.length - 1];
+            if (last && last.status === 'fail') {
+                last.error = (last.error || '') + '\n' + trimmed;
+            }
+        }
+    }
+
+    results.suites = suiteStack[0].tests;
+    return results;
+}
+
+app.post('/api/git/blame', async (req, res) => {
+    const { file } = req.body || {};
+    if (!file) return res.status(400).json({ error: 'Arquivo não especificado' });
+    try {
+        const fullPath = resolveSafePath(file);
+        if (!fullPath) return res.status(400).json({ error: 'Caminho inválido' });
+        const relPath = path.relative(PROJECT_ROOT, fullPath);
+        const r = await runGit(['blame', '--date=short', '--', relPath], PROJECT_ROOT);
+        if (r.code !== 0) return res.json({ success: true, lines: [] });
+        const raw = r.output;
+        const lineRegex = /^([0-9a-f]{8,})\s+\(([^)]+)\)\s+(.*)$/;
+        const lines = raw.split('\n').filter(l => l.trim()).map(l => {
+            const m = l.match(lineRegex);
+            if (!m) return { line: -1, hash: '', author: '', date: '', content: l.trim() };
+            const info = m[2].split(/\s+/);
+            const date = info.length >= 3 ? info[info.length - 3] : '';
+            const author = info.length >= 3 ? info.slice(0, info.length - 3).join(' ') : m[2];
+            return {
+                line: -1, hash: m[1], author, date,
+                content: (m[3] || '').trim()
+            };
+        });
+        lines.forEach((l, i) => { l.line = i + 1; });
+        res.json({ success: true, lines });
+    } catch (e) {
+        res.status(500).json({ error: e.message });
+    }
+});
+
+app.post('/api/file/original', (req, res) => {
+    const { file } = req.body || {};
+    if (!file) return res.status(400).json({ error: 'Arquivo não especificado' });
+    try {
+        const fullPath = resolveSafePath(file);
+        if (!fullPath) return res.status(400).json({ error: 'Caminho inválido' });
+        if (!fs.existsSync(fullPath)) return res.status(404).json({ error: 'Arquivo não encontrado' });
+        const relPath = path.relative(PROJECT_ROOT, fullPath);
+        runGit(['show', 'HEAD:' + relPath], PROJECT_ROOT).then(r => {
+            res.json({
+                success: true,
+                original: r.code === 0 ? r.output : '',
+                current: fs.readFileSync(fullPath, 'utf-8')
+            });
+        }).catch(() => {
+            res.json({ success: true, original: '', current: fs.readFileSync(fullPath, 'utf-8') });
+        });
+    } catch (e) {
+        res.status(500).json({ error: e.message });
+    }
+});
+
+app.post('/api/file/diff-preview', (req, res) => {
+    const { file, conteudo } = req.body || {};
+    if (!file) return res.status(400).json({ error: 'Arquivo não especificado' });
+    try {
+        const fullPath = resolveSafePath(file);
+        if (!fullPath) return res.status(400).json({ error: 'Caminho inválido' });
+        const original = fs.existsSync(fullPath) ? fs.readFileSync(fullPath, 'utf-8') : '';
+        res.json({ success: true, original, modified: typeof conteudo === 'string' ? conteudo : '' });
     } catch (e) {
         res.status(500).json({ error: e.message });
     }
@@ -1850,6 +5186,20 @@ wss.on('connection', (ws, req) => {
             return;
         }
 
+        if (data.type === 'remote-exec') {
+            const { command } = data;
+            if (!command) { ws.send(JSON.stringify({ type: 'error', content: 'Comando vazio' })); return; }
+            if (!remote.isConnected()) { ws.send(JSON.stringify({ type: 'error', content: 'Nenhuma conexao remota ativa. Use /api/remote/connect primeiro.' })); return; }
+            try {
+                remote.execRemoteStream(command, (text) => {
+                    if (ws.readyState === WebSocket.OPEN) ws.send(JSON.stringify({ type: 'remote-output', text }));
+                });
+            } catch (e) {
+                ws.send(JSON.stringify({ type: 'error', content: 'Erro remoto: ' + e.message }));
+            }
+            return;
+        }
+
         if (data.type === 'stream') {
             if (BACKEND_TOKEN && data.token !== BACKEND_TOKEN) {
                 ws.send(JSON.stringify({ type: 'error', content: '❌ Não autorizado' }));
@@ -1877,49 +5227,287 @@ wss.on('connection', (ws, req) => {
                     ws.send(JSON.stringify({ type: 'plan', total: Number(text) || 0 }));
                     return;
                 }
+                if (agent === 'activity') {
+                    try {
+                        ws.send(JSON.stringify({ type: 'activity-event', ...JSON.parse(text) }));
+                    } catch (e) {}
+                    return;
+                }
                 ws.send(JSON.stringify({ type: 'chunk', agent: agent || 'Sistema', content: text }));
             };
 
             try {
-                const model = data.model || 'gemini';
-                if (model === 'opencode' || (model && model.startsWith('opencode/'))) {
-                    const openCodeModel = model === 'opencode' ? null : model.slice('opencode/'.length);
+                const model = data.model || 'gemini-3.5';
+                const provider = data.provider || 'gemini';
+                const mode = data.mode || 'cowork';
+
+                if (mode === 'agent' && provider !== 'opencode') {
+                    if (onChunk) onChunk('Sistema', '🤖 Modo Agente — planejando...\n');
+                    const plan = await analyzeTask(task, onChunk, streamController.signal, mode, Array.isArray(history) ? history : [], provider);
+                    const hasSug = Array.isArray(plan.sugestoes) && plan.sugestoes.length > 0;
+                    const hasArq = Array.isArray(plan.arquivos) && plan.arquivos.length > 0;
+
+                    if (hasSug || hasArq) {
+                        const planId = crypto.randomBytes(8).toString('hex');
+                        pendingPlan = { id: planId, plan, controller: streamController, task, provider, mode };
+                        const payload = { type: 'approval', planId, resumo: plan.resumo || 'Plano do agente', total: hasSug ? plan.sugestoes.length : plan.arquivos.length };
+                        if (hasSug) {
+                            payload.sugestoes = plan.sugestoes.map((s, i) => ({ id: s.id || 's'+(i+1), titulo: s.titulo || '', descricao: s.descricao || '', impacto: s.impacto || 'médio', arquivos: (s.arquivos || []).map(a => ({ caminho: a.caminho, acao: a.acao || 'modificar', explicacao: a.explicacao || '', conteudo: a.conteudo || '' })) }));
+                        } else {
+                            payload.arquivos = plan.arquivos.map(a => ({ caminho: a.caminho, acao: a.acao || 'modificar', explicacao: a.explicacao || '', conteudo: a.conteudo || '' }));
+                        }
+                        ws.send(JSON.stringify(payload));
+                    } else {
+                        if (onChunk) onChunk('Sistema', '🔨 Executando agente...\n');
+                        await runAgentAndCapture(ws, task, onChunk, streamController, Array.isArray(history) ? history : [], provider);
+                    }
+                    return;
+                }
+
+                if (provider === 'opencode' || (model && model.startsWith('opencode/'))) {
+                    const openCodeModel = (model && model.startsWith('opencode/')) ? model.slice('opencode/'.length) : null;
                     if (onChunk) onChunk('Assistente', '🟣 opencode executando...\n');
                     const openPrompt = buildOpenCodePrompt(task, mode, Array.isArray(history) ? history : []);
                     const beforeContents = snapshotProjectContents();
                     const before = snapshotProjectFiles();
+                    let ocFullResponse = '';
                     await callOpenCode(openPrompt, (chunk) => {
+                        ocFullResponse += chunk;
                         if (onChunk) onChunk('Assistente', chunk);
-                    }, streamController.signal, openCodeModel);
+                    }, streamController.signal, openCodeModel, (toolEvent) => {
+                        if (onChunk) onChunk('activity', JSON.stringify(toolEvent));
+                    });
                     const changes = diffSnapshots(before, snapshotProjectFiles());
-                    for (const change of changes) {
-                        if (change.action === 'modificar' || change.action === 'deletar') {
-                            const orig = beforeContents.get(change.file);
-                            if (orig !== undefined) {
-                                backupFromContent(change.file, orig);
+
+                    if (changes.length > 0) {
+                        if (data.reviewMode) {
+                            const ocNewContents = new Map();
+                            for (const change of changes) {
+                                if (change.action === 'modificar' || change.action === 'criar') {
+                                    const absPath = path.join(PROJECT_ROOT, ...change.file.split('/'));
+                                    try { ocNewContents.set(change.file, fs.readFileSync(absPath, 'utf-8')); } catch (e) {}
+                                }
+                            }
+                            for (const change of changes) {
+                                const absPath = path.join(PROJECT_ROOT, ...change.file.split('/'));
+                                if (change.action === 'modificar' || change.action === 'deletar') {
+                                    const orig = beforeContents.get(change.file);
+                                    if (orig !== undefined) {
+                                        backupFromContent(change.file, orig);
+                                        try { fs.writeFileSync(absPath, orig, 'utf-8'); } catch (e) {}
+                                    }
+                                } else if (change.action === 'criar') {
+                                    try { fs.unlinkSync(absPath); } catch (e) {}
+                                }
+                            }
+                            ws.send(JSON.stringify({ type: 'refresh' }));
+                            const ocPlanId = crypto.randomBytes(8).toString('hex');
+                            const ocArquivos = changes.map(c => ({
+                                caminho: c.file, acao: c.action, explicacao: '',
+                                conteudo: ocNewContents.get(c.file) || c.content || ''
+                            }));
+                            pendingPlan = { id: ocPlanId, plan: { resumo: `opencode: ${changes.length} arquivo(s)`, arquivos: ocArquivos }, controller: streamController, task, provider: 'opencode' };
+                            ws.send(JSON.stringify({ type: 'approval', planId: ocPlanId, resumo: `opencode: ${changes.length} arquivo(s)`, total: changes.length, arquivos: ocArquivos }));
+                        } else {
+                            onChunk('plan', String(changes.length));
+                            for (const change of changes) {
+                                if (change.action === 'modificar' || change.action === 'deletar') {
+                                    const orig = beforeContents.get(change.file);
+                                    if (orig !== undefined) backupFromContent(change.file, orig);
+                                }
+                                if (onChunk) onChunk('file-status', JSON.stringify([{ file: change.file, action: change.action, status: change.action === 'criar' ? 'created' : change.action === 'deletar' ? 'deleted' : 'modified' }]));
+                                if (onChunk) onChunk('Sistema', `✅ ${change.file} (${change.action})\n`);
+                            }
+                            ws.send(JSON.stringify({ type: 'refresh' }));
+                            const modifiedFiles = changes.filter(c => c.action !== 'deletar').map(c => c.file);
+                            if (modifiedFiles.length) {
+                                try {
+                                    const result = await runPostExecutionDiagnostics(modifiedFiles, ocFullResponse.slice(0, 80));
+                                    if (result && result.rolledBack) ws.send(JSON.stringify({ type: 'rollback', message: 'Alteracoes revertidas devido a erros' }));
+                                } catch (e) {}
+                            }
+                            const ocSummary = ocFullResponse.replace(/\n+/g, ' ').slice(0, 150).trim() || `opencode: ${changes.length} arquivo(s) alterado(s)`;
+                            ws.send(JSON.stringify({ type: 'done', summary: ocSummary, modifiedFiles: changes.map(c => c.file), command: task }));
+                        }
+                    } else if (/(opção|opções|escolha|qual|Opção \d|recomendada|implementar\?|pergunta|dúvida|qual usar|prefere)/i.test(ocFullResponse)) {
+                        const parsed = extractJson(ocFullResponse);
+                        if (parsed && (parsed.sugestoes || parsed.arquivos)) {
+                            const plan = parsed;
+                            const hasSug = Array.isArray(plan.sugestoes) && plan.sugestoes.length > 0;
+                            const hasArq = Array.isArray(plan.arquivos) && plan.arquivos.length > 0;
+                            const planId = crypto.randomBytes(8).toString('hex');
+                            pendingPlan = { id: planId, plan, controller: streamController, task, provider: 'opencode' };
+                            const payload = { type: 'approval', planId, resumo: plan.resumo || '', total: hasSug ? plan.sugestoes.length : (plan.arquivos || []).length };
+                            if (hasSug) {
+                                payload.sugestoes = plan.sugestoes.map((s, i) => ({ id: s.id || 's'+(i+1), titulo: s.titulo || 'Sugestão '+(i+1), descricao: s.descricao || '', impacto: s.impacto || 'médio', arquivos: (s.arquivos || []).map(a => ({ caminho: a.caminho, acao: a.acao || 'modificar', explicacao: a.explicacao || '', conteudo: a.conteudo || '' })) }));
+                            } else {
+                                payload.arquivos = (plan.arquivos || []).map(a => ({ caminho: a.caminho, acao: a.acao || 'modificar', explicacao: a.explicacao || '', conteudo: a.conteudo || '' }));
+                            }
+                            ws.send(JSON.stringify(payload));
+                        } else {
+                            const textOptions = parseTextOptions(ocFullResponse);
+                            if (textOptions && textOptions.length >= 2) {
+                                const planId = crypto.randomBytes(8).toString('hex');
+                                const plan = { resumo: textOptions[0].descricao || 'Escolha uma opção', sugestoes: textOptions };
+                                pendingPlan = { id: planId, plan, controller: streamController, task, provider: 'opencode' };
+                                ws.send(JSON.stringify({
+                                    type: 'approval', planId,
+                                    resumo: plan.resumo,
+                                    total: textOptions.length,
+                                    sugestoes: textOptions.map(s => ({ id: s.id, titulo: s.titulo, descricao: s.descricao, impacto: s.impacto || 'médio', arquivos: [] }))
+                                }));
+                            } else {
+                                const ocSummary = (ocFullResponse || '').replace(/\n+/g, ' ').slice(0, 120).trim() || 'opencode respondeu';
+                                ws.send(JSON.stringify({ type: 'done', summary: ocSummary, command: task }));
                             }
                         }
-                        if (onChunk) onChunk('file-status', JSON.stringify([change]));
+                    } else {
+                        const ocSummary = (ocFullResponse || '').replace(/\n+/g, ' ').slice(0, 120).trim() || 'opencode executado';
+                        ws.send(JSON.stringify({ type: 'done', summary: ocSummary, command: task }));
                     }
-                    ws.send(JSON.stringify({ type: 'refresh' }));
-                    ws.send(JSON.stringify({ type: 'done' }));
                     return;
                 }
 
-                const plan = await analyzeTask(task, onChunk, streamController.signal, mode, Array.isArray(history) ? history : [], model);
-                const planId = crypto.randomBytes(8).toString('hex');
-                pendingPlan = { id: planId, plan, controller: streamController };
+                if ((provider === 'openai' || provider === 'claude') && mode !== 'agent') {
+                    if (onChunk) onChunk('Sistema', `🤖 ${provider.toUpperCase()} analisando com ferramentas nativas...\n`);
+                    const ntvBeforeContents = snapshotProjectContents();
+                    const ntvBefore = snapshotProjectFiles();
+                    const ntvResult = provider === 'openai'
+                        ? await runAgentLoopOpenAI(task, onChunk, streamController.signal, provider)
+                        : await runAgentLoopClaude(task, onChunk, streamController.signal);
+                    const ntvChanges = diffSnapshots(ntvBefore, snapshotProjectFiles());
 
-                const hasSuggestions = Array.isArray(plan.sugestoes) && plan.sugestoes.length > 0;
+                    if (ntvChanges.length > 0) {
+                        if (data.reviewMode) {
+                            const ntvNewContents = new Map();
+                            for (const c of ntvChanges) {
+                                if (c.action === 'modificar' || c.action === 'criar') {
+                                    const absPath = path.join(PROJECT_ROOT, ...c.file.split('/'));
+                                    try { ntvNewContents.set(c.file, fs.readFileSync(absPath, 'utf-8')); } catch (e) {}
+                                }
+                            }
+                            for (const c of ntvChanges) {
+                                const absPath = path.join(PROJECT_ROOT, ...c.file.split('/'));
+                                if (c.action === 'modificar' || c.action === 'deletar') {
+                                    const orig = ntvBeforeContents.get(c.file);
+                                    if (orig !== undefined) {
+                                        backupFromContent(c.file, orig);
+                                        try { fs.writeFileSync(absPath, orig, 'utf-8'); } catch (e) {}
+                                    }
+                                } else if (c.action === 'criar') {
+                                    try { fs.unlinkSync(absPath); } catch (e) {}
+                                }
+                            }
+                            ws.send(JSON.stringify({ type: 'refresh' }));
+                            const ntvPlanId = crypto.randomBytes(8).toString('hex');
+                            const ntvArquivos = ntvChanges.map(c => ({
+                                caminho: c.file, acao: c.action, explicacao: '',
+                                conteudo: ntvNewContents.get(c.file) || c.content || ''
+                            }));
+                            pendingPlan = { id: ntvPlanId, plan: { resumo: `${provider}: ${ntvChanges.length} arquivo(s)`, arquivos: ntvArquivos }, controller: streamController, task, provider };
+                            ws.send(JSON.stringify({ type: 'approval', planId: ntvPlanId, resumo: `${provider}: ${ntvChanges.length} arquivo(s)`, total: ntvChanges.length, arquivos: ntvArquivos }));
+                        } else {
+                            onChunk('plan', String(ntvChanges.length));
+                            for (const c of ntvChanges) {
+                                if (c.action === 'modificar' || c.action === 'deletar') {
+                                    const orig = ntvBeforeContents.get(c.file);
+                                    if (orig !== undefined) backupFromContent(c.file, orig);
+                                }
+                                if (onChunk) onChunk('file-status', JSON.stringify([{ file: c.file, action: c.action, status: c.action === 'criar' ? 'created' : c.action === 'deletar' ? 'deleted' : 'modified' }]));
+                                if (onChunk) onChunk('Sistema', `✅ ${c.file} (${c.action})\n`);
+                            }
+                            ws.send(JSON.stringify({ type: 'refresh' }));
+                            const ntvModified = ntvChanges.filter(c => c.action !== 'deletar').map(c => c.file);
+                            if (ntvModified.length) {
+                                try {
+                                    const diagResult = await runPostExecutionDiagnostics(ntvModified, ntvResult);
+                                    if (diagResult && diagResult.rolledBack) ws.send(JSON.stringify({ type: 'rollback', message: 'Alteracoes revertidas devido a erros' }));
+                                } catch (e) {}
+                            }
+                            const ntvSummary = (ntvResult || '').replace(/\n+/g, ' ').slice(0, 150).trim() || `${provider}: ${ntvChanges.length} arquivo(s)`;
+                            ws.send(JSON.stringify({ type: 'done', summary: ntvSummary, modifiedFiles: ntvChanges.map(c => c.file), command: task }));
+                        }
+                    } else {
+                        ws.send(JSON.stringify({ type: 'done', summary: ntvResult || `${provider} concluído`, command: task }));
+                    }
+                    return;
+                }
+
+                const plan = await analyzeTask(task, onChunk, streamController.signal, mode, Array.isArray(history) ? history : [], provider);
+                console.log('[ws:plan] analyzeTask retornou', JSON.stringify({ resumo: (plan.resumo||'').slice(0,60), hasSugestoes: Array.isArray(plan.sugestoes) && plan.sugestoes.length > 0, hasArquivos: Array.isArray(plan.arquivos) && plan.arquivos.length > 0, hasRaw: !!(plan._rawResponse), rawLen: (plan._rawResponse||'').length, sugCount: (plan.sugestoes||[]).length, arqCount: (plan.arquivos||[]).length }));
+
+                let hasSugestoes = Array.isArray(plan.sugestoes) && plan.sugestoes.length > 0;
+                let hasArquivos = Array.isArray(plan.arquivos) && plan.arquivos.length > 0;
+
+                if (!hasSugestoes && !hasArquivos) {
+                    console.log('[ws:plan] Entrando no retry...');
+                    const rawText = (plan._rawResponse || '').trim();
+                    const retryPrompt = rawText
+                        ? `⚠️ Você respondeu com texto em vez de JSON. Sua resposta foi:\n\n"""\n${rawText.slice(0, 2000)}\n"""\n\nAgora, com base EXATAMENTE nessa sua análise, retorne APENAS este JSON, sem nenhum texto antes ou depois:\n{\n  "resumo": "resumo curto baseado na sua análise",\n  "sugestoes": [\n    {"id":"s1","titulo":"Opção A (completa): ...","descricao":"O que inclui. 2 frases.","impacto":"alto","arquivos":[]},\n    {"id":"s2","titulo":"Opção B (média): ...","descricao":"O que inclui. 2 frases.","impacto":"médio","arquivos":[]},\n    {"id":"s3","titulo":"Opção C (simples): ...","descricao":"O que inclui. 2 frases.","impacto":"baixo","arquivos":[]},\n    {"id":"custom","titulo":"Personalizado","descricao":"Descreva exatamente o que você deseja","impacto":"médio","arquivos":[]}\n  ]\n}\n\nREGRAS:\n- SEMPRE 4 opções: completa, média, simples, personalizado\n- Use as informações da sua análise anterior nos títulos e descrições\n- "arquivos" sempre vazio ([]) — o usuário escolhe a opção primeiro\n- Apenas JSON. Nada de texto. Nada de markdown. Comece com { e termine com }.`
+                        : `⚠️ EMERGÊNCIA: Você respondeu com texto em vez de JSON.\n\nBaseado na solicitação: "${task}"\n\nRetorne APENAS JSON com sugestoes no formato:\n{\n  "resumo": "...",\n  "sugestoes": [\n    {"id":"s1","titulo":"Opção A (completa): ...","descricao":"...","impacto":"alto","arquivos":[]},\n    {"id":"s2","titulo":"Opção B (média): ...","descricao":"...","impacto":"médio","arquivos":[]},\n    {"id":"s3","titulo":"Opção C (simples): ...","descricao":"...","impacto":"baixo","arquivos":[]},\n    {"id":"custom","titulo":"Personalizado","descricao":"Descreva exatamente o que você deseja","impacto":"médio","arquivos":[]}\n  ]\n}\n\nApenas JSON. Nada de texto. Comece com { e termine com }.`;
+
+                    if (onChunk) onChunk('Sistema', '🔄 Reforçando solicitação de opções...\n');
+                    try {
+                        const retryResponse = await callAI(provider, retryPrompt, null, streamController.signal);
+                        const retryPlan = extractJson(retryResponse);
+                        console.log('[ws:plan] Retry concluído', JSON.stringify({ hasRetryPlan: !!retryPlan, retrySugCount: retryPlan ? (retryPlan.sugestoes||[]).length : 0, retryArqCount: retryPlan ? (retryPlan.arquivos||[]).length : 0 }));
+                        if (retryPlan) {
+                            plan.sugestoes = retryPlan.sugestoes;
+                            plan.arquivos = retryPlan.arquivos;
+                            if (retryPlan.resumo) {
+                                plan.resumo = retryPlan.resumo;
+                                if (onChunk) onChunk('Assistente', '📋 ' + retryPlan.resumo + '\n');
+                            }
+                            hasSugestoes = Array.isArray(plan.sugestoes) && plan.sugestoes.length > 0;
+                            hasArquivos = Array.isArray(plan.arquivos) && plan.arquivos.length > 0;
+                        }
+                    } catch (retryError) {
+                        console.error('[ws] Retry falhou, usando fallback:', retryError.message);
+                    }
+                }
+
+                if (!hasSugestoes && !hasArquivos) {
+                    console.log('[ws:plan] Entrando no fallback...');
+                    const fallback = buildFallbackSugestoes(task, plan._rawResponse || plan.resumo);
+                    if (onChunk) onChunk('Sistema', '📋 Gerando opções padrão...\n');
+                    if (onChunk && fallback.resumo) onChunk('Assistente', '📋 ' + fallback.resumo + '\n');
+                    plan.resumo = fallback.resumo;
+                    plan.sugestoes = fallback.sugestoes;
+                    plan.arquivos = [];
+                    hasSugestoes = true;
+                }
+
+                const planId = crypto.randomBytes(8).toString('hex');
+                pendingPlan = { id: planId, plan, controller: streamController, task, provider };
+
+                if (hasArquivos && !hasSugestoes) {
+                    try {
+                        let filesToExecute = plan.arquivos || [];
+                        await executePlan({ resumo: plan.resumo || '', arquivos: filesToExecute }, onChunk, streamController.signal);
+                        ws.send(JSON.stringify({ type: 'refresh' }));
+                        const modifiedFiles = (filesToExecute || []).filter(f => f.acao !== 'deletar').map(f => f.caminho);
+                        if (modifiedFiles.length) {
+                            const result = await runPostExecutionDiagnostics(modifiedFiles, plan.resumo);
+                            if (result && result.rolledBack) ws.send(JSON.stringify({ type: 'rollback', message: 'Alteracoes revertidas devido a erros' }));
+                        }
+                        ws.send(JSON.stringify({ type: 'done', summary: plan.resumo || 'Alterações aplicadas', modifiedFiles, command: pendingPlan.task || '' }));
+                    } catch (e) {
+                        ws.send(JSON.stringify({ type: 'error', content: '❌ ' + (e.message || 'Erro na execução') }));
+                    } finally {
+                        streamController = null;
+                    }
+                    return;
+                }
+
                 const payload = {
                     type: 'approval',
                     planId,
-                    total: hasSuggestions
+                    total: hasSugestoes
                         ? plan.sugestoes.reduce((n, s) => n + (Array.isArray(s.arquivos) ? s.arquivos.length : 0), 0)
                         : plan.arquivos.length,
                     resumo: plan.resumo || ''
                 };
-                if (hasSuggestions) {
+                if (hasSugestoes) {
                     payload.sugestoes = plan.sugestoes.map((s, i) => ({
                         id: s.id || 's' + (i + 1),
                         titulo: s.titulo || 'Sugestão ' + (i + 1),
@@ -1928,16 +5516,19 @@ wss.on('connection', (ws, req) => {
                         arquivos: (Array.isArray(s.arquivos) ? s.arquivos : []).map(a => ({
                             caminho: a.caminho,
                             acao: a.acao,
-                            explicacao: a.explicacao || ''
+                            explicacao: a.explicacao || '',
+                            conteudo: a.conteudo || ''
                         }))
                     }));
                 } else {
                     payload.arquivos = plan.arquivos.map(a => ({
                         caminho: a.caminho,
                         acao: a.acao,
-                        explicacao: a.explicacao || ''
+                        explicacao: a.explicacao || '',
+                        conteudo: a.conteudo || ''
                     }));
                 }
+                console.log('[ws] Enviando approval payload', JSON.stringify({ planId, hasSugestoes, sugestoesCount: hasSugestoes ? payload.sugestoes.length : 0, arquivosCount: payload.arquivos ? payload.arquivos.length : 0, total: payload.total, resumo: (payload.resumo||'').slice(0, 60) }));
                 ws.send(JSON.stringify(payload));
             } catch (error) {
                 const cancelled = error && error.name === 'AbortError';
@@ -1959,9 +5550,14 @@ wss.on('connection', (ws, req) => {
                 return;
             }
 
-            const { plan, controller } = pendingPlan;
+            const { plan, controller, task, provider, mode: planMode } = pendingPlan;
             pendingPlan = null;
             streamController = controller;
+
+            if (planMode === 'agent') {
+                await runAgentAndCapture(ws, task, onChunk, streamController, [], provider);
+                return;
+            }
 
             const onChunk = (agent, text) => {
                 if (agent === 'file-status') {
@@ -1975,6 +5571,12 @@ wss.on('connection', (ws, req) => {
                     ws.send(JSON.stringify({ type: 'plan', total: Number(text) || 0 }));
                     return;
                 }
+                if (agent === 'activity') {
+                    try {
+                        ws.send(JSON.stringify({ type: 'activity-event', ...JSON.parse(text) }));
+                    } catch (e) {}
+                    return;
+                }
                 ws.send(JSON.stringify({ type: 'chunk', agent: agent || 'Sistema', content: text }));
             };
 
@@ -1982,23 +5584,89 @@ wss.on('connection', (ws, req) => {
                 let filesToExecute;
                 if (Array.isArray(plan.sugestoes) && plan.sugestoes.length > 0) {
                     const selected = new Set(Array.isArray(data.selecionadas) ? data.selecionadas : []);
+                    const selectedSuggestions = plan.sugestoes.filter(s => selected.has(s.id));
                     filesToExecute = [];
-                    for (const s of plan.sugestoes) {
-                        if (selected.has(s.id) && Array.isArray(s.arquivos)) {
+                    for (const s of selectedSuggestions) {
+                        if (Array.isArray(s.arquivos)) {
                             filesToExecute.push(...s.arquivos);
                         }
                     }
+                    if (filesToExecute.length === 0 && selectedSuggestions.length > 0) {
+                        const hasCustom = selected.has('custom') && data.customRequest;
+                        const selTitles = hasCustom ? data.customRequest : selectedSuggestions.filter(s => s.id !== 'custom').map(s => s.titulo).join('; ');
+                        const selDescs = hasCustom ? data.customRequest : selectedSuggestions.filter(s => s.id !== 'custom').map(s => s.descricao).join('; ');
+                        if (onChunk) onChunk('Sistema', '🔨 Implementando opção selecionada...\n');
+
+                        if (provider === 'opencode') {
+                            const beforeSnap = snapshotProjectFiles();
+                            const beforeContents = snapshotProjectContents();
+                            const implPrompt = hasCustom
+                                ? `Solicitação do usuário: "${data.customRequest}"\n\nSolicitação original: "${task}"\n\nImplemente diretamente nos arquivos do projeto.`
+                                : `Solicitação original: "${task}"\n\nOpção escolhida: ${selTitles}\nDescrição: ${selDescs}\n\nImplemente esta opção diretamente nos arquivos do projeto.`;
+                            await callOpenCode(implPrompt, (chunk) => {
+                                if (onChunk) onChunk('Assistente', chunk);
+                            }, controller.signal, null, (toolEvent) => {
+                                if (onChunk) onChunk('activity', JSON.stringify(toolEvent));
+                            });
+                            const ocChanges = diffSnapshots(beforeSnap, snapshotProjectFiles());
+                            if (ocChanges.length > 0) {
+                                for (const change of ocChanges) {
+                                    if (change.action === 'modificar' || change.action === 'deletar') {
+                                        const orig = beforeContents.get(change.file);
+                                        if (orig !== undefined) backupFromContent(change.file, orig);
+                                    }
+                                    if (onChunk) onChunk('file-status', JSON.stringify([{ file: change.file, action: change.action, status: 'done' }]));
+                                    if (onChunk) onChunk('Sistema', `📄 ${change.action.toUpperCase()}: ${change.file}\n`);
+                                }
+                                filesToExecute = ocChanges.map(c => ({ caminho: c.file, acao: c.action }));
+                                ws.send(JSON.stringify({ type: 'refresh' }));
+                                const modifiedFilesOc = ocChanges.filter(c => c.action !== 'deletar').map(c => c.file);
+                                if (modifiedFilesOc.length) {
+                                    const result = await runPostExecutionDiagnostics(modifiedFilesOc, plan.resumo);
+                                    if (result && result.rolledBack) ws.send(JSON.stringify({ type: 'rollback', message: 'Alteracoes revertidas devido a erros' }));
+                                }
+                                ws.send(JSON.stringify({ type: 'done', summary: 'opencode: ' + ocChanges.length + ' arquivo(s) alterado(s)', command: task }));
+                            } else {
+                                if (onChunk) onChunk('Sistema', '⚠️ opencode não gerou arquivos. Seja mais específico ou use a opção "Personalizado".\n');
+                                ws.send(JSON.stringify({ type: 'done', summary: 'Nenhum arquivo gerado. Seja mais específico.', command: task }));
+                            }
+                            return;
+                        } else {
+                            const implPrompt = `Implemente a seguinte opção escolhida pelo usuário:\nTítulo: ${selTitles}\nDescrição: ${selDescs}\n\nSolicitação original: "${task}"\n\nGere o código completo dos arquivos necessários. Retorne APENAS JSON no Formato B:\n{"resumo":"...","arquivos":[{"caminho":"src/arquivo.js","acao":"criar","conteudo":"conteúdo COMPLETO do arquivo","explicacao":"o que este arquivo faz"}]}\n\n⚠️ O "conteudo" deve ser o código COMPLETO do arquivo, pronto para ser salvo. Sem explicações no conteúdo. Apenas JSON. Comece com { e termine com }.`;
+                            const implResponse = await callAI(provider, implPrompt, null, controller.signal);
+                            let implPlan = extractJson(implResponse);
+                            if (!implPlan || !Array.isArray(implPlan.arquivos) || implPlan.arquivos.length === 0) {
+                                if (onChunk) onChunk('Sistema', '🔄 Reforçando implementação...\n');
+                                const implRetryPrompt = `⚠️ Sua resposta anterior não estava no formato JSON correto. Sua resposta foi:\n\n"""\n${(implResponse||'').slice(0, 1500)}\n"""\n\nAgora retorne APENAS JSON com os arquivos a criar/modificar:\n{"resumo":"...","arquivos":[{"caminho":"src/arquivo.js","acao":"criar","conteudo":"conteúdo COMPLETO","explicacao":"..."}]}\n\nApenas JSON. Comece com { e termine com }.`;
+                                try {
+                                    const implRetryResponse = await callAI(provider, implRetryPrompt, null, controller.signal);
+                                    implPlan = extractJson(implRetryResponse);
+                                } catch (e) {
+                                    console.error('[ws] Retry implementação falhou:', e.message);
+                                }
+                            }
+                            if (implPlan && Array.isArray(implPlan.arquivos) && implPlan.arquivos.length > 0) {
+                                filesToExecute = implPlan.arquivos;
+                                plan.resumo = implPlan.resumo || plan.resumo;
+                                if (onChunk && implPlan.resumo) onChunk('Assistente', '📋 ' + implPlan.resumo + '\n');
+                            } else {
+                                if (onChunk) onChunk('Sistema', '⚠️ IA não gerou arquivos. Por favor, seja mais específico no pedido ou use a opção "Personalizado" para descrever exatamente o que deseja.\n');
+                                ws.send(JSON.stringify({ type: 'done', summary: 'Nenhum arquivo gerado pela IA. Seja mais específico.', command: task }));
+                                return;
+                            }
+                        }
+                    }
                 } else {
-                    filesToExecute = plan.arquivos || [];
+                    filesToExecute = data.arquivos || plan.arquivos || [];
+                    if (data.nota && onChunk) onChunk('Sistema', `📝 Nota: ${data.nota}\n`);
                 }
                 await executePlan({ resumo: plan.resumo || '', arquivos: filesToExecute }, onChunk, controller.signal);
-                ws.send(JSON.stringify({ type: 'done' }));
-            } catch (error) {
-                const cancelled = error && error.name === 'AbortError';
-                ws.send(JSON.stringify({
-                    type: cancelled ? 'cancelled' : 'error',
-                    content: cancelled ? '⏹️ Tarefa cancelada' : `❌ ${error.message}`
-                }));
+                const modifiedFiles = (filesToExecute || []).filter(f => f.acao !== 'deletar').map(f => f.caminho);
+                if (modifiedFiles.length) {
+                    const result = await runPostExecutionDiagnostics(modifiedFiles, plan.resumo);
+                    if (result && result.rolledBack) ws.send(JSON.stringify({ type: 'rollback', message: 'Alteracoes revertidas devido a erros' }));
+                }
+                ws.send(JSON.stringify({ type: 'done', summary: plan.resumo || 'Alterações aplicadas', command: task }));
             } finally {
                 streamController = null;
             }
@@ -2015,16 +5683,56 @@ wss.on('connection', (ws, req) => {
     });
 });
 
-module.exports = { app, server, resolveSafePath, extractJson, setProjectRoot, writeFileContent, readFileContent, listBackups, analyzeTask, executePlan, parseJsonC, buildOpenCodePrompt, snapshotProjectFiles, diffSnapshots, parseRemoteUrl, nextVersion, detectRepo, latestVersionTag, runner };
+module.exports = { app, server, resolveSafePath, extractJson, setProjectRoot, writeFileContent, readFileContent, listBackups, analyzeTask, executePlan, parseJsonC, buildOpenCodePrompt, snapshotProjectFiles, diffSnapshots, parseRemoteUrl, nextVersion, detectRepo, latestVersionTag, runner, formatCode, pushUndoState, undoStack, redoStack };
+
+// =============================================
+let mcpConfigs = [];
+function loadMcpConfig() {
+    try {
+        const ocPath = path.join(PROJECT_ROOT, 'opencode.json');
+        if (fs.existsSync(ocPath)) {
+            const oc = JSON.parse(fs.readFileSync(ocPath, 'utf-8'));
+            if (oc.mcp && typeof oc.mcp === 'object') {
+                mcpConfigs = Object.entries(oc.mcp).map(([name, cfg]) => ({
+                    name,
+                    command: cfg.command?.[0] || cfg.command,
+                    args: (cfg.command || []).slice(1),
+                    env: cfg.environment || {},
+                    enabled: cfg.enabled !== false
+                }));
+            }
+        }
+    } catch (e) { console.error('[mcp] Erro ao carregar config:', e.message); }
+}
+
+async function initMcp() {
+    if (mcpConfigs.length === 0) return;
+    console.log(`[mcp] Conectando ${mcpConfigs.filter(c => c.enabled).length} servidor(es)...`);
+    await mcpManager.connectServers(mcpConfigs);
+}
+
+function getMcpTools() { return mcpManager.getAllTools(); }
+async function executeMcpTool(name, args) { return await mcpManager.executeTool(name, args); }
 
 // =============================================
 //  INICIAR SERVIDOR (APENAS SE EXECUTADO DIRETO)
 // =============================================
 if (require.main === module) {
+    loadMcpConfig();
+    initMcp().then(() => {
+        console.log('[mcp] Inicialização concluída');
+    }).catch(e => console.error('[mcp]', e.message));
     server.listen(PORT, '127.0.0.1', () => {
         console.log(`✅ Aedificator Codex IDE Backend rodando na porta ${PORT}`);
         console.log(`🔗 http://localhost:${PORT}/api/health`);
         console.log(`📁 Diretório do projeto: ${PROJECT_ROOT}`);
+        ensureOpenCodeServer().then(() => {
+            console.log('[opencode] Servidor persistente iniciado');
+        }).catch(e => {
+            console.log(`[opencode] Servidor não iniciado (será criado sob demanda): ${e.message}`);
+        });
+        fetchUsdBrlRate();
+        setInterval(fetchUsdBrlRate, 3600000);
     });
 
     server.on('error', (error) => {
@@ -2038,6 +5746,9 @@ if (require.main === module) {
     process.on('uncaughtException', (error) => {
         console.error('❌ Erro não tratado:', error);
     });
+
+    process.on('SIGINT', () => { stopOpenCodeServer(); process.exit(); });
+    process.on('SIGTERM', () => { stopOpenCodeServer(); process.exit(); });
 
     console.log('🏗️ Aedificator Codex IDE Backend inicializando...');
     console.log(`📁 Diretório base: ${PROJECT_ROOT}`);

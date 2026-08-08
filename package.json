@@ -48,7 +48,19 @@
       "main.js",
       "preload.js",
       "backend/**/*",
-      "frontend/**/*"
+      "frontend/**/*",
+      "opencode.json",
+      "build/icon.ico"
+    ],
+    "extraResources": [
+      {
+        "from": "build/icon.ico",
+        "to": "build/icon.ico"
+      }
+    ],
+    "asar": true,
+    "asarUnpack": [
+      "node_modules/monaco-editor/**/*"
     ],
     "win": {
       "target": [
@@ -80,16 +92,13 @@
         "dmg",
         "zip"
       ],
-      "icon": "build/icon.icns",
       "category": "public.app-category.developer-tools"
     },
     "linux": {
       "target": [
         "AppImage",
-        "deb",
-        "snap"
+        "zip"
       ],
-      "icon": "build/icon.png",
       "category": "Development"
     }
   },
@@ -99,10 +108,15 @@
     "eslint": "^8.56.0"
   },
   "dependencies": {
+    "acorn": "^8.18.0",
     "cors": "^2.8.6",
     "dotenv": "^16.3.1",
     "express": "^4.22.2",
+    "marked": "^18.0.9",
     "merge-descriptors": "^2.0.0",
+    "monaco-editor": "^0.56.0",
+    "puppeteer-core": "^25.5.0",
+    "typescript": "^7.0.2",
     "ws": "^8.21.1"
   }
 }
