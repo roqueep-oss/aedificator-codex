@@ -508,7 +508,7 @@ document.addEventListener('DOMContentLoaded', () => {
     safeOn('gitStashBtn', 'click', () => gitStash('push'));
     safeOn('gitStashPopBtn', 'click', () => gitStash('pop'));
 
-    safeOn('publishVersionBtn', 'click', openPublishModal);
+    safeOn('publishHeaderBtn', 'click', openPublishModal);
     safeOn('pubRunBtn', 'click', publishVersion);
     safeOn('pubCloseBtn', 'click', closePublishModal);
 
