@@ -264,9 +264,7 @@ async function fetchAiPrices() {
     const pricingFile = path.join(__dirname, 'pricing.json');
     const saved = fs.existsSync(pricingFile) ? JSON.parse(fs.readFileSync(pricingFile, 'utf-8')) : {};
 
-    if (config.gemini.apiKey) {
-        try {
-            const prompt = `Retorne APENAS um JSON válido (sem markdown, sem explicação) com os preços atuais por 1 milhão de tokens (USD) para estas IAs:
+    const prompt = `Retorne APENAS um JSON válido (sem markdown, sem explicação) com os preços atuais por 1 milhão de tokens (USD) para estas IAs:
 
 {
   "deepseek": {
@@ -288,29 +286,41 @@ async function fetchAiPrices() {
 }
 
 Atualize os valores com os preços REAIS atuais de cada provedor. Retorne SOMENTE o JSON.`;
-            const response = await callGemini(prompt, null, null);
+
+    const providers = [
+        { name: 'Gemini', hasKey: !!config.gemini?.apiKey, call: (p) => callGemini(p, null, null) },
+        { name: 'DeepSeek', hasKey: !!config.deepseek?.apiKey, call: (p) => callDeepSeek(p, null, null) },
+        { name: 'OpenAI', hasKey: !!config.openai?.apiKey, call: (p) => callOpenAI(p, null, null) },
+        { name: 'Claude', hasKey: !!config.claude?.apiKey, call: (p) => callClaude(p, null, null) },
+        { name: 'OpenCode', hasKey: true, call: (p) => callOpenCode(p, null, null) }
+    ];
+
+    for (const provider of providers) {
+        if (!provider.hasKey) continue;
+        try {
+            const response = await provider.call(prompt);
             const jsonMatch = response.match(/\{[\s\S]*\}/);
             if (jsonMatch) {
                 const newPrices = JSON.parse(jsonMatch[0]);
-                for (const [provider, models] of Object.entries(newPrices)) {
-                    if (TOKEN_PRICES[provider] && models && typeof models === 'object') {
+                for (const [p, models] of Object.entries(newPrices)) {
+                    if (TOKEN_PRICES[p] && models && typeof models === 'object') {
                         for (const [model, price] of Object.entries(models)) {
                             if (model === '__default') {
-                                TOKEN_PRICES[provider]['__default'] = price;
+                                TOKEN_PRICES[p]['__default'] = price;
                             } else if (price && typeof price.input === 'number') {
-                                if (!TOKEN_PRICES[provider].models) TOKEN_PRICES[provider].models = {};
-                                TOKEN_PRICES[provider].models[model] = price;
+                                if (!TOKEN_PRICES[p].models) TOKEN_PRICES[p].models = {};
+                                TOKEN_PRICES[p].models[model] = price;
                             }
                         }
                     }
                 }
                 saved.prices = TOKEN_PRICES;
                 fs.writeFileSync(pricingFile, JSON.stringify(saved), 'utf-8');
-                console.log('✅ Preços IA atualizados automaticamente via Gemini');
+                console.log(`✅ Preços IA atualizados via ${provider.name}`);
                 return TOKEN_PRICES;
             }
         } catch (e) {
-            console.log(`⚠️ Falha ao buscar preços via Gemini: ${e.message}`);
+            console.log(`⚠️ ${provider.name} indisponível para preços: ${e.message}`);
         }
     }
 
@@ -327,6 +337,7 @@ Atualize os valores com os preços REAIS atuais de cada provedor. Retorne SOMENT
             }
         }
     }
+    console.log('ℹ️ Nenhum provider disponível para buscar preços, usando defaults');
     return TOKEN_PRICES;
 }
 
