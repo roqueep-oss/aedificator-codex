@@ -259,23 +259,73 @@ let _aiPricesLastFetch = 0;
 async function fetchAiPrices() {
     const now = Date.now();
     if (now - _aiPricesLastFetch < 86400000) return TOKEN_PRICES;
-    try {
-        const pricingFile = path.join(__dirname, 'pricing.json');
-        const saved = fs.existsSync(pricingFile) ? JSON.parse(fs.readFileSync(pricingFile, 'utf-8')) : {};
-        if (saved.prices && Object.keys(saved.prices).length > 0) {
-            for (const [provider, models] of Object.entries(saved.prices)) {
-                if (TOKEN_PRICES[provider]) {
-                    for (const [model, price] of Object.entries(models)) {
+    _aiPricesLastFetch = now;
+
+    const pricingFile = path.join(__dirname, 'pricing.json');
+    const saved = fs.existsSync(pricingFile) ? JSON.parse(fs.readFileSync(pricingFile, 'utf-8')) : {};
+
+    if (config.gemini.apiKey) {
+        try {
+            const prompt = `Retorne APENAS um JSON válido (sem markdown, sem explicação) com os preços atuais por 1 milhão de tokens (USD) para estas IAs:
+
+{
+  "deepseek": {
+    "deepseek-chat": {"input": 0.14, "output": 0.28, "cache": 0.0028},
+    "deepseek-reasoner": {"input": 0.55, "output": 2.19, "cache": 0.14}
+  },
+  "gemini": {
+    "gemini-2.5-flash": {"input": 0.15, "output": 0.60},
+    "gemini-2.5-pro": {"input": 1.25, "output": 5.00}
+  },
+  "openai": {
+    "gpt-4o": {"input": 2.50, "output": 10.00},
+    "gpt-4o-mini": {"input": 0.15, "output": 0.60}
+  },
+  "claude": {
+    "claude-sonnet-4": {"input": 3.00, "output": 15.00},
+    "claude-haiku-4.5": {"input": 1.00, "output": 5.00}
+  }
+}
+
+Atualize os valores com os preços REAIS atuais de cada provedor. Retorne SOMENTE o JSON.`;
+            const response = await callGemini(prompt, null, null);
+            const jsonMatch = response.match(/\{[\s\S]*\}/);
+            if (jsonMatch) {
+                const newPrices = JSON.parse(jsonMatch[0]);
+                for (const [provider, models] of Object.entries(newPrices)) {
+                    if (TOKEN_PRICES[provider] && models && typeof models === 'object') {
+                        for (const [model, price] of Object.entries(models)) {
+                            if (model === '__default') {
+                                TOKEN_PRICES[provider]['__default'] = price;
+                            } else if (price && typeof price.input === 'number') {
+                                if (!TOKEN_PRICES[provider].models) TOKEN_PRICES[provider].models = {};
+                                TOKEN_PRICES[provider].models[model] = price;
+                            }
+                        }
+                    }
+                }
+                saved.prices = TOKEN_PRICES;
+                fs.writeFileSync(pricingFile, JSON.stringify(saved), 'utf-8');
+                console.log('✅ Preços IA atualizados automaticamente via Gemini');
+                return TOKEN_PRICES;
+            }
+        } catch (e) {
+            console.log(`⚠️ Falha ao buscar preços via Gemini: ${e.message}`);
+        }
+    }
+
+    if (saved.prices && Object.keys(saved.prices).length > 0) {
+        for (const [provider, models] of Object.entries(saved.prices)) {
+            if (TOKEN_PRICES[provider]) {
+                if (models.models) {
+                    for (const [model, price] of Object.entries(models.models)) {
                         if (!TOKEN_PRICES[provider].models) TOKEN_PRICES[provider].models = {};
                         TOKEN_PRICES[provider].models[model] = price;
                     }
-                    if (models['__default']) TOKEN_PRICES[provider]['__default'] = models['__default'];
                 }
+                if (models['__default']) TOKEN_PRICES[provider]['__default'] = models['__default'];
             }
         }
-        _aiPricesLastFetch = now;
-    } catch (e) {
-        console.log(`⚠️ Não foi possível carregar preços salvos: ${e.message}`);
     }
     return TOKEN_PRICES;
 }
@@ -2800,6 +2850,16 @@ app.get('/api/usage/monthly', (req, res) => {
     result.months.sort((a, b) => b.month.localeCompare(a.month));
     result.total_brl = Math.round(result.total_brl * 100) / 100;
     res.json(result);
+});
+
+app.post('/api/pricing/refresh', async (req, res) => {
+    try {
+        _aiPricesLastFetch = 0;
+        const prices = await fetchAiPrices();
+        res.json({ success: true, prices, usdBrl: USD_TO_BRL });
+    } catch (e) {
+        res.status(500).json({ success: false, error: e.message });
+    }
 });
 
 app.get('/api/pricing', (req, res) => {

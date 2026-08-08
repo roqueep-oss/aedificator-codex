@@ -701,6 +701,30 @@ async function savePricing() {
 
 document.getElementById('savePricingInlineBtn').addEventListener('click', savePricing);
 
+async function refreshAiPrices() {
+    var btn = document.getElementById('refreshPricesBtn');
+    btn.disabled = true;
+    btn.textContent = '⏳ Buscando...';
+    try {
+        var res = await apiFetch('/api/pricing/refresh', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: '{}' });
+        var d = await res.json();
+        if (d.success) {
+            showToast('✅ Preços atualizados via IA!');
+            btn.textContent = '✅';
+            setTimeout(function() { btn.textContent = '🔄 Atualizar'; btn.disabled = false; }, 2000);
+            openPricingModal();
+        } else {
+            showToast('⚠️ ' + (d.error || 'Falha ao atualizar'));
+            btn.textContent = '🔄 Atualizar';
+            btn.disabled = false;
+        }
+    } catch (e) {
+        showToast('❌ ' + e.message);
+        btn.textContent = '🔄 Atualizar';
+        btn.disabled = false;
+    }
+}
+
 async function openCostDashboard() {
     var modal = document.getElementById('costDashboardModal');
     modal.style.display = 'flex';
