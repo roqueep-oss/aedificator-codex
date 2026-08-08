@@ -74,7 +74,8 @@
       ],
       "icon": "build/icon.ico",
       "publisherName": "Aedificator Codex IDE",
-      "verifyUpdateCodeSignature": true
+      "verifyUpdateCodeSignature": true,
+      "signAndEditExecutable": true
     },
     "nsis": {
       "oneClick": false,

@@ -10,17 +10,12 @@ on:
 jobs:
   lint-and-test:
     runs-on: ubuntu-latest
-    strategy:
-      matrix:
-        node-version: [22]
     steps:
       - uses: actions/checkout@v4
-
       - uses: actions/setup-node@v4
         with:
-          node-version: ${{ matrix.node-version }}
+          node-version: 22
           cache: 'npm'
-
       - run: npm ci
       - run: npm run lint
       - run: npm test
@@ -32,16 +27,8 @@ jobs:
     strategy:
       matrix:
         os: [windows-latest, macos-latest, ubuntu-latest]
-        include:
-          - os: windows-latest
-            build-script: build:win
-          - os: macos-latest
-            build-script: build:mac
-          - os: ubuntu-latest
-            build-script: build:linux
     steps:
       - uses: actions/checkout@v4
-
       - uses: actions/setup-node@v4
         with:
           node-version: 22
@@ -49,13 +36,27 @@ jobs:
 
       - run: npm ci
 
+      - name: Import code signing certificate (Windows)
+        if: runner.os == 'Windows' && env.WIN_CSC_LINK != ''
+        shell: powershell
+        run: |
+          $pfxPath = "${{ runner.temp }}\cert.pfx"
+          [IO.File]::WriteAllBytes($pfxPath, [Convert]::FromBase64String($env:WIN_CSC_LINK))
+          echo "CSC_LINK=$pfxPath" >> $env:GITHUB_ENV
+        env:
+          WIN_CSC_LINK: ${{ secrets.WIN_CSC_LINK }}
+
       - name: Build
-        run: npm run ${{ matrix.build-script }}
+        shell: bash
+        run: |
+          if [ "$RUNNER_OS" = "Windows" ]; then npm run build:win; fi
+          if [ "$RUNNER_OS" = "macOS" ]; then npm run build:mac; fi
+          if [ "$RUNNER_OS" = "Linux" ]; then npm run build:linux; fi
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          CSC_KEY_PASSWORD: ${{ secrets.WIN_CSC_KEY_PASSWORD }}
 
-      - name: Upload artifacts
-        uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v4
         with:
           name: dist-${{ matrix.os }}
           path: dist/*
