@@ -3200,6 +3200,7 @@ body.theme-light .chat-area,
             </select>
             <span id="usageDisplay" title="Consumo de tokens" style="font-size:10px;color:#8b949e;cursor:pointer;" onclick="refreshUsage()"></span>
             <button id="pricingBtn" title="Cotação e preços" style="font-size:10px;background:transparent;border:1px solid #30363d;border-radius:4px;color:#8b949e;cursor:pointer;padding:1px 4px;" onclick="openPricingModal()">💲</button>
+            <button id="dashboardHeaderBtn" title="Dashboard de custos IA" style="font-size:10px;background:transparent;border:1px solid #30363d;border-radius:4px;color:#8b949e;cursor:pointer;padding:1px 4px;" onclick="openCostDashboard()">📊</button>
             <select id="modelSelect">
                 <option value="gemini-3.5">Gemini 3.5</option>
             </select>
@@ -3552,7 +3553,6 @@ body.theme-light .chat-area,
         <div style="margin-top:6px;display:flex;gap:4px;">
             <button style="font-size:9px;background:#1f6feb;border:none;color:#fff;padding:2px 8px;border-radius:3px;cursor:pointer;" id="savePricingInlineBtn">Salvar</button>
             <button style="font-size:9px;background:#21262d;border:1px solid #30363d;color:#8b949e;padding:2px 8px;border-radius:3px;cursor:pointer;" onclick="document.getElementById('pricingPanel').style.display='none'">Fechar</button>
-            <button style="font-size:9px;background:#a371f7;border:none;color:#fff;padding:2px 8px;border-radius:3px;cursor:pointer;margin-left:auto;" onclick="openCostDashboard()">📊 Dashboard</button>
             <button style="font-size:9px;background:#21262d;border:1px solid #f0883e;color:#f0883e;padding:2px 8px;border-radius:3px;cursor:pointer;" id="refreshPricesBtn" onclick="refreshAiPrices()">🔄 Atualizar</button>
         </div>
     </div>

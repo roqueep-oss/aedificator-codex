@@ -738,7 +738,23 @@ async function openCostDashboard() {
             return;
         }
         var html = '';
+
+        // Custo total por provider
         html += '<div style="font-size:14px;color:#3fb950;margin-bottom:12px;">💰 Total acumulado: <b>R$ ' + data.total_brl.toFixed(2).replace('.', ',') + '</b></div>';
+        html += '<div style="display:flex;gap:12px;flex-wrap:wrap;margin-bottom:16px;">';
+        var icons = { deepseek: '🔵', gemini: '🟢', openai: '⚫', claude: '🟣', opencode: '⚪' };
+        for (var p in data.providers) {
+            var pd = data.providers[p];
+            var icon = icons[p] || '📊';
+            html += '<div style="background:#0d1117;border:1px solid #30363d;border-radius:8px;padding:10px 14px;min-width:120px;">';
+            html += '<div style="font-size:10px;color:#8b949e;margin-bottom:2px;">' + icon + ' ' + p.charAt(0).toUpperCase() + p.slice(1) + '</div>';
+            html += '<div style="font-size:16px;color:#e6edf3;font-weight:bold;">R$ ' + pd.total_brl.toFixed(2).replace('.', ',') + '</div>';
+            html += '</div>';
+        }
+        html += '</div>';
+
+        // Tabela mensal
+        html += '<div style="font-size:11px;color:#8b949e;margin-bottom:6px;">📅 Histórico mensal:</div>';
         html += '<table style="width:100%;border-collapse:collapse;font-size:11px;">';
         html += '<thead><tr style="border-bottom:1px solid #30363d;">';
         html += '<th style="text-align:left;padding:4px 8px;color:#8b949e;">Mês</th>';
