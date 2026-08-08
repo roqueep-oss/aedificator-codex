@@ -187,16 +187,15 @@ const TOKEN_PRICES = {
     deepseek: {
         '__default': { input: 0.14, output: 0.28, cache: 0.0028 },
         models: {
-            'deepseek-v4-flash': { input: 0.14, output: 0.28, cache: 0.0028 },
-            'deepseek-v4-pro': { input: 0.435, output: 0.87, cache: 0.0036 },
-            'deepseek-chat': { input: 0.14, output: 0.28, cache: 0.0028 }
+            'deepseek-chat': { input: 0.14, output: 0.28, cache: 0.0028 },
+            'deepseek-reasoner': { input: 0.55, output: 2.19, cache: 0.14 }
         }
     },
     gemini: {
         '__default': { input: 0.15, output: 0.60 },
         models: {
-            'gemini-3.5-flash': { input: 0.15, output: 0.60 },
-            'gemini-3.5-pro': { input: 1.25, output: 5.00 }
+            'gemini-2.5-flash': { input: 0.15, output: 0.60 },
+            'gemini-2.5-pro': { input: 1.25, output: 5.00 }
         }
     },
     openai: {
@@ -209,9 +208,16 @@ const TOKEN_PRICES = {
     claude: {
         '__default': { input: 3.00, output: 15.00 },
         models: {
-            'claude-sonnet-5': { input: 3.00, output: 15.00 },
-            'claude-sonnet-4-6': { input: 3.00, output: 15.00 },
-            'claude-haiku-4-5': { input: 1.00, output: 5.00 }
+            'claude-sonnet-4': { input: 3.00, output: 15.00 },
+            'claude-haiku-4.5': { input: 1.00, output: 5.00 }
+        }
+    },
+    opencode: {
+        '__default': { input: 0.14, output: 0.28 },
+        models: {
+            'opencode/deepseek-v4-flash': { input: 0.14, output: 0.28 },
+            'opencode/deepseek-v4-pro': { input: 0.435, output: 0.87 },
+            'opencode/deepseek-chat': { input: 0.14, output: 0.28 }
         }
     }
 };
@@ -244,8 +250,34 @@ async function fetchUsdBrlRate() {
             } catch (e) {}
         }
     } catch (e) {
-        console.log('💲 Não foi possível atualizar cotação:', e.message);
+        console.log(`⚠️ Não foi possível obter cotação: ${e.message}`);
     }
+}
+
+let _aiPricesLastFetch = 0;
+
+async function fetchAiPrices() {
+    const now = Date.now();
+    if (now - _aiPricesLastFetch < 86400000) return TOKEN_PRICES;
+    try {
+        const pricingFile = path.join(__dirname, 'pricing.json');
+        const saved = fs.existsSync(pricingFile) ? JSON.parse(fs.readFileSync(pricingFile, 'utf-8')) : {};
+        if (saved.prices && Object.keys(saved.prices).length > 0) {
+            for (const [provider, models] of Object.entries(saved.prices)) {
+                if (TOKEN_PRICES[provider]) {
+                    for (const [model, price] of Object.entries(models)) {
+                        if (!TOKEN_PRICES[provider].models) TOKEN_PRICES[provider].models = {};
+                        TOKEN_PRICES[provider].models[model] = price;
+                    }
+                    if (models['__default']) TOKEN_PRICES[provider]['__default'] = models['__default'];
+                }
+            }
+        }
+        _aiPricesLastFetch = now;
+    } catch (e) {
+        console.log(`⚠️ Não foi possível carregar preços salvos: ${e.message}`);
+    }
+    return TOKEN_PRICES;
 }
 
 const usagePath = path.join(__dirname, 'token_usage.json');
@@ -253,7 +285,7 @@ let tokenUsage = {};
 
 function loadTokenUsage() {
     try { if (fs.existsSync(usagePath)) tokenUsage = JSON.parse(fs.readFileSync(usagePath, 'utf-8')); } catch (e) {}
-    for (const p of ['deepseek', 'gemini', 'openai', 'claude']) {
+    for (const p of ['deepseek', 'gemini', 'openai', 'claude', 'opencode']) {
         if (!tokenUsage[p]) tokenUsage[p] = { input: 0, output: 0, cache: 0 };
     }
 }
@@ -280,6 +312,12 @@ function trackTokens(provider, inputTokens, outputTokens, isCacheHit, model) {
         }
         tokenUsage[provider].models[model].output = (tokenUsage[provider].models[model].output || 0) + (outputTokens || 0);
     }
+    const monthKey = new Date().toISOString().slice(0, 7);
+    if (!tokenUsage[provider].monthly) tokenUsage[provider].monthly = {};
+    if (!tokenUsage[provider].monthly[monthKey]) tokenUsage[provider].monthly[monthKey] = { input: 0, output: 0, cache: 0 };
+    tokenUsage[provider].monthly[monthKey].input += (inputTokens || 0);
+    tokenUsage[provider].monthly[monthKey].output += (outputTokens || 0);
+    if (isCacheHit) tokenUsage[provider].monthly[monthKey].cache += (inputTokens || 0);
     saveTokenUsage();
 }
 
@@ -1349,6 +1387,9 @@ async function callOpenCode(prompt, onChunk, signal, model, onToolEvent) {
                 return;
             }
             if (fullText.trim()) {
+                const estimatedInput = Math.round(prompt.length / 4);
+                const estimatedOutput = Math.round(fullText.length / 4);
+                trackTokens('opencode', estimatedInput, estimatedOutput, false, useModel);
                 if (lastError) {
                     const err = new Error(`opencode erro: ${lastError}`);
                     err.partialText = fullText.trim().slice(0, 500);
@@ -2727,6 +2768,38 @@ app.get('/api/usage', (req, res) => {
     const provider = req.query.provider || '';
     const model = req.query.model || '';
     res.json(getUsageReport(provider, model));
+});
+
+app.get('/api/usage/monthly', (req, res) => {
+    const result = { months: [], total_brl: 0, providers: {} };
+    for (const [p, data] of Object.entries(tokenUsage)) {
+        if (!data.monthly) continue;
+        for (const [month, usage] of Object.entries(data.monthly)) {
+            let monthEntry = result.months.find(m => m.month === month);
+            if (!monthEntry) {
+                monthEntry = { month, providers: {}, cost_brl: 0 };
+                result.months.push(monthEntry);
+            }
+            const price = getModelPrice(p, null);
+            const inputCost = ((usage.input || 0) / 1_000_000) * (price.input || 0);
+            const cacheCost = ((usage.cache || 0) / 1_000_000) * (price.cache || price.input || 0);
+            const outputCost = ((usage.output || 0) / 1_000_000) * (price.output || 0);
+            const usd = inputCost + cacheCost + outputCost;
+            const brl = Math.round(usd * USD_TO_BRL * 100) / 100;
+            monthEntry.providers[p] = {
+                tokens: { input: usage.input || 0, output: usage.output || 0, cache: usage.cache || 0 },
+                cost_usd: Math.round(usd * 10000) / 10000,
+                cost_brl: brl
+            };
+            monthEntry.cost_brl += brl;
+            result.total_brl += brl;
+            if (!result.providers[p]) result.providers[p] = { total_brl: 0 };
+            result.providers[p].total_brl += brl;
+        }
+    }
+    result.months.sort((a, b) => b.month.localeCompare(a.month));
+    result.total_brl = Math.round(result.total_brl * 100) / 100;
+    res.json(result);
 });
 
 app.get('/api/pricing', (req, res) => {
@@ -5751,7 +5824,9 @@ if (require.main === module) {
             console.log(`[opencode] Servidor não iniciado (será criado sob demanda): ${e.message}`);
         });
         fetchUsdBrlRate();
+        fetchAiPrices();
         setInterval(fetchUsdBrlRate, 3600000);
+        setInterval(fetchAiPrices, 86400000);
     });
 
     server.on('error', (error) => {

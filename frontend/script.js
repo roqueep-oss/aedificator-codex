@@ -641,13 +641,15 @@ async function checkConfigStatus() {
 async function refreshUsage() {
     try {
         var p = document.getElementById('providerSelect').value;
-        if (p === 'opencode') { document.getElementById('usageDisplay').textContent = ''; return; }
         var m = document.getElementById('modelSelect').value;
-        var res = await fetch('/api/usage?provider=' + p + '&model=' + encodeURIComponent(m));
+        var url = '/api/usage?provider=' + encodeURIComponent(p) + '&model=' + encodeURIComponent(m);
+        var res = await fetch(url);
         var data = await res.json();
         if (data.provider) {
             document.getElementById('usageDisplay').textContent = 'R$ ' + data.cost.brl.toFixed(2).replace('.', ',');
             document.getElementById('usageDisplay').title = (data.tokens.input + data.tokens.output + (data.tokens.cache || 0)).toLocaleString() + ' tokens | ' + data.tokens.input.toLocaleString() + ' in / ' + data.tokens.output.toLocaleString() + ' out | modelo: ' + (data.model || p);
+        } else {
+            document.getElementById('usageDisplay').textContent = '';
         }
     } catch (e) {}
 }
@@ -672,26 +674,22 @@ async function openPricingModal() {
         document.getElementById('pOaiOutput').value = (d.prices.openai && d.prices.openai.models && d.prices.openai.models[model] ? d.prices.openai.models[model].output : (d.prices.openai && d.prices.openai['__default'] ? d.prices.openai['__default'].output : 0));
         document.getElementById('pClInput').value = (d.prices.claude && d.prices.claude.models && d.prices.claude.models[model] ? d.prices.claude.models[model].input : (d.prices.claude && d.prices.claude['__default'] ? d.prices.claude['__default'].input : 0));
         document.getElementById('pClOutput').value = (d.prices.claude && d.prices.claude.models && d.prices.claude.models[model] ? d.prices.claude.models[model].output : (d.prices.claude && d.prices.claude['__default'] ? d.prices.claude['__default'].output : 0));
+        document.getElementById('pOcInput').value = (d.prices.opencode && d.prices.opencode.models && d.prices.opencode.models[model] ? d.prices.opencode.models[model].input : (d.prices.opencode && d.prices.opencode['__default'] ? d.prices.opencode['__default'].input : 0));
+        document.getElementById('pOcOutput').value = (d.prices.opencode && d.prices.opencode.models && d.prices.opencode.models[model] ? d.prices.opencode.models[model].output : (d.prices.opencode && d.prices.opencode['__default'] ? d.prices.opencode['__default'].output : 0));
     } catch (e) {}
 }
 
 async function savePricing() {
     try {
-        var prov = document.getElementById('providerSelect').value;
-        var model = document.getElementById('modelSelect').value;
         var body = {
             prices: {
                 deepseek: { models: {}, '__default': { input: parseFloat(document.getElementById('pDeepInput').value) || 0, output: parseFloat(document.getElementById('pDeepOutput').value) || 0, cache: parseFloat(document.getElementById('pDeepCache').value) || 0 } },
                 gemini: { models: {}, '__default': { input: parseFloat(document.getElementById('pGemInput').value) || 0, output: parseFloat(document.getElementById('pGemOutput').value) || 0 } },
                 openai: { models: {}, '__default': { input: parseFloat(document.getElementById('pOaiInput').value) || 0, output: parseFloat(document.getElementById('pOaiOutput').value) || 0 } },
-                claude: { models: {}, '__default': { input: parseFloat(document.getElementById('pClInput').value) || 0, output: parseFloat(document.getElementById('pClOutput').value) || 0 } }
+                claude: { models: {}, '__default': { input: parseFloat(document.getElementById('pClInput').value) || 0, output: parseFloat(document.getElementById('pClOutput').value) || 0 } },
+                opencode: { models: {}, '__default': { input: parseFloat(document.getElementById('pOcInput').value) || 0, output: parseFloat(document.getElementById('pOcOutput').value) || 0 } }
             }
         };
-        body.prices[prov].models[model] = {
-            input: prov === 'deepseek' ? (parseFloat(document.getElementById('pDeepInput').value) || 0) : prov === 'gemini' ? (parseFloat(document.getElementById('pGemInput').value) || 0) : prov === 'openai' ? (parseFloat(document.getElementById('pOaiInput').value) || 0) : (parseFloat(document.getElementById('pClInput').value) || 0),
-            output: prov === 'deepseek' ? (parseFloat(document.getElementById('pDeepOutput').value) || 0) : prov === 'gemini' ? (parseFloat(document.getElementById('pGemOutput').value) || 0) : prov === 'openai' ? (parseFloat(document.getElementById('pOaiOutput').value) || 0) : (parseFloat(document.getElementById('pClOutput').value) || 0)
-        };
-        if (prov === 'deepseek') body.prices[prov].models[model].cache = parseFloat(document.getElementById('pDeepCache').value) || 0;
         var res = await fetch('/api/pricing', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body) });
         var d = await res.json();
         if (d.success) {
@@ -702,6 +700,61 @@ async function savePricing() {
 }
 
 document.getElementById('savePricingInlineBtn').addEventListener('click', savePricing);
+
+async function openCostDashboard() {
+    var modal = document.getElementById('costDashboardModal');
+    modal.style.display = 'flex';
+    var content = document.getElementById('costDashboardContent');
+    content.innerHTML = '<div style="text-align:center;padding:20px;color:#8b949e;">Carregando...</div>';
+    try {
+        var res = await fetch('/api/usage/monthly');
+        var data = await res.json();
+        if (!data.months || data.months.length === 0) {
+            content.innerHTML = '<div style="text-align:center;padding:20px;color:#8b949e;">Nenhum consumo registrado ainda.</div>';
+            return;
+        }
+        var html = '';
+        html += '<div style="font-size:14px;color:#3fb950;margin-bottom:12px;">💰 Total acumulado: <b>R$ ' + data.total_brl.toFixed(2).replace('.', ',') + '</b></div>';
+        html += '<table style="width:100%;border-collapse:collapse;font-size:11px;">';
+        html += '<thead><tr style="border-bottom:1px solid #30363d;">';
+        html += '<th style="text-align:left;padding:4px 8px;color:#8b949e;">Mês</th>';
+        for (var p in data.providers) {
+            html += '<th style="text-align:right;padding:4px 8px;color:#8b949e;">' + p.charAt(0).toUpperCase() + p.slice(1) + '</th>';
+        }
+        html += '<th style="text-align:right;padding:4px 8px;color:#8b949e;">Total</th></tr></thead><tbody>';
+        for (var i = 0; i < data.months.length; i++) {
+            var m = data.months[i];
+            var dateLabel = m.month.split('-');
+            var monthNames = ['Jan','Fev','Mar','Abr','Mai','Jun','Jul','Ago','Set','Out','Nov','Dez'];
+            var label = monthNames[parseInt(dateLabel[1])-1] + ' ' + dateLabel[0];
+            html += '<tr style="border-bottom:1px solid #21262d;">';
+            html += '<td style="padding:6px 8px;color:#e6edf3;">' + label + '</td>';
+            for (var p in data.providers) {
+                var pdata = m.providers[p];
+                var val = pdata ? pdata.cost_brl : 0;
+                var color = val > 0 ? (val > 5 ? '#f85149' : '#e6edf3') : '#484f58';
+                html += '<td style="text-align:right;padding:6px 8px;color:' + color + ';">' + (val > 0 ? 'R$ ' + val.toFixed(2).replace('.', ',') : '—') + '</td>';
+            }
+            html += '<td style="text-align:right;padding:6px 8px;color:#e6edf3;font-weight:bold;">R$ ' + m.cost_brl.toFixed(2).replace('.', ',') + '</td>';
+            html += '</tr>';
+        }
+        html += '</tbody></table>';
+        var now = new Date();
+        var currentMonth = now.toISOString().slice(0, 7);
+        var currentMonthData = data.months.find(function(m) { return m.month === currentMonth; });
+        if (currentMonthData) {
+            var dayOfMonth = now.getDate();
+            var daysInMonth = new Date(now.getFullYear(), now.getMonth()+1, 0).getDate();
+            var projected = dayOfMonth > 0 ? (currentMonthData.cost_brl / dayOfMonth) * daysInMonth : currentMonthData.cost_brl;
+            html += '<div style="margin-top:12px;padding:8px;background:#1f6feb11;border:1px solid #30363d;border-radius:6px;font-size:11px;color:#8b949e;">';
+            html += '📈 Projeção do mês atual: <b style="color:#e6edf3;">R$ ' + projected.toFixed(2).replace('.', ',') + '</b> (base: ' + dayOfMonth + ' dias)';
+            html += '</div>';
+        }
+        content.innerHTML = html;
+    } catch (e) {
+        content.innerHTML = '<div style="text-align:center;padding:20px;color:#f85149;">Erro: ' + e.message + '</div>';
+    }
+}
 
 async function loadOpenCodeModels() {
     try {
@@ -4694,28 +4747,22 @@ function closeSnapshotModal() {
 // =============================================
 var PROVIDER_MODELS = {
     gemini: [
-        { value: 'gemini-3.5', label: 'Gemini 3.5 Flash' },
-        { value: 'gemini-3.1', label: 'Gemini 3.1 Pro' },
-        { value: 'gemini-3-flash', label: 'Gemini 3 Flash' },
-        { value: 'gemini-3.6-flash', label: 'Gemini 3.6 Flash' }
+        { value: 'gemini-2.5-flash', label: 'Gemini 2.5 Flash' },
+        { value: 'gemini-2.5-pro', label: 'Gemini 2.5 Pro' }
     ],
     deepseek: [
-        { value: 'deepseek-v3', label: 'DeepSeek V3' },
-        { value: 'deepseek-r1', label: 'DeepSeek R1' }
+        { value: 'deepseek-chat', label: 'DeepSeek V3' },
+        { value: 'deepseek-reasoner', label: 'DeepSeek R1' }
     ],
     openai: [
         { value: 'gpt-4o', label: 'GPT-4o' },
-        { value: 'gpt-4.1', label: 'GPT-4.1' },
-        { value: 'gpt-5', label: 'GPT-5' },
-        { value: 'gpt-5.6-sol', label: 'GPT-5.6 Sol' }
+        { value: 'gpt-4o-mini', label: 'GPT-4o Mini' }
     ],
     claude: [
-        { value: 'claude-sonnet-5', label: 'Claude Sonnet 5' },
-        { value: 'claude-opus-5', label: 'Claude Opus 5' },
-        { value: 'claude-fable-5', label: 'Claude Fable 5' },
-        { value: 'claude-haiku-4-5', label: 'Claude Haiku 4.5' }
+        { value: 'claude-sonnet-4', label: 'Claude Sonnet 4' },
+        { value: 'claude-haiku-4.5', label: 'Claude Haiku 4.5' }
     ],
-    opencode: [] // Populado dinamicamente
+    opencode: []
 };
 
 function updateModelOptions(provider) {

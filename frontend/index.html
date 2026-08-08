@@ -3547,10 +3547,12 @@ body.theme-light .chat-area,
             <tr><td style="padding:1px 4px;">Gemini</td><td><input id="pGemInput" type="number" step="0.001" style="width:50px;background:#0d1117;border:1px solid #30363d;color:#e6edf3;font-size:9px;padding:1px 2px;"></td><td><input id="pGemOutput" type="number" step="0.001" style="width:50px;background:#0d1117;border:1px solid #30363d;color:#e6edf3;font-size:9px;padding:1px 2px;"></td><td style="padding:1px 4px;color:#484f58;">—</td></tr>
             <tr><td style="padding:1px 4px;">OpenAI</td><td><input id="pOaiInput" type="number" step="0.001" style="width:50px;background:#0d1117;border:1px solid #30363d;color:#e6edf3;font-size:9px;padding:1px 2px;"></td><td><input id="pOaiOutput" type="number" step="0.001" style="width:50px;background:#0d1117;border:1px solid #30363d;color:#e6edf3;font-size:9px;padding:1px 2px;"></td><td style="padding:1px 4px;color:#484f58;">—</td></tr>
             <tr><td style="padding:1px 4px;">Claude</td><td><input id="pClInput" type="number" step="0.001" style="width:50px;background:#0d1117;border:1px solid #30363d;color:#e6edf3;font-size:9px;padding:1px 2px;"></td><td><input id="pClOutput" type="number" step="0.001" style="width:50px;background:#0d1117;border:1px solid #30363d;color:#e6edf3;font-size:9px;padding:1px 2px;"></td><td style="padding:1px 4px;color:#484f58;">—</td></tr>
+            <tr><td style="padding:1px 4px;">OpenCode</td><td><input id="pOcInput" type="number" step="0.001" style="width:50px;background:#0d1117;border:1px solid #30363d;color:#e6edf3;font-size:9px;padding:1px 2px;"></td><td><input id="pOcOutput" type="number" step="0.001" style="width:50px;background:#0d1117;border:1px solid #30363d;color:#e6edf3;font-size:9px;padding:1px 2px;"></td><td style="padding:1px 4px;color:#484f58;">—</td></tr>
         </table>
         <div style="margin-top:6px;display:flex;gap:4px;">
             <button style="font-size:9px;background:#1f6feb;border:none;color:#fff;padding:2px 8px;border-radius:3px;cursor:pointer;" id="savePricingInlineBtn">Salvar</button>
             <button style="font-size:9px;background:#21262d;border:1px solid #30363d;color:#8b949e;padding:2px 8px;border-radius:3px;cursor:pointer;" onclick="document.getElementById('pricingPanel').style.display='none'">Fechar</button>
+            <button style="font-size:9px;background:#a371f7;border:none;color:#fff;padding:2px 8px;border-radius:3px;cursor:pointer;margin-left:auto;" onclick="openCostDashboard()">📊 Dashboard</button>
         </div>
     </div>
 
@@ -3823,6 +3825,17 @@ body.theme-light .chat-area,
         </div>
         <div style="flex:1;background:#fff;position:relative;">
             <iframe id="browserIframe" src="about:blank" style="width:100%;height:100%;border:none;"></iframe>
+        </div>
+    </div>
+
+    <!-- ===== DASHBOARD DE CUSTOS ===== -->
+    <div id="costDashboardModal" style="display:none;position:fixed;top:0;left:0;width:100%;height:100%;background:rgba(0,0,0,0.7);z-index:4000;align-items:center;justify-content:center;backdrop-filter:blur(4px);">
+        <div style="background:#161b22;border:1px solid #30363d;border-radius:12px;padding:24px;max-width:700px;width:90%;max-height:85vh;overflow-y:auto;">
+            <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:16px;">
+                <h2 style="color:#e6edf3;margin:0;">📊 Dashboard de Custos (IA)</h2>
+                <button onclick="document.getElementById('costDashboardModal').style.display='none'" style="background:transparent;border:none;color:#8b949e;font-size:18px;cursor:pointer;">✕</button>
+            </div>
+            <div id="costDashboardContent" style="font-size:11px;color:#c9d1d9;"></div>
         </div>
     </div>
 
