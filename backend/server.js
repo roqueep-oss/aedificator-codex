@@ -2881,7 +2881,13 @@ app.post('/api/pricing', (req, res) => {
     if (usdBrl && usdBrl > 0) USD_TO_BRL = usdBrl;
     if (prices) {
         for (const [p, v] of Object.entries(prices)) {
-            if (TOKEN_PRICES[p]) Object.assign(TOKEN_PRICES[p], v);
+            if (TOKEN_PRICES[p]) {
+                if (v['__default']) TOKEN_PRICES[p]['__default'] = v['__default'];
+                if (v.models && Object.keys(v.models).length > 0) {
+                    if (!TOKEN_PRICES[p].models) TOKEN_PRICES[p].models = {};
+                    Object.assign(TOKEN_PRICES[p].models, v.models);
+                }
+            }
         }
     }
     try {

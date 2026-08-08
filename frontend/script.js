@@ -661,21 +661,28 @@ async function openPricingModal() {
     try {
         var res = await fetch('/api/pricing');
         var d = await res.json();
-        var prov = document.getElementById('providerSelect').value;
-        var model = document.getElementById('modelSelect').value;
         document.getElementById('pInlineUsd').textContent = d.usdBrl.toFixed(2).replace('.', ',');
-        var pp = (d.prices[prov] && d.prices[prov].models && d.prices[prov].models[model]) || (d.prices[prov] && d.prices[prov]['__default']) || {};
-        document.getElementById('pDeepInput').value = (d.prices.deepseek && d.prices.deepseek.models && d.prices.deepseek.models[model] ? d.prices.deepseek.models[model].input : (d.prices.deepseek && d.prices.deepseek['__default'] ? d.prices.deepseek['__default'].input : 0));
-        document.getElementById('pDeepOutput').value = (d.prices.deepseek && d.prices.deepseek.models && d.prices.deepseek.models[model] ? d.prices.deepseek.models[model].output : (d.prices.deepseek && d.prices.deepseek['__default'] ? d.prices.deepseek['__default'].output : 0));
-        document.getElementById('pDeepCache').value = (d.prices.deepseek && d.prices.deepseek.models && d.prices.deepseek.models[model] ? (d.prices.deepseek.models[model].cache || 0) : (d.prices.deepseek && d.prices.deepseek['__default'] ? (d.prices.deepseek['__default'].cache || 0) : 0));
-        document.getElementById('pGemInput').value = (d.prices.gemini && d.prices.gemini.models && d.prices.gemini.models[model] ? d.prices.gemini.models[model].input : (d.prices.gemini && d.prices.gemini['__default'] ? d.prices.gemini['__default'].input : 0));
-        document.getElementById('pGemOutput').value = (d.prices.gemini && d.prices.gemini.models && d.prices.gemini.models[model] ? d.prices.gemini.models[model].output : (d.prices.gemini && d.prices.gemini['__default'] ? d.prices.gemini['__default'].output : 0));
-        document.getElementById('pOaiInput').value = (d.prices.openai && d.prices.openai.models && d.prices.openai.models[model] ? d.prices.openai.models[model].input : (d.prices.openai && d.prices.openai['__default'] ? d.prices.openai['__default'].input : 0));
-        document.getElementById('pOaiOutput').value = (d.prices.openai && d.prices.openai.models && d.prices.openai.models[model] ? d.prices.openai.models[model].output : (d.prices.openai && d.prices.openai['__default'] ? d.prices.openai['__default'].output : 0));
-        document.getElementById('pClInput').value = (d.prices.claude && d.prices.claude.models && d.prices.claude.models[model] ? d.prices.claude.models[model].input : (d.prices.claude && d.prices.claude['__default'] ? d.prices.claude['__default'].input : 0));
-        document.getElementById('pClOutput').value = (d.prices.claude && d.prices.claude.models && d.prices.claude.models[model] ? d.prices.claude.models[model].output : (d.prices.claude && d.prices.claude['__default'] ? d.prices.claude['__default'].output : 0));
-        document.getElementById('pOcInput').value = (d.prices.opencode && d.prices.opencode.models && d.prices.opencode.models[model] ? d.prices.opencode.models[model].input : (d.prices.opencode && d.prices.opencode['__default'] ? d.prices.opencode['__default'].input : 0));
-        document.getElementById('pOcOutput').value = (d.prices.opencode && d.prices.opencode.models && d.prices.opencode.models[model] ? d.prices.opencode.models[model].output : (d.prices.opencode && d.prices.opencode['__default'] ? d.prices.opencode['__default'].output : 0));
+
+        var ds = (d.prices.deepseek && d.prices.deepseek['__default']) || {};
+        document.getElementById('pDeepInput').value = ds.input || 0;
+        document.getElementById('pDeepOutput').value = ds.output || 0;
+        document.getElementById('pDeepCache').value = ds.cache || 0;
+
+        var gm = (d.prices.gemini && d.prices.gemini['__default']) || {};
+        document.getElementById('pGemInput').value = gm.input || 0;
+        document.getElementById('pGemOutput').value = gm.output || 0;
+
+        var oa = (d.prices.openai && d.prices.openai['__default']) || {};
+        document.getElementById('pOaiInput').value = oa.input || 0;
+        document.getElementById('pOaiOutput').value = oa.output || 0;
+
+        var cl = (d.prices.claude && d.prices.claude['__default']) || {};
+        document.getElementById('pClInput').value = cl.input || 0;
+        document.getElementById('pClOutput').value = cl.output || 0;
+
+        var oc = (d.prices.opencode && d.prices.opencode['__default']) || {};
+        document.getElementById('pOcInput').value = oc.input || 0;
+        document.getElementById('pOcOutput').value = oc.output || 0;
     } catch (e) {}
 }
 
@@ -683,11 +690,11 @@ async function savePricing() {
     try {
         var body = {
             prices: {
-                deepseek: { models: {}, '__default': { input: parseFloat(document.getElementById('pDeepInput').value) || 0, output: parseFloat(document.getElementById('pDeepOutput').value) || 0, cache: parseFloat(document.getElementById('pDeepCache').value) || 0 } },
-                gemini: { models: {}, '__default': { input: parseFloat(document.getElementById('pGemInput').value) || 0, output: parseFloat(document.getElementById('pGemOutput').value) || 0 } },
-                openai: { models: {}, '__default': { input: parseFloat(document.getElementById('pOaiInput').value) || 0, output: parseFloat(document.getElementById('pOaiOutput').value) || 0 } },
-                claude: { models: {}, '__default': { input: parseFloat(document.getElementById('pClInput').value) || 0, output: parseFloat(document.getElementById('pClOutput').value) || 0 } },
-                opencode: { models: {}, '__default': { input: parseFloat(document.getElementById('pOcInput').value) || 0, output: parseFloat(document.getElementById('pOcOutput').value) || 0 } }
+                deepseek: { '__default': { input: parseFloat(document.getElementById('pDeepInput').value) || 0, output: parseFloat(document.getElementById('pDeepOutput').value) || 0, cache: parseFloat(document.getElementById('pDeepCache').value) || 0 } },
+                gemini: { '__default': { input: parseFloat(document.getElementById('pGemInput').value) || 0, output: parseFloat(document.getElementById('pGemOutput').value) || 0 } },
+                openai: { '__default': { input: parseFloat(document.getElementById('pOaiInput').value) || 0, output: parseFloat(document.getElementById('pOaiOutput').value) || 0 } },
+                claude: { '__default': { input: parseFloat(document.getElementById('pClInput').value) || 0, output: parseFloat(document.getElementById('pClOutput').value) || 0 } },
+                opencode: { '__default': { input: parseFloat(document.getElementById('pOcInput').value) || 0, output: parseFloat(document.getElementById('pOcOutput').value) || 0 } }
             }
         };
         var res = await fetch('/api/pricing', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body) });
