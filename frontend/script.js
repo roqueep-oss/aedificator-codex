@@ -707,7 +707,7 @@ async function openCostDashboard() {
     var content = document.getElementById('costDashboardContent');
     content.innerHTML = '<div style="text-align:center;padding:20px;color:#8b949e;">Carregando...</div>';
     try {
-        var res = await fetch('/api/usage/monthly');
+        var res = await apiFetch('/api/usage/monthly');
         var data = await res.json();
         if (!data.months || data.months.length === 0) {
             content.innerHTML = '<div style="text-align:center;padding:20px;color:#8b949e;">Nenhum consumo registrado ainda.</div>';
