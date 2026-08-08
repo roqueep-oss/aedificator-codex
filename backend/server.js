@@ -1621,7 +1621,8 @@ const AGENT_TOOLS = [
     { name: 'browser_click', description: 'Clica em um elemento CSS na página.', parameters: { selector: 'string' } },
     { name: 'browser_type', description: 'Digita texto em um campo input/textarea.', parameters: { selector: 'string', text: 'string' } },
     { name: 'browser_evaluate', description: 'Executa JavaScript na página e retorna o resultado.', parameters: { js: 'string' } },
-    { name: 'browser_console', description: 'Lê os logs do console do browser.', parameters: {} }
+    { name: 'browser_console', description: 'Lê os logs do console do browser.', parameters: {} },
+    { name: 'git_publish', description: 'Publica uma release: faz commit (se houver mudanças), cria tag semver e push para o remote. Use após concluir uma feature.', parameters: { mensagem: 'string (opcional, mensagem do commit)' } }
 ];
 
 async function executeAgentTool(name, args) {
@@ -1734,6 +1735,24 @@ async function executeAgentTool(name, args) {
                 return `✅ Teste criado: ${testPath}\n${testResult || 'Teste executado'}`;
             } catch (e) {
                 return `Erro ao gerar testes: ${e.message}`;
+            }
+        }
+        case 'git_publish': {
+            try {
+                const status = await runGit(['status', '--porcelain'], PROJECT_ROOT);
+                if (status.code !== 0) return 'Erro: git não encontrado ou projeto não é repositório';
+                const hasChanges = status.output.trim().length > 0;
+                const tag = nextVersion(await latestVersionTag());
+                const commitMsg = args.mensagem || `🔖 versão ${tag}`;
+                if (hasChanges) {
+                    await runGit(['add', '-A'], PROJECT_ROOT);
+                    await runGit(['commit', '-m', commitMsg], PROJECT_ROOT);
+                }
+                await runGit(['tag', '-a', tag, '-m', `Release ${tag}`], PROJECT_ROOT);
+                await runGit(['push', 'origin', 'HEAD', '--follow-tags'], PROJECT_ROOT);
+                return `✅ Release ${tag} publicada! ${hasChanges ? '(com alterações commitadas)' : '(sem novas alterações)'}`;
+            } catch (e) {
+                return `Erro ao publicar: ${e.message}`;
             }
         }
         default: {
