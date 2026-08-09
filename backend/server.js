@@ -1498,7 +1498,7 @@ async function callDeepSeek(prompt, onChunk, signal) {
     }
 
     const cachePrefix = getDeepseekCachePrefix();
-    const url = 'https://api.deepseek.com/chat/completions';
+    const url = 'https://api.deepseek.com/v1/chat/completions';
     const response = await fetchWithTimeout(url, {
         method: 'POST',
         headers: {
@@ -2244,7 +2244,7 @@ async function runAgentLoopOpenAI(task, onChunk, signal, provider) {
     const apiKey = provider === 'deepseek' ? config.deepseek.apiKey : config.openai.apiKey;
     if (!apiKey) throw new Error(`Chave ${provider} não configurada`);
     const baseUrl = provider === 'deepseek'
-        ? 'https://api.deepseek.com/chat/completions'
+        ? 'https://api.deepseek.com/v1/chat/completions'
         : 'https://api.openai.com/v1/chat/completions';
     const model = provider === 'deepseek' ? (config.deepseek.model || 'deepseek-v4-flash') : (config.openai.model || 'gpt-4o');
 
