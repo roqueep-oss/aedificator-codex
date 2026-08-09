@@ -156,6 +156,35 @@ function setProjectRoot(newPath) {
     return false;
 }
 
+// ===== LOGGER =====
+const LOG_FILE = path.join(__dirname, 'aedificator.log');
+const logBuffer = [];
+const MAX_LOG_BUFFER = 300;
+
+function logError(type, message, details) {
+    const entry = {
+        ts: new Date().toISOString(),
+        type,
+        message: String(message || '').slice(0, 500),
+        details: details ? String(details).slice(0, 1000) : ''
+    };
+    logBuffer.push(entry);
+    if (logBuffer.length > MAX_LOG_BUFFER) logBuffer.shift();
+    try {
+        fs.appendFileSync(LOG_FILE, `[${entry.ts}] [${entry.type}] ${entry.message}${entry.details ? '\n  ' + entry.details : ''}\n`);
+    } catch (e) {}
+    broadcastLog(entry);
+}
+
+function broadcastLog(entry) {
+    const payload = JSON.stringify({ type: 'log-entry', entry });
+    for (const client of wss.clients) {
+        if (client.readyState === WebSocket.OPEN) {
+            try { client.send(payload); } catch (e) {}
+        }
+    }
+}
+
 // ===== CONFIGURAÇÃO =====
 const OPENCODE_DEFAULT_MODEL = 'opencode/deepseek-v4-flash-free';
 
@@ -1519,13 +1548,17 @@ async function callDeepSeek(prompt, onChunk, signal) {
 
     if (!response.ok) {
         const error = await response.text().catch(() => '');
-        if (response.status === 429) {
-            throw new Error('Limite de requisições da API DeepSeek atingido. Aguarde alguns minutos ou troque de provider.');
+        const statusCode = response.status;
+        let errorMsg;
+        if (statusCode === 429) {
+            errorMsg = 'Limite de requisições da API DeepSeek atingido. Aguarde alguns minutos ou troque de provider.';
+        } else if (statusCode === 402 || error.includes('insufficient_quota')) {
+            errorMsg = 'Créditos da API DeepSeek esgotados. Recarregue em https://platform.deepseek.com ou troque de provider.';
+        } else {
+            errorMsg = `Erro na API DeepSeek: ${statusCode}${error ? ' - ' + error.slice(0, 200) : ''}`;
         }
-        if (response.status === 402 || error.includes('insufficient_quota')) {
-            throw new Error('Créditos da API DeepSeek esgotados. Recarregue em https://platform.deepseek.com ou troque de provider.');
-        }
-        throw new Error(`Erro na API DeepSeek: ${response.status}${error ? ' - ' + error.slice(0, 200) : ''}`);
+        logError('deepseek-api', errorMsg, `status=${statusCode} body=${error.slice(0, 300)}`);
+        throw new Error(errorMsg);
     }
 
     const reader = response.body.getReader();
@@ -5450,6 +5483,12 @@ app.post('/api/git/publish', async (req, res) => {
     }
 });
 
+app.get('/api/logs', (req, res) => {
+    const limit = parseInt(req.query.limit) || 100;
+    const recent = logBuffer.slice(-limit).reverse();
+    res.json({ count: logBuffer.length, logs: recent });
+});
+
 // ===== EXPLORADOR =====
 function getRootLocations() {
     const roots = [];
@@ -5910,6 +5949,7 @@ wss.on('connection', (ws, req) => {
                         }
                         ws.send(JSON.stringify({ type: 'done', summary: plan.resumo || 'Alterações aplicadas', modifiedFiles, command: pendingPlan.task || '' }));
                     } catch (e) {
+                        logError('plan-execute', e.message, pendingPlan?.task || '');
                         ws.send(JSON.stringify({ type: 'error', content: '❌ ' + (e.message || 'Erro na execução') }));
                     } finally {
                         streamController = null;

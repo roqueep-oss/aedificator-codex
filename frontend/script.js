@@ -7477,3 +7477,73 @@ setTimeout(function() {
     initCommandPalette();
     updateStatusBar();
 }, 600);
+
+// ===== LOGS =====
+var _logEntries = [];
+
+async function refreshLogs() {
+    try {
+        var res = await apiFetch('/api/logs?limit=100');
+        var data = await res.json();
+        _logEntries = data.logs || [];
+        renderLogs();
+    } catch (e) {}
+}
+
+function renderLogs() {
+    var content = document.getElementById('logsContent');
+    if (!content) return;
+    if (_logEntries.length === 0) {
+        content.innerHTML = '<div style="color:#484f58;text-align:center;padding:20px;">Nenhum log registrado.</div>';
+        return;
+    }
+    var html = '';
+    var colors = { 'deepseek-api': '#f85149', 'plan-execute': '#f0883e', 'gemini-api': '#58a6ff', 'openai-api': '#3fb950', 'error': '#f85149', 'warn': '#d29922', 'info': '#8b949e' };
+    for (var i = 0; i < _logEntries.length; i++) {
+        var e = _logEntries[i];
+        var color = colors[e.type] || '#8b949e';
+        var time = e.ts.slice(11, 19);
+        html += '<div style="margin-bottom:4px;border-bottom:1px solid #21262d;padding-bottom:4px;">';
+        html += '<span style="color:#484f58;">' + time + '</span> ';
+        html += '<span style="color:' + color + ';">[' + e.type + ']</span> ';
+        html += '<span style="color:#e6edf3;">' + e.message + '</span>';
+        if (e.details) html += '<div style="color:#8b949e;margin-left:12px;">' + e.details.slice(0, 200) + '</div>';
+        html += '</div>';
+    }
+    content.innerHTML = html;
+}
+
+function openLogsModal() {
+    var modal = document.getElementById('logsModal');
+    modal.style.display = 'flex';
+    refreshLogs();
+}
+
+// Recebe logs em tempo real via WebSocket
+if (typeof handleWsMessage === 'function') {
+    var _origWsHandler = handleWsMessage;
+    handleWsMessage = function(msg) {
+        if (msg.type === 'log-entry' && msg.entry) {
+            _logEntries.unshift(msg.entry);
+            if (_logEntries.length > 200) _logEntries.pop();
+            if (document.getElementById('logsModal').style.display === 'flex') renderLogs();
+        }
+        if (_origWsHandler) _origWsHandler(msg);
+    };
+}
+
+// Atualiza badge de erros no botão
+setInterval(function() {
+    var btn = document.getElementById('logsHeaderBtn');
+    if (!btn || !_logEntries.length) return;
+    var recentErrors = _logEntries.filter(function(e) {
+        return e.type === 'deepseek-api' || e.type === 'plan-execute' || e.type === 'error';
+    }).length;
+    if (recentErrors > 0) {
+        btn.style.borderColor = '#f85149';
+        btn.style.color = '#f85149';
+    } else {
+        btn.style.borderColor = '#30363d';
+        btn.style.color = '#8b949e';
+    }
+}, 5000);
