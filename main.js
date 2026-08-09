@@ -200,11 +200,11 @@ function createWindow() {
     const menu = Menu.buildFromTemplate(menuTemplate);
     Menu.setApplicationMenu(menu);
 
-    // Carrega o frontend
-    const indexPath = path.join(__dirname, 'frontend', 'index.html');
-    console.log('📂 Carregando:', indexPath);
+    // Carrega o frontend via HTTP do backend (evita file:// cross-origin e Monaco paths)
+    const frontendUrl = `http://127.0.0.1:${BACKEND_PORT}`;
+    console.log('📂 Carregando:', frontendUrl);
 
-    mainWindow.loadFile(indexPath)
+    mainWindow.loadURL(frontendUrl)
         .then(() => {
             console.log('✅ Página carregada!');
         })
