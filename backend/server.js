@@ -1983,7 +1983,45 @@ async function executeAgentTool(name, args) {
             try { const r = await redoLastChange(); return r || 'Nada para refazer'; } catch (e) { return `Erro: ${e.message}`; }
         }
         case 'search_replace': {
-            try { const base = resolveSafePath(args.caminho || ''); const pattern = args.padrao || ''; const replacement = args.substituto || ''; if (!pattern) return 'Erro: informe o padrão'; const files = base && fs.existsSync(base) ? (fs.statSync(base).isDirectory() ? getAllFiles(base, { n: 0 }).slice(0, 50) : [base]) : getAllFiles(PROJECT_ROOT, { n: 0 }).slice(0, 50); let count = 0; for (const f of files) { if (!fs.statSync(f).isFile()) continue; let content = fs.readFileSync(f, 'utf-8'); const regex = new RegExp(pattern, 'g'); const before = content; content = content.replace(regex, replacement); if (content !== before) { backupFromContent(path.relative(PROJECT_ROOT, f), before); fs.writeFileSync(f, content, 'utf-8'); count++; } } return `${count} arquivo(s) alterado(s)`; } catch (e) { return `Erro: ${e.message}`; }
+            try {
+                const base = resolveSafePath(args.caminho || '');
+                const pattern = args.padrao || '';
+                const replacement = args.substituto || '';
+                if (!pattern) return 'Erro: informe o padrão';
+                const files = base && fs.existsSync(base) ? (fs.statSync(base).isDirectory() ? getAllFiles(base, { n: 0 }).slice(0, 50) : [base]) : getAllFiles(PROJECT_ROOT, { n: 0 }).slice(0, 50);
+                let count = 0;
+                for (const f of files) {
+                    if (!fs.statSync(f).isFile()) continue;
+                    let content = fs.readFileSync(f, 'utf-8');
+                    let before = content;
+                    try {
+                        const regex = new RegExp(pattern, 'g');
+                        content = content.replace(regex, replacement);
+                    } catch (regexErr) {
+                        if (content.includes(pattern)) {
+                            content = content.split(pattern).join(replacement);
+                        } else {
+                            const lines = content.split('\n');
+                            let found = false;
+                            for (let i = 0; i < lines.length; i++) {
+                                const trimmed = lines[i].trim();
+                                if (trimmed && pattern.trim() && (trimmed.includes(pattern.trim()) || pattern.trim().includes(trimmed.slice(0, 40)))) {
+                                    lines[i] = lines[i].replace(pattern.trim(), replacement.trim());
+                                    found = true;
+                                }
+                            }
+                            if (found) content = lines.join('\n');
+                            else continue;
+                        }
+                    }
+                    if (content !== before) {
+                        backupFromContent(path.relative(PROJECT_ROOT, f), before);
+                        fs.writeFileSync(f, content, 'utf-8');
+                        count++;
+                    }
+                }
+                return count > 0 ? `${count} arquivo(s) alterado(s)` : 'Nenhum arquivo alterado (padrão não encontrado em nenhum arquivo). Tente usar write_file para reescrever o arquivo inteiro.';
+            } catch (e) { return `Erro: ${e.message}`; }
         }
         default: {
             if (name === 'browser_content') {
@@ -2095,7 +2133,7 @@ async function runAgentLoopGemini(task, onChunk, signal, mode, history, provider
     const toolDeclarations = getAllToolDeclarations();
 
     let iteration = 0;
-    const maxIterations = 15;
+    const maxIterations = 20;
 
     while (iteration < maxIterations) {
         if (signal && signal.aborted) break;
@@ -2223,11 +2261,14 @@ async function runAgentLoopOpenAI(task, onChunk, signal, provider) {
         { role: 'user', content: task }];
 
     let iteration = 0;
-    const maxIterations = 15;
+    const maxIterations = 20;
+    let filesRead = 0;
 
     while (iteration < maxIterations) {
         if (signal && signal.aborted) break;
         iteration++;
+        if (iteration === 16 && onChunk) onChunk('Sistema', '⚠️ 16/20 iterações — priorize write_file e evite novas leituras\n');
+        if (iteration >= 19 && onChunk) onChunk('Sistema', '⚠️ Última iteração — entregue o resultado agora\n');
 
         const body = { model, messages, tools, tool_choice: 'auto', max_tokens: 4096 };
         if (provider === 'deepseek') {
@@ -2264,6 +2305,7 @@ async function runAgentLoopOpenAI(task, onChunk, signal, provider) {
                 file: args.filePath || args.path || args.file || args.caminho || ''
             }));
             const result = await executeAgentTool(tc.function.name, args);
+            if (tc.function.name === 'read_file') { filesRead++; if (filesRead >= 10) messages.push({ role: 'system', content: '⚠️ Você já leu 10+ arquivos. Use write_file ou search_replace para fazer alterações agora.' }); }
             if (onChunk) onChunk('activity', JSON.stringify({ ev: 'tool_end', id: tc.id, isError: false }));
             messages.push({ role: 'tool', tool_call_id: tc.id, content: String(result).slice(0, 8000) });
         }
@@ -2288,7 +2330,7 @@ async function runAgentLoopClaude(task, onChunk, signal) {
     const messages = [{ role: 'user', content: getAgentSystemPrompt(task) }];
 
     let iteration = 0;
-    const maxIterations = 15;
+    const maxIterations = 20;
 
     while (iteration < maxIterations) {
         if (signal && signal.aborted) break;
