@@ -2176,6 +2176,30 @@ function getAgentSystemPrompt(task) {
     return `${getQualityRules()}\n\nDIRETÓRIO: ${PROJECT_ROOT}\n${fileTree ? '\nESTRUTURA:\n' + fileTree : ''}\n\nTAREFA: ${task}\n\nCICLO: 1.Explore 2.Implemente 3.Compile e corrija erros até passar 4.Gere e execute testes 5.Revise segurança (injeção, XSS, secrets, validação) 6.Reporte resultados. Se for app novo: APP_SPEC.md primeiro.\n\nAPÓS ENTREGAR: pergunte se precisa de ajuste de UI/UX.`;
 }
 
+function getDeepSeekAgentPrompt(task) {
+    const fileTree = getFileTree('', '', { n: 0 }).slice(0, 1500);
+    return `Você é um agente de desenvolvimento expert. Siga estas regras:
+
+1. DIRETÓRIO: ${PROJECT_ROOT}
+${fileTree ? '\nESTRUTURA:\n' + fileTree : ''}
+
+2. TAREFA: ${task}
+
+3. REGRAS DE EXECUÇÃO:
+- Máximo 5 arquivos lidos antes de começar a escrever código
+- Use write_file para criar/modificar (não use search_replace a menos que seja uma mudança de 1 linha)
+- Sempre leia um arquivo antes de modificá-lo
+- Após escrever, valide com analyzer_validate
+- Use git_status e git_diff para ver o que mudou
+- Crie snapshot_create antes de mudanças grandes
+
+4. FORMATO DE RESPOSTA:
+Ao concluir, SEMPRE retorne APENAS o texto da resposta final (sem JSON, sem blocos de código).
+Durante a execução, use as ferramentas livremente.
+
+5. ${getQualityRules().split('\n').slice(0, 3).join('\n')}`;
+}
+
 async function runAgentLoopGemini(task, onChunk, signal, mode, history, provider) {
     const systemPrompt = getAgentSystemPrompt(task);
     const messages = [{ role: 'user', parts: [{ text: systemPrompt }] }];
@@ -2307,7 +2331,8 @@ async function runAgentLoopOpenAI(task, onChunk, signal, provider) {
         }
     }));
 
-    const messages = [{ role: 'system', content: getAgentSystemPrompt(task) },
+    const systemPrompt = provider === 'deepseek' ? getDeepSeekAgentPrompt(task) : getAgentSystemPrompt(task);
+    const messages = [{ role: 'system', content: systemPrompt },
         { role: 'user', content: task }];
 
     let iteration = 0;
