@@ -188,9 +188,16 @@ function broadcastLog(entry) {
 // ===== CONFIGURAÇÃO =====
 function sanitizeForJson(str) {
     if (!str) return '';
-    return str.replace(/[\x00-\x08\x0B\x0C\x0E-\x1F\x7F]/g, '')
-        .replace(/\\x(?![0-9a-fA-F]{2})/g, '\\\\x')
-        .replace(/\\u(?![0-9a-fA-F]{4})/g, '\\\\u');
+    let out = '';
+    for (let i = 0; i < str.length; i++) {
+        const c = str.charCodeAt(i);
+        if (c < 0x20 && c !== 0x09 && c !== 0x0A && c !== 0x0D) continue;
+        if (c === 0x7F) continue;
+        if (c >= 0xD800 && c <= 0xDFFF) { out += '\uFFFD'; continue; }
+        out += str[i];
+    }
+    return out.replace(/\\x[0-9a-fA-F]{0,2}/g, '')
+        .replace(/\\u[0-9a-fA-F]{0,4}/g, '');
 }
 
 const OPENCODE_DEFAULT_MODEL = 'opencode/deepseek-v4-flash-free';
