@@ -166,7 +166,8 @@ let config = {
     },
     deepseek: {
         apiKey: process.env.DEEPSEEK_API_KEY || '',
-        model: 'deepseek-chat'
+        model: 'deepseek-v4-flash',
+        reasoningEffort: 'medium'
     },
     opencode: {
         apiKey: process.env.OPENCODE_API_KEY || '',
@@ -422,6 +423,7 @@ if (fs.existsSync(configPath)) {
         if (savedConfig.gemini?.model) config.gemini.model = savedConfig.gemini.model;
         if (savedConfig.deepseek?.apiKey) config.deepseek.apiKey = decryptSecret(savedConfig.deepseek.apiKey);
         if (savedConfig.deepseek?.model) config.deepseek.model = savedConfig.deepseek.model;
+        if (savedConfig.deepseek?.reasoningEffort) config.deepseek.reasoningEffort = savedConfig.deepseek.reasoningEffort;
         if (savedConfig.opencode?.apiKey) config.opencode.apiKey = decryptSecret(savedConfig.opencode.apiKey);
         if (savedConfig.opencode?.model) config.opencode.model = savedConfig.opencode.model;
         if (savedConfig.openai?.apiKey) config.openai.apiKey = decryptSecret(savedConfig.openai.apiKey);
@@ -437,7 +439,7 @@ if (fs.existsSync(configPath)) {
 function saveConfigToFile() {
     const fileConfig = {
         gemini: { apiKey: encryptSecret(config.gemini.apiKey), model: config.gemini.model },
-        deepseek: { apiKey: encryptSecret(config.deepseek.apiKey), model: config.deepseek.model },
+        deepseek: { apiKey: encryptSecret(config.deepseek.apiKey), model: config.deepseek.model, reasoningEffort: config.deepseek.reasoningEffort },
         opencode: { apiKey: encryptSecret(config.opencode.apiKey), model: config.opencode.model },
         openai: { apiKey: encryptSecret(config.openai.apiKey), model: config.openai.model },
         claude: { apiKey: encryptSecret(config.claude.apiKey), model: config.claude.model }
@@ -1509,6 +1511,8 @@ async function callDeepSeek(prompt, onChunk, signal) {
                 { role: 'system', content: cachePrefix },
                 { role: 'user', content: prompt }
             ],
+            thinking: { type: 'enabled' },
+            reasoning_effort: config.deepseek.reasoningEffort || 'medium',
             stream: true
         })
     }, 120000, signal);
@@ -1528,6 +1532,8 @@ async function callDeepSeek(prompt, onChunk, signal) {
     const decoder = new TextDecoder();
     let fullResponse = '';
     let lastUsage = null;
+    let reasoningBuf = '';
+    let reasoningSent = false;
 
     while (true) {
         if (signal && signal.aborted) break;
@@ -1542,9 +1548,16 @@ async function callDeepSeek(prompt, onChunk, signal) {
                 try {
                     const parsed = JSON.parse(data);
                     const content = parsed.choices?.[0]?.delta?.content || '';
+                    const reasoning = parsed.choices?.[0]?.delta?.reasoning_content || '';
+                    if (reasoning) reasoningBuf += reasoning;
                     if (content) {
+                        if (reasoningBuf && !reasoningSent) {
+                            reasoningSent = true;
+                            if (onChunk) onChunk('reasoning', reasoningBuf);
+                            fullResponse += `\n[🤔 raciocínio: ${reasoningBuf.slice(0, 200)}...]\n`;
+                        }
                         fullResponse += content;
-                        if (onChunk) onChunk(content);
+                        if (onChunk) onChunk('text', content);
                     }
                     if (parsed.usage) lastUsage = parsed.usage;
                 } catch (e) {}
