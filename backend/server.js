@@ -2206,7 +2206,7 @@ async function runAgentLoopOpenAI(task, onChunk, signal, provider) {
     const apiKey = provider === 'deepseek' ? config.deepseek.apiKey : config.openai.apiKey;
     if (!apiKey) throw new Error(`Chave ${provider} não configurada`);
     const baseUrl = provider === 'deepseek'
-        ? 'https://api.deepseek.com/v1/chat/completions'
+        ? 'https://api.deepseek.com/chat/completions'
         : 'https://api.openai.com/v1/chat/completions';
     const model = provider === 'deepseek' ? (config.deepseek.model || 'deepseek-v4-flash') : (config.openai.model || 'gpt-4o');
 
@@ -2229,10 +2229,15 @@ async function runAgentLoopOpenAI(task, onChunk, signal, provider) {
         if (signal && signal.aborted) break;
         iteration++;
 
+        const body = { model, messages, tools, tool_choice: 'auto', max_tokens: 4096 };
+        if (provider === 'deepseek') {
+            body.thinking = { type: 'enabled' };
+            body.reasoning_effort = config.deepseek.reasoningEffort || 'medium';
+        }
         const response = await fetch(baseUrl, {
             method: 'POST',
             headers: { 'Content-Type': 'application/json', 'Authorization': `Bearer ${apiKey}` },
-            body: JSON.stringify({ model, messages, tools, tool_choice: 'auto', max_tokens: 4096 }),
+            body: JSON.stringify(body),
             signal
         });
         if (!response.ok) throw new Error(`${provider} HTTP ${response.status}: ${(await response.text()).slice(0, 300)}`);
