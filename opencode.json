@@ -15,6 +15,14 @@
       "command": "npx",
       "args": ["-y", "@modelcontextprotocol/server-filesystem", "."],
       "enabled": true
+    },
+    "aedificator": {
+      "command": "node",
+      "args": ["backend/mcp-aedificator-server.js"],
+      "enabled": true,
+      "env": {
+        "AED_PROJECT_ROOT": "${PROJECT_ROOT}"
+      }
     }
   }
 }

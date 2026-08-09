@@ -5749,9 +5749,29 @@ wss.on('connection', (ws, req) => {
                 const provider = data.provider || 'gemini';
                 const mode = data.mode || 'cowork';
 
-                if (mode === 'agent' && provider !== 'opencode') {
-                    if (onChunk) onChunk('Sistema', '🤖 Modo Agente — planejando...\n');
-                    await runAgentAndCapture(ws, task, onChunk, streamController, Array.isArray(history) ? history : [], provider);
+                if (mode === 'agent') {
+                    const label = provider === 'opencode' ? '🟣 OpenCode' : provider === 'deepseek' ? '🔵 DeepSeek' : provider === 'gemini' ? '🟢 Gemini' : provider === 'claude' ? '🟣 Claude' : '🤖 ' + provider.toUpperCase();
+                    if (onChunk) onChunk('Sistema', label + ' — executando...\n');
+                    const beforeContents = snapshotProjectContents();
+                    const before = snapshotProjectFiles();
+                    let fullResponse = '';
+                    await callOpenCode(task, (chunk) => {
+                        fullResponse += chunk;
+                        if (onChunk) onChunk('Assistente', chunk);
+                    }, streamController.signal, null, (toolEvent) => {
+                        if (onChunk) onChunk('activity', JSON.stringify(toolEvent));
+                    });
+                    const changes = diffSnapshots(before, snapshotProjectFiles());
+                    for (const change of changes) {
+                        if (change.action === 'modificar' || change.action === 'deletar') {
+                            const orig = beforeContents.get(change.file);
+                            if (orig !== undefined) backupFromContent(change.file, orig);
+                        }
+                        if (onChunk) onChunk('file-status', JSON.stringify([{ file: change.file, action: change.action, status: change.action === 'criar' ? 'created' : 'deleted' }]));
+                    }
+                    ws.send(JSON.stringify({ type: 'refresh' }));
+                    const summary = changes.length > 0 ? `${changes.length} arquivo(s) alterado(s)` : (fullResponse.slice(0, 200).trim() || 'Concluído');
+                    ws.send(JSON.stringify({ type: 'done', summary, modifiedFiles: changes.map(c => c.file), command: task }));
                     return;
                 }
 
@@ -6173,7 +6193,7 @@ wss.on('connection', (ws, req) => {
     });
 });
 
-module.exports = { app, server, resolveSafePath, extractJson, setProjectRoot, writeFileContent, readFileContent, listBackups, analyzeTask, executePlan, parseJsonC, buildOpenCodePrompt, snapshotProjectFiles, diffSnapshots, parseRemoteUrl, nextVersion, detectRepo, latestVersionTag, runner, formatCode, pushUndoState, undoStack, redoStack };
+module.exports = { app, server, resolveSafePath, extractJson, setProjectRoot, writeFileContent, readFileContent, listBackups, analyzeTask, executePlan, executeAgentTool, parseJsonC, buildOpenCodePrompt, snapshotProjectFiles, diffSnapshots, parseRemoteUrl, nextVersion, detectRepo, latestVersionTag, runner, formatCode, pushUndoState, undoStack, redoStack };
 
 // =============================================
 let mcpConfigs = [];
