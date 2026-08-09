@@ -5740,30 +5740,11 @@ wss.on('connection', (ws, req) => {
 
                 if (mode === 'agent' && provider !== 'opencode') {
                     if (onChunk) onChunk('Sistema', '🤖 Modo Agente — planejando...\n');
-                    const plan = await analyzeTask(task, onChunk, streamController.signal, mode, Array.isArray(history) ? history : [], provider);
-                    const hasSug = Array.isArray(plan.sugestoes) && plan.sugestoes.length > 0;
-                    const hasArq = Array.isArray(plan.arquivos) && plan.arquivos.length > 0;
-
-                    if (hasSug || hasArq) {
-                        const planId = crypto.randomBytes(8).toString('hex');
-                        pendingPlan = { id: planId, plan, controller: streamController, task, provider, mode };
-                        const payload = { type: 'approval', planId, resumo: plan.resumo || 'Plano do agente', total: hasSug ? plan.sugestoes.length : plan.arquivos.length };
-                        if (hasSug) {
-                            payload.sugestoes = plan.sugestoes.map((s, i) => ({ id: s.id || 's'+(i+1), titulo: s.titulo || '', descricao: s.descricao || '', impacto: s.impacto || 'médio', arquivos: (s.arquivos || []).map(a => ({ caminho: a.caminho, acao: a.acao || 'modificar', explicacao: a.explicacao || '', conteudo: a.conteudo || '' })) }));
-                        } else {
-                            payload.arquivos = plan.arquivos.map(a => ({ caminho: a.caminho, acao: a.acao || 'modificar', explicacao: a.explicacao || '', conteudo: a.conteudo || '' }));
-                        }
-                        ws.send(JSON.stringify(payload));
-                    } else {
-                        if (onChunk) onChunk('Sistema', '🔨 Executando agente...\n');
-                        await runAgentAndCapture(ws, task, onChunk, streamController, Array.isArray(history) ? history : [], provider);
-                    }
+                    await runAgentAndCapture(ws, task, onChunk, streamController, Array.isArray(history) ? history : [], provider);
                     return;
                 }
 
                 if (provider === 'opencode' || (model && model.startsWith('opencode/'))) {
-                    const openCodeModel = (model && model.startsWith('opencode/')) ? model.slice('opencode/'.length) : null;
-                    if (onChunk) onChunk('Assistente', '🟣 opencode executando...\n');
                     const openPrompt = buildOpenCodePrompt(task, mode, Array.isArray(history) ? history : []);
                     const beforeContents = snapshotProjectContents();
                     const before = snapshotProjectFiles();
@@ -5771,7 +5752,7 @@ wss.on('connection', (ws, req) => {
                     await callOpenCode(openPrompt, (chunk) => {
                         ocFullResponse += chunk;
                         if (onChunk) onChunk('Assistente', chunk);
-                    }, streamController.signal, openCodeModel, (toolEvent) => {
+                    }, streamController.signal, null, (toolEvent) => {
                         if (onChunk) onChunk('activity', JSON.stringify(toolEvent));
                     });
                     const changes = diffSnapshots(before, snapshotProjectFiles());
