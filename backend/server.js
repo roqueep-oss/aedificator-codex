@@ -186,6 +186,13 @@ function broadcastLog(entry) {
 }
 
 // ===== CONFIGURAÇÃO =====
+function sanitizeForJson(str) {
+    if (!str) return '';
+    return str.replace(/[\x00-\x08\x0B\x0C\x0E-\x1F\x7F]/g, '')
+        .replace(/\\x(?![0-9a-fA-F]{2})/g, '\\\\x')
+        .replace(/\\u(?![0-9a-fA-F]{4})/g, '\\\\u');
+}
+
 const OPENCODE_DEFAULT_MODEL = 'opencode/deepseek-v4-flash-free';
 
 let config = {
@@ -1528,22 +1535,25 @@ async function callDeepSeek(prompt, onChunk, signal) {
 
     const cachePrefix = getDeepseekCachePrefix();
     const url = 'https://api.deepseek.com/chat/completions';
+    const safePrompt = sanitizeForJson(prompt);
+    const safeSystem = sanitizeForJson(cachePrefix);
+    const body = JSON.stringify({
+        model: config.deepseek.model || 'deepseek-v4-flash',
+        messages: [
+            { role: 'system', content: safeSystem },
+            { role: 'user', content: safePrompt }
+        ],
+        thinking: { type: 'enabled' },
+        reasoning_effort: config.deepseek.reasoningEffort || 'medium',
+        stream: true
+    });
     const response = await fetchWithTimeout(url, {
         method: 'POST',
         headers: {
             'Content-Type': 'application/json',
             'Authorization': `Bearer ${apiKey}`
         },
-        body: JSON.stringify({
-            model: config.deepseek.model || 'deepseek-v4-flash',
-            messages: [
-                { role: 'system', content: cachePrefix },
-                { role: 'user', content: prompt }
-            ],
-            thinking: { type: 'enabled' },
-            reasoning_effort: config.deepseek.reasoningEffort || 'medium',
-            stream: true
-        })
+        body
     }, 120000, signal);
 
     if (!response.ok) {
