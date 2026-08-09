@@ -2177,27 +2177,23 @@ function getAgentSystemPrompt(task) {
 }
 
 function getDeepSeekAgentPrompt(task) {
-    const fileTree = getFileTree('', '', { n: 0 }).slice(0, 1500);
-    return `Você é um agente de desenvolvimento expert. Siga estas regras:
+    const fileTree = getFileTree('', '', { n: 0 }).slice(0, 1200);
+    return `Você é um agente de desenvolvimento. REGRAS ABSOLUTAS:
 
 1. DIRETÓRIO: ${PROJECT_ROOT}
-${fileTree ? '\nESTRUTURA:\n' + fileTree : ''}
+${fileTree ? 'ESTRUTURA:\n' + fileTree : '(pasta vazia)'}
 
 2. TAREFA: ${task}
 
-3. REGRAS DE EXECUÇÃO:
-- Máximo 5 arquivos lidos antes de começar a escrever código
-- Use write_file para criar/modificar (não use search_replace a menos que seja uma mudança de 1 linha)
-- Sempre leia um arquivo antes de modificá-lo
-- Após escrever, valide com analyzer_validate
-- Use git_status e git_diff para ver o que mudou
-- Crie snapshot_create antes de mudanças grandes
+3. COMPORTAMENTO OBRIGATÓRIO:
+- ⛔ MÁXIMO 5 LEITURAS de arquivos. Depois disso, APENAS write_file
+- ⛔ NUNCA leia o mesmo arquivo duas vezes
+- ✅ Use list_files 1x no início para ver a estrutura
+- ✅ Use read_file APENAS nos arquivos que vai modificar
+- ✅ Use write_file para criar/modificar arquivos INTEIROS
+- ✅ Após todas as alterações, retorne APENAS o texto final da resposta
 
-4. FORMATO DE RESPOSTA:
-Ao concluir, SEMPRE retorne APENAS o texto da resposta final (sem JSON, sem blocos de código).
-Durante a execução, use as ferramentas livremente.
-
-5. ${getQualityRules().split('\n').slice(0, 3).join('\n')}`;
+4. ${getQualityRules().split('\\n').slice(0, 2).join('\\n')}`;
 }
 
 async function runAgentLoopGemini(task, onChunk, signal, mode, history, provider) {
@@ -2342,8 +2338,9 @@ async function runAgentLoopOpenAI(task, onChunk, signal, provider) {
     while (iteration < maxIterations) {
         if (signal && signal.aborted) break;
         iteration++;
-        if (iteration === 16 && onChunk) onChunk('Sistema', '⚠️ 16/20 iterações — priorize write_file e evite novas leituras\n');
-        if (iteration >= 19 && onChunk) onChunk('Sistema', '⚠️ Última iteração — entregue o resultado agora\n');
+        if (filesRead >= 5 && onChunk) onChunk('Sistema', '⚠️ Já leu 5+ arquivos. Use AGORA write_file para fazer alterações.\n');
+        if (iteration === 10 && onChunk) onChunk('Sistema', '⚠️ Iteração 10/20 — PARE de ler e FAÇA as alterações com write_file.\n');
+        if (iteration >= 18 && onChunk) onChunk('Sistema', '⚠️ Últimas iterações — entregue o resultado JÁ.\n');
 
         const body = { model, messages, tools, tool_choice: 'auto', max_tokens: 4096 };
         const response = await fetch(baseUrl, {
@@ -2376,7 +2373,12 @@ async function runAgentLoopOpenAI(task, onChunk, signal, provider) {
                 file: args.filePath || args.path || args.file || args.caminho || ''
             }));
             const result = await executeAgentTool(tc.function.name, args);
-            if (tc.function.name === 'read_file') { filesRead++; if (filesRead >= 10) messages.push({ role: 'system', content: '⚠️ Você já leu 10+ arquivos. Use write_file ou search_replace para fazer alterações agora.' }); }
+            if (tc.function.name === 'read_file' || tc.function.name === 'list_files') {
+                filesRead++;
+                if (filesRead === 8) {
+                    messages.push({ role: 'system', content: '⚠️ VOCÊ JÁ LEU 8 ARQUIVOS. NÃO LEIA MAIS NADA. Use write_file AGORA para fazer as alterações. Não use mais read_file, list_files ou search_code.' });
+                }
+            }
             if (onChunk) onChunk('activity', JSON.stringify({ ev: 'tool_end', id: tc.id, isError: false }));
             messages.push({ role: 'tool', tool_call_id: tc.id, content: String(result).slice(0, 8000) });
         }
