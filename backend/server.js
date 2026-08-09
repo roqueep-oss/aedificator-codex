@@ -2321,10 +2321,6 @@ async function runAgentLoopOpenAI(task, onChunk, signal, provider) {
         if (iteration >= 19 && onChunk) onChunk('Sistema', '⚠️ Última iteração — entregue o resultado agora\n');
 
         const body = { model, messages, tools, tool_choice: 'auto', max_tokens: 4096 };
-        if (provider === 'deepseek') {
-            body.thinking = { type: 'enabled' };
-            body.reasoning_effort = config.deepseek.reasoningEffort || 'medium';
-        }
         const response = await fetch(baseUrl, {
             method: 'POST',
             headers: { 'Content-Type': 'application/json', 'Authorization': `Bearer ${apiKey}` },
