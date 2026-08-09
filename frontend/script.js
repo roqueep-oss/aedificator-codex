@@ -4797,8 +4797,8 @@ var PROVIDER_MODELS = {
         { value: 'gemini-2.5-pro', label: 'Gemini 2.5 Pro' }
     ],
     deepseek: [
-        { value: 'deepseek-chat', label: 'DeepSeek V3' },
-        { value: 'deepseek-reasoner', label: 'DeepSeek R1' }
+        { value: 'deepseek-v4-flash', label: 'DeepSeek V4 Flash' },
+        { value: 'deepseek-v4-pro', label: 'DeepSeek V4 Pro' }
     ],
     openai: [
         { value: 'gpt-4o', label: 'GPT-4o' },

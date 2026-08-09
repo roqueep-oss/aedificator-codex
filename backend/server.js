@@ -187,8 +187,8 @@ const TOKEN_PRICES = {
     deepseek: {
         '__default': { input: 0.14, output: 0.28, cache: 0.0028 },
         models: {
-            'deepseek-chat': { input: 0.14, output: 0.28, cache: 0.0028 },
-            'deepseek-reasoner': { input: 0.55, output: 2.19, cache: 0.14 }
+            'deepseek-v4-flash': { input: 0.14, output: 0.28, cache: 0.0028 },
+            'deepseek-v4-pro': { input: 0.435, output: 0.87, cache: 0.0036 }
         }
     },
     gemini: {
@@ -268,8 +268,8 @@ async function fetchAiPrices(forceRefresh) {
 
 {
   "deepseek": {
-    "deepseek-chat": {"input": 0.14, "output": 0.28, "cache": 0.0028},
-    "deepseek-reasoner": {"input": 0.55, "output": 2.19, "cache": 0.14}
+    "deepseek-v4-flash": {"input": 0.14, "output": 0.28, "cache": 0.0028},
+    "deepseek-v4-pro": {"input": 0.435, "output": 0.87, "cache": 0.0036}
   },
   "gemini": {
     "gemini-2.5-flash": {"input": 0.15, "output": 0.60},
@@ -1477,7 +1477,7 @@ let _deepseekCachePrefix = '';
 let _deepseekCacheKey = '';
 
 function getDeepseekCachePrefix() {
-    const key = PROJECT_ROOT + '|' + (config.deepseek.model || 'deepseek-chat');
+    const key = PROJECT_ROOT + '|' + (config.deepseek.model || 'deepseek-v4-flash');
     if (_deepseekCachePrefix && _deepseekCacheKey === key) return _deepseekCachePrefix;
     _deepseekCacheKey = key;
     _deepseekCachePrefix = getQualityRules() + '\nDIRETÓRIO: ' + PROJECT_ROOT + '\n';
@@ -1496,7 +1496,7 @@ async function callDeepSeek(prompt, onChunk, signal) {
     }
 
     const cachePrefix = getDeepseekCachePrefix();
-    const url = 'https://api.deepseek.com/v1/chat/completions';
+    const url = 'https://api.deepseek.com/chat/completions';
     const response = await fetchWithTimeout(url, {
         method: 'POST',
         headers: {
@@ -1504,7 +1504,7 @@ async function callDeepSeek(prompt, onChunk, signal) {
             'Authorization': `Bearer ${apiKey}`
         },
         body: JSON.stringify({
-            model: config.deepseek.model || 'deepseek-chat',
+            model: config.deepseek.model || 'deepseek-v4-flash',
             messages: [
                 { role: 'system', content: cachePrefix },
                 { role: 'user', content: prompt }
@@ -2195,7 +2195,7 @@ async function runAgentLoopOpenAI(task, onChunk, signal, provider) {
     const baseUrl = provider === 'deepseek'
         ? 'https://api.deepseek.com/v1/chat/completions'
         : 'https://api.openai.com/v1/chat/completions';
-    const model = provider === 'deepseek' ? (config.deepseek.model || 'deepseek-chat') : (config.openai.model || 'gpt-4o');
+    const model = provider === 'deepseek' ? (config.deepseek.model || 'deepseek-v4-flash') : (config.openai.model || 'gpt-4o');
 
     const tools = getAllToolDeclarations().map(t => ({
         type: 'function',
