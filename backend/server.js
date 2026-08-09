@@ -196,8 +196,19 @@ function sanitizeForJson(str) {
         if (c >= 0xD800 && c <= 0xDFFF) { out += '\uFFFD'; continue; }
         out += str[i];
     }
-    return out.replace(/\\x[0-9a-fA-F]{0,2}/g, '')
-        .replace(/\\u[0-9a-fA-F]{0,4}/g, '');
+    return out;
+}
+
+function safeJsonStringify(obj) {
+    try {
+        return JSON.stringify(obj);
+    } catch (e) {
+        const clean = JSON.parse(JSON.stringify(obj, (key, value) => {
+            if (typeof value === 'string') return sanitizeForJson(value);
+            return value;
+        }));
+        return JSON.stringify(clean);
+    }
 }
 
 const OPENCODE_DEFAULT_MODEL = 'opencode/deepseek-v4-flash-free';
@@ -797,7 +808,7 @@ async function callGemini(prompt, onChunk, signal) {
     const response = await fetchWithTimeout(url, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
+        body: safeJsonStringify({
             contents: [{ parts: [{ text: prompt }] }]
         })
     }, 120000, signal);
@@ -1544,7 +1555,7 @@ async function callDeepSeek(prompt, onChunk, signal) {
     const url = 'https://api.deepseek.com/chat/completions';
     const safePrompt = sanitizeForJson(prompt);
     const safeSystem = sanitizeForJson(cachePrefix);
-    const body = JSON.stringify({
+    const body = safeJsonStringify({
         model: config.deepseek.model || 'deepseek-v4-flash',
         messages: [
             { role: 'system', content: safeSystem },
@@ -2346,7 +2357,7 @@ async function runAgentLoopOpenAI(task, onChunk, signal, provider) {
         const response = await fetch(baseUrl, {
             method: 'POST',
             headers: { 'Content-Type': 'application/json', 'Authorization': `Bearer ${apiKey}` },
-            body: JSON.stringify(body),
+            body: safeJsonStringify(body),
             signal
         });
         if (!response.ok) throw new Error(`${provider} HTTP ${response.status}: ${(await response.text()).slice(0, 300)}`);
@@ -2412,7 +2423,7 @@ async function runAgentLoopClaude(task, onChunk, signal) {
         const response = await fetch('https://api.anthropic.com/v1/messages', {
             method: 'POST',
             headers: { 'Content-Type': 'application/json', 'x-api-key': apiKey, 'anthropic-version': '2023-06-01' },
-            body: JSON.stringify({ model, max_tokens: 4096, messages, tools }),
+            body: safeJsonStringify({ model, max_tokens: 4096, messages, tools }),
             signal
         });
         if (!response.ok) throw new Error(`Claude HTTP ${response.status}: ${(await response.text()).slice(0, 300)}`);
