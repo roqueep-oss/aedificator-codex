@@ -26,13 +26,24 @@ function startServer(token) {
     return { child, projectRoot };
 }
 
+// No Windows, matar o processo é imediato mas a pasta ainda pode ficar presa
+// (servidor + filhos MCP/opencode segurando handles). Aguarda o exit e tenta
+// a limpeza com retry antes de desistir — evita EPERM falso.
 function stopServer(child, projectRoot) {
-    if (process.platform === 'win32') {
-        try { require('child_process').execSync(`taskkill /F /PID ${child.pid} /T`, { stdio: 'ignore' }); } catch (_) {}
-    } else {
-        child.kill('SIGKILL');
-    }
-    try { fs.rmSync(projectRoot, { recursive: true, force: true }); } catch (_) {}
+    return new Promise((resolve) => {
+        if (process.platform === 'win32') {
+            try { require('child_process').execSync(`taskkill /F /PID ${child.pid} /T`, { stdio: 'ignore' }); } catch (_) {}
+        } else {
+            child.kill('SIGKILL');
+        }
+        let cleaned = false;
+        const attempt = (n) => {
+            if (cleaned) return;
+            try { fs.rmSync(projectRoot, { recursive: true, force: true }); cleaned = true; resolve(); }
+            catch (_) { if (n >= 3) resolve(); else setTimeout(() => attempt(n + 1), 300); }
+        };
+        setTimeout(() => attempt(0), 300);
+    });
 }
 
 function waitForPort(timeoutMs = 10000) {

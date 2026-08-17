@@ -22,7 +22,24 @@ function startServer() {
     child.stderr.on('data', () => {});
     return { child, projectRoot };
 }
-function stopServer(child, root) { child.kill(); fs.rmSync(root, { recursive: true, force: true }); }
+// No Windows, child.kill() retorna antes do processo realmente sair — e o
+// servidor ainda segura a pasta (ou processos-filhos do MCP/opencode). Usamos
+// taskkill /T (mata a árvore inteira) e aguardamos o exit antes de remover a
+// pasta, com retry para tolerar o release lento de handles.
+function stopServer(child, root) {
+    return new Promise((resolve) => {
+        if (process.platform === 'win32') {
+            try { require('child_process').execSync(`taskkill /F /PID ${child.pid} /T`, { stdio: 'ignore' }); } catch (_) {}
+        } else {
+            child.kill('SIGKILL');
+        }
+        const attempt = (n) => {
+            try { fs.rmSync(root, { recursive: true, force: true }); resolve(); }
+            catch (e) { if (n >= 3) resolve(); else setTimeout(() => attempt(n + 1), 300); }
+        };
+        setTimeout(() => attempt(0), 300);
+    });
+}
 function waitForPort(t = 10000) {
     return new Promise((res, rej) => {
         const s = Date.now();
@@ -69,6 +86,6 @@ test('snapshot: criar, listar, diff e restaurar', async (t) => {
         assert.equal(fs.existsSync(path.join(projectRoot, 'novo.txt')), true);
         assert.equal(fs.readFileSync(path.join(projectRoot, 'sub', 'b.txt'), 'utf-8'), 'conteudo B');
     } finally {
-        stopServer(child, projectRoot);
+        await stopServer(child, projectRoot);
     }
 });

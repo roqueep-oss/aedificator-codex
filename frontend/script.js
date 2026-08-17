@@ -982,8 +982,8 @@ async function openCostDashboard() {
             var label = monthNames[parseInt(dateLabel[1])-1] + ' ' + dateLabel[0];
             html += '<tr style="border-bottom:1px solid #21262d;">';
             html += '<td style="padding:6px 8px;color:#e6edf3;">' + label + '</td>';
-            for (var p2 in data.providers) {
-                var pdata = m.providers[p2];
+            for (var pKey in data.providers) {
+                var pdata = m.providers[pKey];
                 var val = pdata ? pdata.cost_brl : 0;
                 var color = val > 0 ? (val > 5 ? '#f85149' : '#e6edf3') : '#484f58';
                 html += '<td style="text-align:right;padding:6px 8px;color:' + color + ';">' + (val > 0 ? 'R$ ' + val.toFixed(2).replace('.', ',') : '—') + '</td>';
@@ -1150,7 +1150,7 @@ function armNoProgressTimer() {
     }, 60000);
 }
 
-function handleWsMessage(data) {
+let handleWsMessage = function(data) {
     // Qualquer mensagem vinda do backend enquanto uma tarefa está ativa é sinal
     // de que o agente ainda está trabalhando — renova o watchdog de stream.
     if (isStreaming) resetStreamTimeout();
@@ -1428,8 +1428,8 @@ function handleWsMessage(data) {
     }
 
     if (data.type === 'test-failed') {
-        var outEl = document.getElementById('bottomOutputContent');
-        if (outEl) outEl.textContent = data.message || 'Testes falharam';
+        var outElFailed = document.getElementById('bottomOutputContent');
+        if (outElFailed) outElFailed.textContent = data.message || 'Testes falharam';
         toggleBottomPanel('output');
         setActivityStatus('test', 'error');
         updateTestAgentChat('\u274C ' + String(data.message || 'Testes falharam').slice(0, 600));
@@ -1458,8 +1458,8 @@ function handleWsMessage(data) {
     }
 
     if (data.type === 'remote-output') {
-        var out = document.getElementById('bottomTerminalOutput');
-        if (out) { out.textContent += data.text || ''; out.scrollTop = out.scrollHeight; }
+        var outRemote = document.getElementById('bottomTerminalOutput');
+        if (outRemote) { outRemote.textContent += data.text || ''; outRemote.scrollTop = outRemote.scrollHeight; }
         return;
     }
 
@@ -1489,11 +1489,11 @@ function handleWsMessage(data) {
     if (data.type === 'cancelled') {
         if (concludeTimer) { clearTimeout(concludeTimer); concludeTimer = null; }
         taskConcluded = true;
-        var msg = data.restoredCount ? `⏹️ Cancelado — ${data.restoredCount} arquivo(s) restaurado(s)` : '⏹️ Tarefa cancelada';
+        var cancelledMsg = data.restoredCount ? `⏹️ Cancelado — ${data.restoredCount} arquivo(s) restaurado(s)` : '⏹️ Tarefa cancelada';
         if (data.restoredFiles && data.restoredFiles.length) {
-            msg += '\n↩ ' + data.restoredFiles.join('\n↩ ');
+            cancelledMsg += '\n↩ ' + data.restoredFiles.join('\n↩ ');
         }
-        endTask(msg);
+        endTask(cancelledMsg);
         return;
     }
 
@@ -2246,7 +2246,7 @@ async function deleteFilePrompt(filePath, name) {
 // =============================================
 //  SALVAR ABA ATIVA (EDITOR)
 // =============================================
-async function saveFileEditor() {
+let saveFileEditor = async function() {
     const tab = editorTabs.find(t => t.path === activeTabPath);
     if (!tab || tab.isImage) return;
     let content = getEditorContent();
@@ -2574,7 +2574,7 @@ function renderSearchResults(results, query) {
 // =============================================
 //  EXECUTAR COMANDOS (TERMINAL)
 // =============================================
-function openTerminal() {
+let openTerminal = function() {
     if (!currentProjectPath) {
         showToast('📁 Selecione uma pasta primeiro!');
         return;
@@ -4228,7 +4228,7 @@ function renderAgentTodos(todos) {
     addMessage('system', '📋 Plano de tarefas:\n' + lines);
 }
 
-function showApprovalModal(data) {
+let showApprovalModal = function(data) {
     const hasSugestoes = data.sugestoes && Array.isArray(data.sugestoes) && data.sugestoes.length > 0;
     const hasArquivos = data.arquivos && data.arquivos.length > 0;
 
@@ -6066,7 +6066,7 @@ function colorizeCodeBlocks(container) {
 
 function openReferencedFile(filePath) {
     if (!filePath) return;
-    loadTabInEditor(filePath, true);
+    openFile(filePath);
 }
 
 function openFileAtLine(filePath, line) {
@@ -6341,7 +6341,7 @@ function browserNavigate() {
 
 function browserRefresh() {
     const f = document.getElementById('browserIframe');
-    if (f) { f.src = f.src; showToast('🔄 Atualizado'); }
+    if (f) { const src = f.src; f.src = src; showToast('🔄 Atualizado'); }
 }
 
 function browserStartDrag(e) {
@@ -6373,7 +6373,7 @@ saveFileEditor = async function() {
         const panel = document.getElementById('browserPanel');
         if (panel && panel.classList.contains('show')) {
             const iframe = document.getElementById('browserIframe');
-            if (iframe) iframe.src = iframe.src;
+            if (iframe) { const src = iframe.src; iframe.src = src; }
         }
     }
     return result;
@@ -6467,20 +6467,20 @@ showApprovalModal = function(data) {
             }
         }
         if (previewFiles.length > 0) {
-            var previewHtml = '';
-            for (const f of previewFiles) {
-                var icon = f.acao === 'criar' ? '\uD83C\uDD95' : f.acao === 'deletar' ? '\uD83D\uDDD1\uFE0F' : '\u270F\uFE0F';
-                previewHtml += '<div class="approval-preview-file" style="margin-top:8px;padding:4px 8px;background:#0d1117;border-radius:4px;cursor:pointer;font-family:Consolas,monospace;font-size:11px;" data-file="' + escapeHtml(f.caminho) + '" data-content="' + escapeHtml(f.conteudo || '') + '" data-acao="' + escapeHtml(f.acao || '') + '">' +
-                    icon + ' <b>' + escapeHtml(f.caminho.split(/[\\/]/).pop()) + '</b> — ' + (f.acao || 'modificar') + ' [' + escapeHtml(f.sugestaoTitulo) + '] — clique para preview</div>';
+            var previewHtml2 = '';
+            for (const f2 of previewFiles) {
+                var icon2 = f2.acao === 'criar' ? '\uD83C\uDD95' : f2.acao === 'deletar' ? '\uD83D\uDDD1\uFE0F' : '\u270F\uFE0F';
+                previewHtml2 += '<div class="approval-preview-file" style="margin-top:8px;padding:4px 8px;background:#0d1117;border-radius:4px;cursor:pointer;font-family:Consolas,monospace;font-size:11px;" data-file="' + escapeHtml(f2.caminho) + '" data-content="' + escapeHtml(f2.conteudo || '') + '" data-acao="' + escapeHtml(f2.acao || '') + '">' +
+                    icon2 + ' <b>' + escapeHtml(f2.caminho.split(/[\\/]/).pop()) + '</b> — ' + (f2.acao || 'modificar') + ' [' + escapeHtml(f2.sugestaoTitulo) + '] — clique para preview</div>';
             }
-            var resumoEl = document.getElementById('approvalResumo');
-            var existingPreview = document.getElementById('approvalDiffPreview');
-            if (existingPreview) existingPreview.remove();
-            var div = document.createElement('div');
-            div.id = 'approvalDiffPreview';
-            div.innerHTML = previewHtml;
-            resumoEl.parentNode.insertBefore(div, resumoEl.nextSibling);
-            div.querySelectorAll('.approval-preview-file').forEach(function(el) {
+            var resumoEl2 = document.getElementById('approvalResumo');
+            var existingPreview2 = document.getElementById('approvalDiffPreview');
+            if (existingPreview2) existingPreview2.remove();
+            var div2 = document.createElement('div');
+            div2.id = 'approvalDiffPreview';
+            div2.innerHTML = previewHtml2;
+            resumoEl2.parentNode.insertBefore(div2, resumoEl2.nextSibling);
+            div2.querySelectorAll('.approval-preview-file').forEach(function(el) {
                 el.addEventListener('click', function() {
                     var filePath = el.dataset.file;
                     var content = el.dataset.content;
@@ -6955,7 +6955,7 @@ function executeMenuAction(action) {
         case 'findInFiles': document.getElementById('searchInput')?.focus(); break;
         case 'openSearchInFiles': openSearchInFiles(); break;
         case 'openFindReplacePreview': openFindReplacePreview(); break;
-        case 'openFindReplace': if (typeof openFindReplace==='function') openFindReplace(); else showToast('Use Ctrl+Shift+H para buscar e substituir'); break;
+        case 'openFindReplace': openFindReplacePreview(); break;
         case 'copyFile': showToast('📋 Clique direito no arquivo no explorador para copiar'); break;
         case 'pasteFile': showToast('📋 Clique direito no explorador para colar'); break;
         case 'renameFile': showToast('✏️ Clique direito no arquivo ou pressione F2 para renomear'); break;
@@ -8221,7 +8221,7 @@ function bottomTerminalSend() {
     }).catch(function(e) { out.textContent += e.message + '\n'; out.scrollTop = out.scrollHeight; });
 }
 
-function updateBottomProblems(errorsList) {
+let updateBottomProblems = function(errorsList) {
     var content = document.getElementById('bottomProblemsContent');
     var countEl = document.getElementById('statusErrors');
     if (!content) return;
@@ -8625,10 +8625,10 @@ function openOpenCodeModelBrowser() {
     var currentProvider = '';
     var isWide = models.length > 20;
 
-    for (var i = 0; i < models.length; i++) {
-        var m = models[i];
+    for (var k = 0; k < models.length; k++) {
+        var m = models[k];
         // Extrai provider do label se possivel (Go models tem "Go · nome" no label)
-        var label = m.label.replace(/^[🟣💎]\s*/, '');
+        var label = m.label.replace(/^[🟣💎]\s*/u, '');
         var provider = '';
         var parts = label.split(' · ');
         if (parts.length > 1) { provider = parts[0]; label = parts.slice(1).join(' · '); }

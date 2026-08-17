@@ -20,7 +20,7 @@
     "dist": "electron-builder --win --x64",
     "postinstall": "electron-builder install-app-deps",
     "lint": "eslint .",
-    "test": "node --test",
+    "test": "node --test --test-force-exit --test-concurrency=1",
     "version:patch": "npm version patch && npm run publish:all",
     "version:minor": "npm version minor && npm run publish:all",
     "version:major": "npm version major && npm run publish:all",
@@ -73,7 +73,6 @@
         }
       ],
       "icon": "build/icon.ico",
-      "publisherName": "Aedificator Codex IDE",
       "verifyUpdateCodeSignature": true,
       "signAndEditExecutable": true
     },
