@@ -55,3 +55,103 @@ Código perfeito é código testado. Testes unitários e de integração garante
 | Modularização e baixo acoplamento           | Classes/módulos dependentes de dezenas de outros    |
 | Testes unitários cobrindo fluxos críticos   | Entregar código sem validação automatizada          |
 | Código simples e direto                     | Over-engineering e padrões desnecessários           |
+
+## Arquitetura do Projeto
+
+```
+aedificator-codex/
+├── main.js              → Electron main process (janela, spawn do backend)
+├── preload.js           → Ponte segura entre renderer e Node.js
+│
+├── frontend/            → SPA servida pelo Express (vanilla HTML/CSS/JS)
+│   ├── index.html       → Layout principal (explorer, editor, chat, modals)
+│   ├── script.js        → Toda a lógica do frontend (~8100 linhas)
+│   ├── multi-agent.js   → Sessões paralelas de agentes (tabs de chat)
+│   ├── style.css        → Temas claro/escuro
+│   └── vendor/          → Bibliotecas third-party
+│
+├── backend/
+│   ├── server.js        → Express + WebSocket + AI + agentes (~6900 linhas)
+│   ├── analyzer.js      → Indexação de código, parser JS/TS, validação
+│   ├── runner.js        → Execução de comandos shell e builds Electron
+│   ├── debugger.js      → Debug via CDP (Node, Chrome, Python, Go)
+│   ├── remote.js        → SSH remoto (deploy, execução)
+│   ├── browser-client.js→ Automação de navegador (Playwright)
+│   ├── mcp-client.js    → Model Context Protocol (conexão com servidores MCP)
+│   ├── mcp-aedificator-server.js → Servidor MCP expondo ferramentas do Aedificator
+│   ├── config.json      → Chaves API criptografadas (AES-256-GCM)
+│   └── pricing.json     → Preços dos modelos para tracking de custo
+│
+├── scripts/
+│   ├── publish.js       → Publicação automática (GitHub/GitLab Releases)
+│   └── test-e2e.ps1     → Testes end-to-end
+│
+└── test/
+    ├── api.test.js      → Testes de API REST
+    └── snapshot.test.js → Testes de snapshot/backup
+```
+
+### Fluxo de uma requisição de IA
+
+```
+[Chat Input] → sendMessage() → WebSocket {type:'stream', message, provider, mode}
+    │
+    ▼
+[Stream Handler] (server.js ~linha 6090)
+    │
+    ├─ mode='agent' ─────────→ runAgentLoop() ─→ runAgentLoopGemini/OpenAI/Claude
+    │                           │                  (tool-calling nativo, máx 20 iterações)
+    │                           ├─ reviewMode ON  → rollback + approval com diff
+    │                           └─ reviewMode OFF → aplica direto + diagnósticos
+    │
+    ├─ provider='opencode' ──→ callOpenCode() (subprocesso CLI)
+    │
+    ├─ openai/claude ────────→ runAgentLoopOpenAI/Claude()
+    │                           ├─ reviewMode ON  → rollback + approval com diff
+    │                           └─ reviewMode OFF → aplica direto + diagnósticos
+    │
+    └─ gemini/deepseek ──────→ [reviewMode ON]  → runExplorationPhase() → analyzeTask() → approval
+                               [reviewMode OFF] → runExplorationPhase() → runAgentLoop() → direto
+```
+
+### Fluxo de execução de ferramentas no agente
+
+```
+runAgentLoopGemini()
+    │
+    ▼
+[Gemini API] ← system prompt + AGENT_TOOLS + mensagens
+    │
+    ▼ (loop até 20 iterações)
+[Resposta] → tool_calls? ──Sim──→ executeAgentTool(name, args)
+    │                               │
+    │                               ├─ read_file    → resolveSafePath → fs.readFileSync
+    │                               ├─ write_file   → resolveSafePath → fs.writeFileSync
+    │                               ├─ exec_command → spawn (streaming) ou execSync
+    │                               ├─ search_code  → grep nos arquivos do projeto
+    │                               └─ ... (30+ ferramentas)
+    │                               │
+    └─ Não (texto final) ←─────────┘ (resultado enviado de volta ao modelo)
+
+[Pós-execução] → runPostExecutionDiagnostics() → runQuickTest() → done
+```
+
+### Convenções de código
+
+- **backend**: `const` por padrão, `let` quando necessário, nunca `var`
+- **frontend**: `var` usado em funções legacy (não alterar sem testar), `let`/`const` em código novo
+- **WebSocket**: tipo `chunk` para streaming, `file-status` para atualizar explorer, `done` para finalizar
+- **Nomes de ferramenta**: snake_case (`read_file`, `exec_command`)
+- **Provider keys**: lowercase (`gemini`, `deepseek`, `openai`, `claude`, `opencode`)
+
+### Onde adicionar novas features
+
+| Feature | Arquivo(s) |
+|---------|-----------|
+| Nova ferramenta do agente | `server.js` → `AGENT_TOOLS` + `executeAgentTool` |
+| Novo provedor de IA | `server.js` → `callProvider()` + `runAgentLoopProvider()` + `callAI()` |
+| Nova ação no editor | `script.js` → `initMonacoEditor()` (addAction) |
+| Novo atalho de teclado | `script.js` → handler global + `monacoEditor.addAction()` |
+| Novo modal | `index.html` (HTML/CSS) + `script.js` (lógica) |
+| Novo endpoint REST | `server.js` → `app.get/post()` |
+| Nova ferramenta MCP | `mcp-aedificator-server.js` |

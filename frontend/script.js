@@ -11,6 +11,15 @@ let currentMode = 'agent';
 let isStreaming = false;
 let ws = null;
 let wsReconnectDelay = 1000;
+// Auto-conclusão: quando o agente termina de modificar os arquivos, a tarefa é
+// concluída logo depois mesmo que a pós-execução (testes/commit) ainda rode em
+// segundo plano. Isso garante que o chat nunca fique preso em "Enviando...".
+let taskConcluded = false;
+let concludedTaskFiles = [];
+let concludeTimer = null;
+let maxTaskTimer = null;
+let noProgressTimer = null;
+let hideProgressTimer = null;
 let pendingStream = null;
 let backendReady = false;
 let currentProjectPath = '';
@@ -37,6 +46,7 @@ let activityItems = [];     // { id, kind, icon, label, file, status, start, end
 let activitySeq = 0;
 let actTaskId = null;
 let repoInfo = null;
+let lastBackendActivity = Date.now();
 
 let monacoEditor = null;
 let monacoReady = false;
@@ -90,6 +100,7 @@ const CHAT_HISTORY_KEY = 'aedificator_chat_history';
 const RECENT_PROJECTS_KEY = 'aedificator_recent_projects';
 const THEME_KEY = 'aedificator_theme';
 const OPENCODE_KEY = 'aedificator_use_opencode';
+const TASK_LOG_KEY = 'aedificator_task_log';
 
 // =============================================
 //  UTILIDADES
@@ -262,7 +273,24 @@ function initMonacoEditor() {
                 }
             });
 
-            // Ctrl+D: multi-cursor select next occurrence
+            // Ctrl+K: inline AI edit
+            monacoEditor.addAction({
+                id: 'ai-inline-edit',
+                label: '✏️ Editar com IA (Ctrl+K)',
+                keybindings: [monaco.KeyMod.CtrlCmd | monaco.KeyCode.KeyK],
+                run: function(ed) {
+                    showInlineEditPrompt(ed);
+                }
+            });
+
+            monacoEditor.addCommand(monaco.KeyMod.CtrlCmd | monaco.KeyCode.Period, function() {
+                var pos = monacoEditor.getPosition();
+                var markers = monaco.editor.getModelMarkers({ resource: monacoEditor.getModel().uri });
+                var lineMarkers = markers.filter(function(m) { return m.startLineNumber <= pos.lineNumber && m.endLineNumber >= pos.lineNumber; });
+                if (lineMarkers.length) {
+                    showAIQuickFix(monacoEditor, lineMarkers);
+                }
+            });
             monacoEditor.addAction({
                 id: 'editor.action.addSelectionToNextFindMatch',
                 label: 'Add Selection To Next Find Match',
@@ -315,6 +343,15 @@ function initMonacoEditor() {
                 triggerCharacters: ['.', '"', "'"]
             });
 
+            if (monaco.languages.registerInlineCompletionsProvider) {
+                monaco.languages.registerInlineCompletionsProvider({ pattern: '**' }, {
+                    provideInlineCompletions: function (model, position, context, token) {
+                        return provideAIInlineCompletions(model, position, context, token);
+                    },
+                    freeInlineCompletions: function (completions) {}
+                });
+            }
+
             monaco.languages.registerHoverProvider(['javascript', 'typescript', 'javascriptreact', 'typescriptreact', 'python', 'go'], {
                 provideHover: function (model, position) {
                     return provideAedHover(model, position);
@@ -351,6 +388,12 @@ function initMonacoEditor() {
                 }
             });
 
+            monaco.languages.registerCodeActionProvider(['javascript', 'typescript', 'javascriptreact', 'typescriptreact', 'python', 'go', 'css', 'scss', 'less', 'html', 'json', 'yaml', 'xml'], {
+                provideCodeActions: function (model, range, context, token) {
+                    return provideAIQuickFixes(model, range, context);
+                }
+            });
+
             window._aedGutterDeco = [];
             window._aedGutterTimer = null;
             scheduleAedGutterDecorations();
@@ -361,6 +404,146 @@ function initMonacoEditor() {
             }
         });
     } catch (e) { console.error('Monaco init error:', e); }
+}
+
+function showInlineEditPrompt(editor) {
+    const sel = editor.getSelection();
+    const code = sel.isEmpty()
+        ? editor.getModel().getValueInRange(editor.getModel().getFullModelRange()).slice(0, 6000)
+        : editor.getModel().getValueInRange(sel);
+    if (!code || !code.trim()) return;
+
+    const overlay = document.createElement('div');
+    overlay.style.cssText = 'position:fixed;top:0;left:0;width:100%;height:100%;background:rgba(0,0,0,0.2);display:flex;align-items:flex-start;justify-content:center;z-index:6000;';
+    overlay.addEventListener('click', function(e) { if (e.target === overlay) overlay.remove(); });
+
+    const box = document.createElement('div');
+    box.style.cssText = 'margin-top:80px;background:#161b22;border:1px solid #58a6ff;border-radius:10px;padding:16px;width:500px;max-width:90vw;box-shadow:0 8px 32px rgba(0,0,0,0.6);';
+    box.innerHTML = `
+        <div style="display:flex;align-items:center;gap:8px;margin-bottom:10px;">
+            <span style="font-size:14px;font-weight:600;color:#58a6ff;">✏️ Editar com IA</span>
+            <span style="font-size:11px;color:#8b949e;">${sel.isEmpty() ? 'arquivo inteiro' : Math.min(code.length, 6000) + ' caracteres selecionados'}</span>
+        </div>
+        <textarea id="inlineEditPrompt" rows="3" placeholder="Descreva a alteração (ex: adiciona validação de email, extrai função, troca var por const)..." style="width:100%;background:#0d1117;border:1px solid #30363d;border-radius:6px;color:#e6edf3;font-size:13px;font-family:inherit;padding:8px;resize:vertical;box-sizing:border-box;"></textarea>
+        <div style="display:flex;gap:8px;margin-top:10px;justify-content:flex-end;">
+            <button id="inlineEditCancel" style="padding:6px 14px;background:#21262d;border:1px solid #30363d;border-radius:6px;color:#e6edf3;cursor:pointer;font-size:12px;">Cancelar</button>
+            <button id="inlineEditApply" style="padding:6px 14px;background:#1f6feb;border:none;border-radius:6px;color:#fff;cursor:pointer;font-size:12px;font-weight:600;">🔮 Editar</button>
+        </div>
+        <div id="inlineEditStatus" style="margin-top:8px;font-size:12px;color:#8b949e;display:none;"></div>
+    `;
+    overlay.appendChild(box);
+    document.body.appendChild(overlay);
+
+    const textarea = box.querySelector('#inlineEditPrompt');
+    textarea.addEventListener('keydown', function(e) {
+        if (e.key === 'Enter' && !e.shiftKey) {
+            e.preventDefault();
+            box.querySelector('#inlineEditApply').click();
+        }
+        if (e.key === 'Escape') {
+            overlay.remove();
+        }
+    });
+    box.querySelector('#inlineEditCancel').addEventListener('click', function() { overlay.remove(); });
+    box.querySelector('#inlineEditApply').addEventListener('click', async function() {
+        const prompt = textarea.value.trim();
+        if (!prompt) return;
+
+        const status = box.querySelector('#inlineEditStatus');
+        const applyBtn = box.querySelector('#inlineEditApply');
+        status.style.display = 'block';
+        status.textContent = '⏳ Gerando...';
+        applyBtn.disabled = true;
+
+        try {
+            const provider = document.getElementById('providerSelect')?.value || 'gemini';
+            const lang = getMonacoLanguage(activeTabPath || '');
+            const res = await fetch(`${BACKEND_URL}/api/ai/inline-edit`, {
+                method: 'POST',
+                headers: {
+                    'Content-Type': 'application/json',
+                    'Authorization': BACKEND_TOKEN ? `Bearer ${BACKEND_TOKEN}` : ''
+                },
+                body: JSON.stringify({ code, prompt, filePath: activeTabPath, language: lang, provider })
+            });
+            const data = await res.json();
+            const newCode = data.code || code;
+
+            if (!sel.isEmpty()) {
+                editor.executeEdits('ai-inline', [{ range: sel, text: newCode }]);
+            } else {
+                editor.setValue(newCode);
+            }
+            overlay.remove();
+            showToast('✅ Código atualizado');
+        } catch (e) {
+            status.textContent = '❌ Erro: ' + (e.message || 'falha na requisição');
+            applyBtn.disabled = false;
+        }
+    });
+
+    setTimeout(function() { textarea.focus(); }, 100);
+}
+
+function showAIQuickFix(editor, markers) {
+    const code = editor.getValue();
+    const errorText = markers.map(function(m) { return 'Ln ' + m.startLineNumber + ': ' + m.message; }).join('\n');
+    const sel = editor.getSelection();
+
+    const overlay = document.createElement('div');
+    overlay.style.cssText = 'position:fixed;top:0;left:0;width:100%;height:100%;background:rgba(0,0,0,0.2);display:flex;align-items:flex-start;justify-content:center;z-index:6000;';
+    overlay.addEventListener('click', function(e) { if (e.target === overlay) overlay.remove(); });
+
+    const box = document.createElement('div');
+    box.style.cssText = 'margin-top:80px;background:#161b22;border:1px solid #f85149;border-radius:10px;padding:16px;width:500px;max-width:90vw;box-shadow:0 8px 32px rgba(0,0,0,0.6);';
+    box.innerHTML = `
+        <div style="display:flex;align-items:center;gap:8px;margin-bottom:10px;">
+            <span style="font-size:14px;font-weight:600;color:#f85149;">🔧 Quick Fix com IA</span>
+            <span style="font-size:11px;color:#8b949e;">${markers.length} erro(s) detectado(s)</span>
+        </div>
+        <pre style="background:#0d1117;border:1px solid #30363d;border-radius:6px;padding:8px;font-size:11px;color:#f85149;max-height:100px;overflow-y:auto;font-family:Consolas,monospace;margin-bottom:8px;">${escapeHtml(errorText)}</pre>
+        <div id="quickFixStatus" style="margin:8px 0;font-size:12px;color:#8b949e;display:none;"></div>
+        <div style="display:flex;gap:8px;justify-content:flex-end;">
+            <button id="quickFixCancel" style="padding:6px 14px;background:#21262d;border:1px solid #30363d;border-radius:6px;color:#e6edf3;cursor:pointer;font-size:12px;">Cancelar</button>
+            <button id="quickFixApply" style="padding:6px 14px;background:#238636;border:none;border-radius:6px;color:#fff;cursor:pointer;font-size:12px;font-weight:600;">🔧 Corrigir</button>
+        </div>
+    `;
+    overlay.appendChild(box);
+    document.body.appendChild(overlay);
+
+    box.querySelector('#quickFixCancel').addEventListener('click', function() { overlay.remove(); });
+    box.querySelector('#quickFixApply').addEventListener('click', async function() {
+        const status = box.querySelector('#quickFixStatus');
+        const applyBtn = box.querySelector('#quickFixApply');
+        status.style.display = 'block';
+        status.textContent = '⏳ Gerando correção...';
+        applyBtn.disabled = true;
+
+        try {
+            const provider = document.getElementById('providerSelect')?.value || 'gemini';
+            const lang = getMonacoLanguage(activeTabPath || '');
+            const res = await fetch(`${BACKEND_URL}/api/ai/inline-edit`, {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json', 'Authorization': BACKEND_TOKEN ? `Bearer ${BACKEND_TOKEN}` : '' },
+                body: JSON.stringify({
+                    code: code,
+                    prompt: 'Corrija os seguintes erros no código, mantendo o resto igual:\n' + errorText,
+                    filePath: activeTabPath,
+                    language: lang,
+                    provider: provider
+                })
+            });
+            const data = await res.json();
+            const newCode = data.code || code;
+            editor.setValue(newCode);
+            overlay.remove();
+            showToast('✅ Erros corrigidos');
+            runDiagnostics();
+        } catch (e) {
+            status.textContent = '❌ Erro: ' + (e.message || 'falha');
+            applyBtn.disabled = false;
+        }
+    });
 }
 
 function switchMonacoModel(filePath) {
@@ -446,11 +629,13 @@ document.addEventListener('DOMContentLoaded', () => {
     providerSelect.addEventListener('change', function(e) {
         updateModelOptions(e.target.value);
         currentModel = modelSelect.value;
+        updateProviderIndicator(e.target.value);
         refreshUsage();
     });
 
     modelSelect.addEventListener('change', function(e) {
         currentModel = e.target.value;
+        updateProviderIndicator(providerSelect.value);
         refreshUsage();
         showToast('Modelo: ' + e.target.options[e.target.selectedIndex].text);
     });
@@ -458,6 +643,7 @@ document.addEventListener('DOMContentLoaded', () => {
     // Inicializa com Gemini
     updateModelOptions('gemini');
     currentModel = modelSelect.value;
+    updateProviderIndicator('gemini');
 
     document.getElementById('modeSelect').addEventListener('change', (e) => {
         currentMode = e.target.value;
@@ -469,11 +655,30 @@ document.addEventListener('DOMContentLoaded', () => {
     document.getElementById('chatInput').addEventListener('keypress', (e) => {
         if (e.key === 'Enter') sendMessage();
     });
+    document.getElementById('chatInput').addEventListener('paste', (e) => {
+        const items = e.clipboardData?.items;
+        if (!items) return;
+        for (const item of items) {
+            if (item.type.startsWith('image/')) {
+                e.preventDefault();
+                const blob = item.getAsFile();
+                const reader = new FileReader();
+                reader.onload = function(ev) {
+                    attachedFiles.push({ name: 'screenshot_' + Date.now() + '.png', dataUrl: ev.target.result, type: 'image' });
+                    renderAttachments();
+                    showToast('🖼️ Imagem anexada');
+                };
+                reader.readAsDataURL(blob);
+                break;
+            }
+        }
+    });
     document.getElementById('cancelButton').addEventListener('click', cancelTask);
 
     safeOn('configBtn', 'click', openConfigModal);
     safeOn('closeConfigBtn', 'click', closeConfigModal);
     safeOn('saveConfigBtn', 'click', saveConfig);
+    safeOn('resetPermissionsBtn', 'click', resetPermissions);
 
     safeOn('selectFolderBtn', 'click', selectFolder);
     safeOn('unlinkFolderBtn', 'click', unlinkFolder);
@@ -624,12 +829,14 @@ async function checkConfigStatus() {
         const options = select.querySelectorAll('option');
         options.forEach(function(opt) {
             var v = opt.value;
-            if (v === 'opencode') { opt.style.display = ''; return; }
-            if (v === 'gemini' && !data.gemini.configured) { opt.style.display = 'none'; return; }
-            if (v === 'deepseek' && !data.deepseek.configured) { opt.style.display = 'none'; return; }
-            if (v === 'openai' && !data.openai.configured) { opt.style.display = 'none'; return; }
-            if (v === 'claude' && !data.claude.configured) { opt.style.display = 'none'; return; }
-            opt.style.display = '';
+            if (v === 'opencode') { opt.textContent = 'opencode'; return; }
+            var configured = (v === 'gemini' && data.gemini?.configured)
+                || (v === 'deepseek' && data.deepseek?.configured)
+                || (v === 'openai' && data.openai?.configured)
+                || (v === 'claude' && data.claude?.configured);
+            var name = v === 'gemini' ? 'Google' : v === 'deepseek' ? 'DeepSeek' : v === 'openai' ? 'OpenAI' : v === 'claude' ? 'Anthropic' : v;
+            opt.textContent = configured ? name : name + ' (sem chave)';
+            opt.style.color = configured ? '' : '#8b949e';
         });
         if (!data.gemini.configured && !data.deepseek.configured && !data.opencode.configured) {
             showToast('⚠️ Configure sua chave API em "Chave"');
@@ -749,7 +956,7 @@ async function openCostDashboard() {
         html += '<div style="font-size:14px;color:#3fb950;margin-bottom:12px;">💰 Total acumulado: <b>R$ ' + data.total_brl.toFixed(2).replace('.', ',') + '</b></div>';
         html += '<div style="display:flex;gap:12px;flex-wrap:wrap;margin-bottom:16px;">';
         var icons = { deepseek: '🔵', gemini: '🟢', openai: '⚫', claude: '🟣', opencode: '⚪' };
-        for (var p in data.providers) {
+        for (let p in data.providers) {
             var pd = data.providers[p];
             var icon = icons[p] || '📊';
             html += '<div style="background:#0d1117;border:1px solid #30363d;border-radius:8px;padding:10px 14px;min-width:120px;">';
@@ -837,6 +1044,38 @@ function populateOpenCodeModels(freeModels, goModels) {
 // =============================================
 //  WEBSOCKET (RECONEXÃO AUTOMÁTICA)
 // =============================================
+
+function updateBackendStatus(connected) {
+    const el = document.getElementById('backendStatus');
+    if (el) {
+        el.textContent = connected ? '● Conectado' : '● Desconectado';
+        el.style.color = connected ? '#3fb950' : '#da3633';
+    }
+}
+
+function showReconnectBanner() {
+    let banner = document.getElementById('reconnectBanner');
+    if (!banner) {
+        banner = document.createElement('div');
+        banner.id = 'reconnectBanner';
+        banner.style.cssText = 'position:fixed;top:0;left:0;width:100%;background:#da3633;color:#fff;text-align:center;padding:6px 12px;font-size:12px;font-weight:600;z-index:9999;display:none;';
+        banner.innerHTML = '🔌 Conexão perdida com o backend — reconectando... <button id="reconnectRetryBtn" style="margin-left:12px;padding:2px 10px;background:#fff;color:#da3633;border:none;border-radius:4px;cursor:pointer;font-size:11px;font-weight:600;">Reconectar</button>';
+        document.body.prepend(banner);
+        banner.querySelector('#reconnectRetryBtn').addEventListener('click', function() {
+            banner.style.display = 'none';
+            connectWebSocket();
+        });
+    }
+    banner.style.display = 'block';
+    updateBackendStatus(false);
+}
+
+function hideReconnectBanner() {
+    var banner = document.getElementById('reconnectBanner');
+    if (banner) banner.style.display = 'none';
+    updateBackendStatus(true);
+}
+
 function connectWebSocket() {
     if (ws && (ws.readyState === WebSocket.OPEN || ws.readyState === WebSocket.CONNECTING)) return;
     ws = new WebSocket(WS_URL);
@@ -844,6 +1083,7 @@ function connectWebSocket() {
     ws.onopen = () => {
         console.log('🔌 WebSocket conectado');
         wsReconnectDelay = 1000;
+        hideReconnectBanner();
         if (pendingStream) {
             const msg = pendingStream;
             pendingStream = null;
@@ -861,9 +1101,11 @@ function connectWebSocket() {
 
     ws.onclose = () => {
         console.log('🔌 WebSocket fechado');
-        if (isStreaming) endTask('⟲ Conexão perdida');
+        if (isStreaming) endTask('⏹️ Conexão perdida — tarefa cancelada');
         ws = null;
+        clearStreamTimeout();
         if (backendReady) {
+            showReconnectBanner();
             setTimeout(connectWebSocket, wsReconnectDelay);
             wsReconnectDelay = Math.min(wsReconnectDelay * 2, 30000);
         }
@@ -872,6 +1114,20 @@ function connectWebSocket() {
     ws.onerror = () => {
         // onclose virá em seguida e cuidará da reconexão
     };
+}
+
+var _streamTimeout = null;
+function resetStreamTimeout() {
+    clearStreamTimeout();
+    _streamTimeout = setTimeout(function() {
+        if (isStreaming) {
+            console.log('⏰ Stream timeout — forçando endTask');
+            endTask('⏰ Tempo esgotado — o backend não respondeu');
+        }
+    }, 240000);
+}
+function clearStreamTimeout() {
+    if (_streamTimeout) { clearTimeout(_streamTimeout); _streamTimeout = null; }
 }
 
 function sendStreamingMessage(msg) {
@@ -884,7 +1140,27 @@ function sendStreamingMessage(msg) {
     connectWebSocket();
 }
 
+function armNoProgressTimer() {
+    if (noProgressTimer) clearTimeout(noProgressTimer);
+    noProgressTimer = setTimeout(function() {
+        noProgressTimer = null;
+        // 60s sem qualquer mensagem do backend: o agente terminou de responder
+        // mas o 'done' não chegou (ou o backend pendurou). Conclui a tarefa.
+        if (isStreaming && !taskConcluded) forceConcludeTask();
+    }, 60000);
+}
+
 function handleWsMessage(data) {
+    // Qualquer mensagem vinda do backend enquanto uma tarefa está ativa é sinal
+    // de que o agente ainda está trabalhando — renova o watchdog de stream.
+    if (isStreaming) resetStreamTimeout();
+    // Renova também o timer de "sem progresso": qualquer mensagem é progresso.
+    if (isStreaming && !taskConcluded) armNoProgressTimer();
+    // Marca atividade real do backend: é o sinal mais confiável de que o agente
+    // está vivo, independente de flags (isStreaming/taskConcluded podem ficar
+    // inconsistentes entre sessões do multi-agente ou no fechamento da conexão).
+    lastBackendActivity = Date.now();
+
     if (data.type === 'plan') {
         setProgress(data.total);
         finishAnalysisActivity(true);
@@ -895,47 +1171,88 @@ function handleWsMessage(data) {
 
     if (data.type === 'file-status') {
         updatePipeline('execute', 'active', '')
+        // O agente começou a aplicar as alterações: a fase de análise/planejamento
+        // terminou. Em modo agente direto não há mensagem 'plan', então sem isso o
+        // item "Analisando" ficaria "Executando" até o fim da tarefa.
+        finishAnalysisActivity(true);
+        var needsRefresh = false;
         for (const file of data.files) {
-            setFileStatus(file.file, file.status);
+            var found = setFileStatus(file.file, file.status);
+            if (!found && (file.status === 'created' || file.action === 'criar')) needsRefresh = true;
             refreshTabIfOpen(file.file);
             processedFiles++;
             if (data.files.length === 1) taskActivityProgress(`${file.action} ${file.file}`);
             fileActivity(file.file, file.status);
+            if (file.file && concludedTaskFiles.indexOf(file.file) === -1) concludedTaskFiles.push(file.file);
         }
         updateProgressUI();
+        if (needsRefresh) {
+            setTimeout(() => loadFolderStructure(currentProjectPath), 500);
+        }
+        // Auto-conclusão: o agente já aplicou as alterações. Se o 'done' não chegar
+        // logo (pós-execução de testes/commit demorada ou pendurada), concluímos
+        // mesmo assim para liberar o chat. As mensagens de teste/rollback continuam
+        // chegando normalmente depois.
+        // Nota: não depende de isStreaming — o estado pode ficar inconsistente
+        // entre sessões do multi-agente; file-status por si só já significa que o
+        // agente terminou de modificar os arquivos.
+        if (!taskConcluded) {
+            if (concludeTimer) clearTimeout(concludeTimer);
+            concludeTimer = setTimeout(function() {
+                concludeTimer = null;
+                if (!taskConcluded) forceConcludeTask();
+            }, 20000);
+        }
         return;
     }
 
     if (data.type === 'activity-event') {
         if (data.ev === 'tool_start') {
+            // Primeira ferramenta rodando: a análise terminou e a execução começou.
+            finishAnalysisActivity(true);
             terminalAdd('tool', data.label || data.tool, { icon: data.icon, id: data.id });
         } else if (data.ev === 'tool_end') {
-            terminalFinishTool(data.id, data.isError ? 'error' : 'success');
+            terminalFinishTool(data.id, data.isError ? 'error' : 'success', data.error || '');
         }
         return;
     }
 
     if (data.type === 'chunk') {
+        resetStreamTimeout();
         const agent = data.agent || 'Assistente';
+        const text = data.content || '';
+        const trimmed = text.trim();
+
+        if (agent === 'Sistema') {
+            taskActivityProgress(text.replace(/\n|✅|❌|📄|🗑️|✏️|🆕/g, ''));
+            const isToolMeta =
+                /^🔧/.test(trimmed) ||
+                /^→/.test(trimmed) ||
+                /^\+\s*Thought/.test(trimmed) ||
+                /Iteração\s+\d+\/\d+/.test(trimmed) ||
+                /^⚠️\s*falhou/.test(trimmed) ||
+                /^⛔/.test(trimmed);
+            terminalAdd('thought', trimmed);
+            if (isToolMeta) return;
+        }
+
         if (!agentMessages[agent]) {
             agentMessages[agent] = '';
             addMessage('agent', '', agent);
         }
-        agentMessages[agent] += data.content;
+        agentMessages[agent] += text;
         updateAgentMessage(agent, agentMessages[agent]);
-        if (agent === 'Sistema') {
-            taskActivityProgress(data.content.replace(/\n|✅|❌|📄|🗑️|✏️|🆕/g, ''));
-            if (!/^🔧|📖|✏️|⚡|📋|🔍|🌐|🤖|📦|🧪/.test(data.content.trim())) {
-                terminalAdd('thought', data.content.trim());
-            }
-        } else if (agent === 'Assistente') {
+
+        if (agent === 'Assistente') {
+            var ptEl = document.getElementById('progressText');
+            if (ptEl && (ptEl.textContent.trim() === 'Analisando...' || ptEl.textContent.trim() === '')) ptEl.textContent = '🤖 Executando...';
             var last = terminalLines.length > 0 ? terminalLines[terminalLines.length - 1] : null;
             if (last && last.type === 'output') {
-                last.text += data.content;
+                last.text += text;
                 last.time = Date.now();
                 renderTerminal();
             } else {
-                terminalAdd('output', data.content);
+                terminalAdd('output', text);
             }
         }
         return;
@@ -949,6 +1266,23 @@ function handleWsMessage(data) {
         } else {
             endTask('📋 Nada a executar');
         }
+        return;
+    }
+
+    if (data.type === 'permission') {
+        clearStreamTimeout();
+        showPermissionPrompt(data);
+        return;
+    }
+
+    if (data.type === 'question') {
+        clearStreamTimeout();
+        showQuestionPrompt(data);
+        return;
+    }
+
+    if (data.type === 'todo') {
+        renderAgentTodos(data.todos);
         return;
     }
 
@@ -973,10 +1307,13 @@ function handleWsMessage(data) {
         if (cancelBtn) cancelBtn.disabled = true;
         if (data.status === 'done') {
             showToast('✅ Build concluído!');
+            recordTaskLog('success', '✅ Build concluído!');
         } else if (data.status === 'cancelled') {
             showToast('⏹️ Build cancelado.');
+            recordTaskLog('cancelled', '⏹️ Build cancelado.');
         } else if (data.status === 'error') {
             showToast('❌ Build falhou.');
+            recordTaskLog('error', '❌ Build falhou.');
         }
         return;
     }
@@ -1037,13 +1374,14 @@ function handleWsMessage(data) {
             var msg = [];
             if (errCount) msg.push(errCount + ' erro(s)');
             if (warnCount) msg.push(warnCount + ' aviso(s)');
-            if (msg.length) showToast('\u26A0\uFE0F Diagnostics: ' + msg.join(', '));
+            if (msg.length) showToast('\u26A0\uFE0F Problemas: ' + msg.join(', '));
         }
         return;
     }
 
     if (data.type === 'rollback') {
         showToast('\u267B\uFE0F ' + (data.message || 'Alteracoes revertidas devido a erros'));
+        recordTaskLog('error', '♻️ ' + (data.message || 'Alteracoes revertidas devido a erros'));
         if (currentProjectPath) loadFolderStructure(currentProjectPath);
         return;
     }
@@ -1051,6 +1389,29 @@ function handleWsMessage(data) {
     if (data.type === 'test-status') {
         updatePipeline('test', 'done', (data.results ? (data.results.pass || 0) + ' passaram' : ''));
         showToast('\uD83E\uDDEA ' + (data.message || 'Testes executados'));
+        if (data.status !== 'running') {
+            const failed = data.status === 'failed' || (data.results && data.results.fail > 0);
+            recordTaskLog(failed ? 'error' : 'success', (failed ? '❌ ' : '✅ ') + (data.message || 'Testes executados'));
+        }
+
+        // Atividade da IA: painel mostra a fase de testes com o status atual.
+        if (data.status === 'running') {
+            upsertActivity('test', { kind: 'process', icon: '\uD83E\uDDEA', label: 'Executando testes', status: 'running', error: '' });
+        } else {
+            setActivityStatus('test', (data.status === 'failed' || (data.results && data.results.fail > 0)) ? 'error' : 'success');
+        }
+
+        // Chat: bolha dedicada com o progresso/resultado dos testes.
+        var chatTestText;
+        if (data.results) {
+            chatTestText = '\uD83E\uDDEA Testes conclu\u00EDdos \u2014 ' + (data.results.total || 0) + ' total, ' +
+                (data.results.pass || 0) + ' passaram, ' + (data.results.fail || 0) + ' falharam';
+            if (data.results.fail > 0) chatTestText = '\u274C ' + chatTestText;
+        } else {
+            chatTestText = (data.status === 'running' ? '\u23F3 ' : '\u2705 ') + (data.message || 'Testes executados');
+        }
+        updateTestAgentChat(chatTestText);
+
         var outEl = document.getElementById('bottomOutputContent');
         if (outEl && data.results) {
             var out = '=== Resultado dos Testes ===\n';
@@ -1070,12 +1431,17 @@ function handleWsMessage(data) {
         var outEl = document.getElementById('bottomOutputContent');
         if (outEl) outEl.textContent = data.message || 'Testes falharam';
         toggleBottomPanel('output');
+        setActivityStatus('test', 'error');
+        updateTestAgentChat('\u274C ' + String(data.message || 'Testes falharam').slice(0, 600));
+        showToast('\u274C Testes falharam');
+        recordTaskLog('error', '❌ Testes falharam' + (data.message ? ': ' + String(data.message).slice(0, 200) : ''));
         return;
     }
 
     if (data.type === 'auto-commit') {
         updatePipeline('commit', 'done');
         showToast('\uD83D\uDCC4 ' + (data.message || 'Commit automatico realizado'));
+        recordTaskLog('success', '📄 ' + (data.message || 'Commit automatico realizado'));
         sidebarGitRefresh();
         return;
     }
@@ -1085,7 +1451,7 @@ function handleWsMessage(data) {
             var changedFile = data.file.replace(/\\/g, '/');
             var currentFile = (activeTabPath || '').replace(/\\/g, '/');
             if (changedFile === currentFile.replace(currentProjectPath.replace(/\\/g, '/') + '/', '')) {
-                showToast('\uD83D\uDCC4 Arquivo modificado externamente. Recarregue para ver mudancas.');
+                showToast('📄 Arquivo modificado externamente. <button onclick="reloadActiveTab()" style="margin-left:8px;padding:2px 8px;background:#3fb950;color:#000;border:none;border-radius:3px;cursor:pointer;font-weight:600;">Recarregar</button>');
             }
         }
         return;
@@ -1099,26 +1465,117 @@ function handleWsMessage(data) {
 
     if (data.type === 'deploy-done') {
         showToast('\uD83D\uDE80 ' + (data.message || 'Deploy concluido'));
+        recordTaskLog('success', '🚀 ' + (data.message || 'Deploy concluido'));
         return;
     }
 
     if (data.type === 'done') {
-        showReportCard(data);
+        if (concludeTimer) { clearTimeout(concludeTimer); concludeTimer = null; }
+        // endTask SEMPRE roda: concluir o chat/atividade nunca pode ser pulado.
+        // O card só é renderizado uma vez (se já houve auto-conclusão, evita duplicado).
+        if (!taskConcluded) {
+            taskConcluded = true;
+            try { showReportCard(data); } catch (e) { console.error('showReportCard error:', e); }
+        } else {
+            taskConcluded = true;
+        }
         endTask('✅ Tarefa concluída!');
-        updateUndoRedoButtons();
+        try { updateUndoRedoButtons(); } catch (e) { console.error('updateUndoRedoButtons error:', e); }
         attachedFiles = [];
-        renderAttachments();
+        try { renderAttachments(); } catch (e) { console.error('renderAttachments error:', e); }
         return;
     }
 
     if (data.type === 'cancelled') {
-        endTask('⏹️ Tarefa cancelada');
+        if (concludeTimer) { clearTimeout(concludeTimer); concludeTimer = null; }
+        taskConcluded = true;
+        var msg = data.restoredCount ? `⏹️ Cancelado — ${data.restoredCount} arquivo(s) restaurado(s)` : '⏹️ Tarefa cancelada';
+        if (data.restoredFiles && data.restoredFiles.length) {
+            msg += '\n↩ ' + data.restoredFiles.join('\n↩ ');
+        }
+        endTask(msg);
         return;
     }
 
     if (data.type === 'error') {
-        showToast('❌ ' + data.content);
-        endTask('❌ ' + data.content);
+        if (concludeTimer) { clearTimeout(concludeTimer); concludeTimer = null; }
+        taskConcluded = true;
+        endTask('❌ ' + (data.content || 'Erro'));
+        return;
+    }
+}
+
+// Rede de segurança: periodicamente, se a tarefa deveria ter concluído mas o
+// estado ficou inconsistente, força a conclusão da UI. (O timer de 20s pós
+// file-status e o tempo máximo de 3min são as proteções principais; isto é só
+// redundância caso o estado atravesse uma troca de sessão do multi-agente.)
+setInterval(function() {
+    if (taskConcluded && isStreaming) {
+        endTask('✅ Tarefa concluída');
+    }
+}, 5000);
+
+// Auto-conclusão: o agente já aplicou as alterações, mas o 'done' não chegou
+// (pós-execução de testes/commit demorada ou backend pendurado). Concluímos
+// a tarefa e liberamos o chat; as mensagens posteriores (testes/rollback)
+// continuam chegando normalmente.
+function forceConcludeTask() {
+    taskConcluded = true;
+    var resumo = concludedTaskFiles.length
+        ? concludedTaskFiles.length + ' arquivo(s) alterado(s)'
+        : 'Alterações aplicadas';
+    var data = { type: 'done', summary: resumo, modifiedFiles: concludedTaskFiles.slice() };
+    try { showReportCard(data); } catch (e) {}
+    endTask('✅ ' + resumo);
+    // Garantia extra: libera o botão/cancelamento mesmo que o endTask falhe
+    // por estado inconsistente (multi-agente).
+    var sb = document.getElementById('sendButton');
+    if (sb) { sb.disabled = false; sb.textContent = 'Enviar'; }
+    var cb = document.getElementById('cancelButton');
+    if (cb) cb.style.display = 'none';
+    try { setActivityStatus('task', 'success'); } catch (e) {}
+    try { setActivityStatus('analysis', 'success'); } catch (e) {}
+}
+
+// Tempo máximo de execução atingido: libera o chat e interrompe o trabalho em
+// segundo plano (agente em loop, servidor que não sai, etc.).
+function forceFreeChat() {
+    taskConcluded = true;
+    if (maxTaskTimer) { clearTimeout(maxTaskTimer); maxTaskTimer = null; }
+    try {
+        // Interrompe o backend para parar o agente/loop em execução.
+        var sock = getStreamingSocket();
+        if (sock) sock.send(JSON.stringify({ type: 'cancel' }));
+    } catch (e) {}
+    endTask('⏰ Tempo máximo de execução atingido (3 min) — chat liberado. Reenvie a mensagem se o trabalho foi interrompido.');
+    var sb = document.getElementById('sendButton');
+    if (sb) { sb.disabled = false; sb.textContent = 'Enviar'; }
+    var cb = document.getElementById('cancelButton');
+    if (cb) cb.style.display = 'none';
+}
+
+// Garante que TODA tarefa tenha um tempo máximo: mesmo que o backend continue
+// enviando mensagens (loop de ferramentas, failover de provider pendurado etc.),
+// o chat é liberado após este prazo. Deve ser chamado em TODOS os fluxos que
+// iniciam trabalho no backend (chat, execução de sugestão do plano, etc.).
+function armMaxTaskTimer() {
+    if (maxTaskTimer) { clearTimeout(maxTaskTimer); maxTaskTimer = null; }
+    maxTaskTimer = setTimeout(function() {
+        maxTaskTimer = null;
+        if (isStreaming && !taskConcluded) forceFreeChat();
+    }, 120000);
+}
+
+// Cria/atualiza a bolha "🧪 Testes" no chat com o progresso e o resultado
+// dos testes executados na pós-execução (visível mesmo após a auto-conclusão).
+function updateTestAgentChat(text) {
+    var agent = '\uD83E\uDDEA Testes';
+    if (!agentDivIds[agent]) {
+        agentMessages[agent] = String(text || '');
+        addMessage('agent', text || '', agent);
+    } else {
+        agentMessages[agent] = String(text || '');
+        updateAgentMessage(agent, text || '');
     }
 }
 
@@ -1218,6 +1675,55 @@ async function applySelectedFolder(folderPath) {
     await detectRepoForProject();
     showToast(`📁 Pasta selecionada: ${folderPath}`);
 }
+
+function newProject() {
+    var nome = prompt('Digite o nome do novo projeto:', 'meu-app');
+    if (!nome) return;
+    nome = nome.trim();
+    if (!nome) return;
+
+    var pasta = prompt('Pasta onde criar o projeto (ex: C:\\Projetos):', currentProjectPath || '');
+    if (!pasta) return;
+    pasta = pasta.trim();
+    if (!pasta) return;
+
+    pasta = pasta.replace(/\\/g, '/').replace(/\/+$/, '');
+    var caminhoCompleto = pasta + '/' + nome;
+
+    showToast('⏳ Criando projeto...');
+
+    var xhr = new XMLHttpRequest();
+    xhr.open('POST', BACKEND_URL + '/api/project/create', true);
+    xhr.setRequestHeader('Content-Type', 'application/json');
+    if (BACKEND_TOKEN) xhr.setRequestHeader('Authorization', 'Bearer ' + BACKEND_TOKEN);
+
+    xhr.onload = function() {
+        if (xhr.status >= 200 && xhr.status < 300) {
+            try {
+                var data = JSON.parse(xhr.responseText);
+                if (data.success) {
+                    showToast('✅ Projeto criado: ' + nome);
+                    applySelectedFolder(data.path);
+                } else {
+                    showToast('❌ ' + (data.error || 'Erro ao criar'));
+                }
+            } catch(e) {
+                showToast('❌ Erro ao processar resposta');
+            }
+        } else {
+            showToast('❌ Erro HTTP ' + xhr.status);
+        }
+    };
+
+    xhr.onerror = function() {
+        showToast('❌ Erro de conexão com o backend');
+    };
+
+    xhr.send(JSON.stringify({ path: caminhoCompleto }));
+}
+
+async function createNewProject() { selectFolder(); }
+function browseNewProjectParent() { selectFolder(); }
 
 // =============================================
 //  EXPLORADOR DE PASTAS (SELEÇÃO DA RAIZ)
@@ -1599,61 +2105,8 @@ async function renderSubFolder(container, files, basePath) {
                     const subFiles = await loadSubFolder(fullPath);
                     if (subFiles) {
                         renderSubFolder(childrenDiv, subFiles, fullPath);
-    }
-}
-
-// =============================================
-//  NOVO PROJETO
-// =============================================
-function newProject() {
-
-    var nome = prompt('Digite o nome do novo projeto:', 'meu-app');
-    if (!nome) return;
-    nome = nome.trim();
-    if (!nome) return;
-
-    var pasta = prompt('Pasta onde criar o projeto (ex: C:\\Projetos):', currentProjectPath || '');
-    if (!pasta) return;
-    pasta = pasta.trim();
-    if (!pasta) return;
-
-    pasta = pasta.replace(/\\/g, '/').replace(/\/+$/, '');
-    var caminhoCompleto = pasta + '/' + nome;
-
-    showToast('⏳ Criando projeto...');
-
-    var xhr = new XMLHttpRequest();
-    xhr.open('POST', BACKEND_URL + '/api/project/create', true);
-    xhr.setRequestHeader('Content-Type', 'application/json');
-    if (BACKEND_TOKEN) xhr.setRequestHeader('Authorization', 'Bearer ' + BACKEND_TOKEN);
-
-    xhr.onload = function() {
-        if (xhr.status >= 200 && xhr.status < 300) {
-            try {
-                var data = JSON.parse(xhr.responseText);
-                if (data.success) {
-                    showToast('✅ Projeto criado: ' + nome);
-                    applySelectedFolder(data.path);
-                } else {
-                    showToast('❌ ' + (data.error || 'Erro ao criar'));
+                    }
                 }
-            } catch(e) {
-                showToast('❌ Erro ao processar resposta');
-            }
-        } else {
-            showToast('❌ Erro HTTP ' + xhr.status);
-        }
-    };
-
-    xhr.onerror = function() {
-        showToast('❌ Erro de conexão com o backend');
-    };
-
-    xhr.send(JSON.stringify({ path: caminhoCompleto }));
-}
-
-async function createNewProject() { selectFolder(); }
-function browseNewProjectParent() { selectFolder(); }
             });
 
         } else {
@@ -1857,6 +2310,7 @@ function setFileStatus(filePath, status) {
             el.className = `file-item ${cls}`;
         }
     }
+    return !!el;
 }
 
 // =============================================
@@ -2236,8 +2690,17 @@ function runTerminalCommand(command) {
         return;
     }
     if (isStreaming || isRunning) {
-        showToast('⏳ Aguarde a tarefa atual terminar');
-        return;
+        // Mesmo saneamento do sendMessage: stream preso sem trabalho real não
+        // pode bloquear o terminal.
+        var noRealWork = !isRunning
+            && Date.now() - lastBackendActivity > 20000
+            && !activityItems.some(function(i) { return i.status === 'running' && !i.end; });
+        if (noRealWork) {
+            try { forceConcludeTask(); } catch (e) {}
+        } else {
+            showToast('⏳ Aguarde a tarefa atual terminar');
+            return;
+        }
     }
 
     const out = document.getElementById('terminalOutput');
@@ -2424,23 +2887,43 @@ function savePlanModeState() {
 }
 
 let reviewMode = false;
+let smartMode = true;
 const REVIEW_KEY = 'aedificator_review_mode';
+const SMART_KEY = 'aedificator_smart_mode';
 
 function toggleReviewMode() {
-    reviewMode = !reviewMode;
+    if (smartMode) {
+        smartMode = false;
+        reviewMode = false;
+    } else if (!reviewMode) {
+        reviewMode = true;
+    } else {
+        smartMode = true;
+        reviewMode = false;
+    }
     try { localStorage.setItem(REVIEW_KEY, reviewMode ? '1' : '0'); } catch (e) {}
+    try { localStorage.setItem(SMART_KEY, smartMode ? '1' : '0'); } catch (e) {}
     updateReviewToggle();
 }
 
 function updateReviewToggle() {
     var btn = document.getElementById('reviewToggleBtn');
     if (!btn) return;
-    btn.textContent = reviewMode ? '🔒 Revisar' : '🚀 Direto';
-    btn.title = reviewMode ? 'Revisar alterações antes de aplicar' : 'Executar direto sem aprovação';
+    if (smartMode) {
+        btn.textContent = '🤖 Smart';
+        btn.title = 'Modo inteligente: o app decide se executa direto ou pede opções';
+    } else if (reviewMode) {
+        btn.textContent = '🔒 Revisar';
+        btn.title = 'Revisar alterações antes de aplicar';
+    } else {
+        btn.textContent = '🚀 Direto';
+        btn.title = 'Executar direto sem aprovação';
+    }
 }
 
 function initReviewMode() {
     try { reviewMode = localStorage.getItem(REVIEW_KEY) === '1'; } catch (e) {}
+    try { smartMode = localStorage.getItem(SMART_KEY) === '1' || (localStorage.getItem(SMART_KEY) === null && !reviewMode); } catch (e) {}
     updateReviewToggle();
 }
 
@@ -2594,6 +3077,8 @@ function selectAcItem(file) {
     input.selectionStart = input.selectionEnd = beforeAt.length + file.path.length + 2;
     dropdown.classList.remove('active');
     acSelectedIndex = -1;
+
+    loadAttachedFile(file.path);
 }
 
 function fuzzyScore(query, text) {
@@ -2700,10 +3185,30 @@ function buildAttachmentPrompt(userMessage) {
             prompt += `\n- Imagem: ${f.name}`;
         } else {
             prompt += `\n- Arquivo: ${f.path || f.name}`;
+            if (f.content) prompt += '\n```\n' + f.content.slice(0, 8000) + '\n```';
         }
     }
     prompt += ']';
     return prompt;
+}
+
+async function loadAttachedFile(filePath) {
+    if (!filePath) return;
+    const alreadyAttached = attachedFiles.find(f => f.path === filePath);
+    if (alreadyAttached) return;
+    try {
+        const res = await apiFetch('/api/file/read', {
+            method: 'POST', headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ path: filePath })
+        });
+        const data = await res.json();
+        if (data.content !== undefined) {
+            const name = filePath.split(/[\\/]/).pop();
+            attachedFiles.push({ name, path: filePath, content: data.content, type: 'file' });
+            renderAttachments();
+            showToast('📎 ' + name + ' anexado ao contexto');
+        }
+    } catch (e) {}
 }
 
 // =============================================
@@ -2742,7 +3247,7 @@ function showReportCard(data) {
     }
 
     html += '<div class="report-actions">';
-    html += '<button class="report-btn accept" onclick="this.closest(\'.message\').querySelector(\'.report-actions\').innerHTML=\'✔ Concluído\'">✔ OK</button>';
+    html += '<button class="report-btn accept" onclick="this.closest(\'.message\').querySelector(\'.report-actions\').innerHTML=\'✔ Concluído\';document.getElementById(\'cancelButton\').style.display=\'none\';">✔ OK</button>';
     html += '<button class="report-btn refine" data-command="' + escapeHtml(data.command || '') + '" data-files="' + escapeHtml(JSON.stringify(files)) + '">🔄 Refinar</button>';
     html += '<button class="report-btn undo" onclick="undoLastChange();this.closest(\'.message\').querySelector(\'.report-actions\').innerHTML=\'↩ Desfeito\'">↩ Desfazer</button>';
     html += '</div></div>';
@@ -2780,7 +3285,7 @@ function initNewFeatures() {
     restorePlanModeState();
     initReviewMode();
     setTimeout(updateUndoRedoButtons, 2000);
-    setInterval(updateUndoRedoButtons, 15000);
+    window._undoRedoInterval = setInterval(updateUndoRedoButtons, 15000);
 }
 
 if (document.readyState === 'loading') {
@@ -2974,18 +3479,49 @@ function activateTab(filePath) {
 function renderTabs() {
     const bar = document.getElementById('editorTabs');
     bar.innerHTML = '';
-    for (const tab of editorTabs) {
+    for (let i = 0; i < editorTabs.length; i++) {
+        const tab = editorTabs[i];
         const el = document.createElement('div');
-        el.className = 'editor-tab' + (tab.path === activeTabPath ? ' active' : '');
+        el.className = 'editor-tab' + (tab.path === activeTabPath ? ' active' : '') + (tab.dirty ? ' dirty' : '');
         el.title = tab.path;
+        el.draggable = true;
+        el.dataset.tabIndex = i;
         const name = tab.path.split('/').pop() || tab.path;
-        el.innerHTML = `<span class="tab-name">${escapeHtml(name)}</span><button class="tab-close" title="Fechar aba">×</button>`;
+        const parts = name.split('.');
+        const ext = parts.length > 1 ? parts.pop() : '';
+        const baseName = parts.join('.');
+        el.innerHTML = `<span class="tab-dirty-dot"></span><span class="tab-name">${escapeHtml(baseName)}${ext ? '<span class="tab-ext">.' + escapeHtml(ext) + '</span>' : ''}</span><button class="tab-close" title="Fechar aba">×</button>`;
         el.addEventListener('click', (e) => {
             if (e.target.classList.contains('tab-close')) {
                 e.stopPropagation();
                 closeTab(tab.path);
                 return;
             }
+            activateTab(tab.path);
+        });
+        el.addEventListener('dragstart', function(e) {
+            e.dataTransfer.setData('text/plain', String(i));
+            this.classList.add('dragging');
+        });
+        el.addEventListener('dragend', function(e) {
+            this.classList.remove('dragging');
+        });
+        el.addEventListener('dragover', function(e) {
+            e.preventDefault();
+            this.classList.add('drag-over');
+        });
+        el.addEventListener('dragleave', function(e) {
+            this.classList.remove('drag-over');
+        });
+        el.addEventListener('drop', function(e) {
+            e.preventDefault();
+            this.classList.remove('drag-over');
+            const fromIdx = parseInt(e.dataTransfer.getData('text/plain'));
+            const toIdx = parseInt(this.dataset.tabIndex);
+            if (isNaN(fromIdx) || isNaN(toIdx) || fromIdx === toIdx) return;
+            const tab = editorTabs.splice(fromIdx, 1)[0];
+            editorTabs.splice(toIdx, 0, tab);
+            renderTabs();
             activateTab(tab.path);
         });
         bar.appendChild(el);
@@ -3050,6 +3586,13 @@ function refreshTabIfOpen(filePath) {
     if (!tab || tab.dirty) return;
     tab.loaded = false;
     loadTabContent(filePath);
+}
+
+function reloadActiveTab() {
+    if (!activeTabPath) return;
+    const tab = editorTabs.find(t => t.path === activeTabPath);
+    if (tab) { tab.loaded = false; tab.dirty = false; }
+    loadTabContent(activeTabPath);
 }
 
 function closeFileEditor() {
@@ -3573,7 +4116,8 @@ function updateDebugUI() {
         document.getElementById('debugStopBtn').addEventListener('click', debugStop);
 
         if (monacoEditor && monacoReady) {
-            monacoEditor.onMouseDown(e => {
+            if (window._debugMouseDownDisposable) window._debugMouseDownDisposable.dispose();
+            window._debugMouseDownDisposable = monacoEditor.onMouseDown(e => {
                 if (e.target.type === monaco.editor.MouseTargetType.GUTTER_GLYPH_MARGIN || e.target.type === monaco.editor.MouseTargetType.GUTTER_LINE_NUMBERS) {
                     toggleDebugBreakpoint(e.target.position.lineNumber);
                 }
@@ -3612,6 +4156,78 @@ async function debugStepOut() { try { await apiFetch('/api/debug/stepOut', { met
 // =============================================
 //  APROVAÇÃO DO PLANO
 // =============================================
+let acceptedFilesMap = {};
+let fileDiffEditors = [];
+
+// =============================================
+//  INTERAÇÕES DO AGENTE (permissão / pergunta / todos)
+// =============================================
+function showPermissionPrompt(data) {
+    const argsStr = (data.args && typeof data.args === 'object') ? JSON.stringify(data.args).slice(0, 400) : '';
+    const overlay = document.createElement('div');
+    overlay.style.cssText = 'position:fixed;top:0;left:0;width:100%;height:100%;background:rgba(0,0,0,0.6);display:flex;align-items:center;justify-content:center;z-index:9500;';
+    const box = document.createElement('div');
+    box.style.cssText = 'background:#161b22;border:1px solid #d29922;border-radius:10px;padding:20px;width:440px;max-width:90vw;box-shadow:0 8px 32px rgba(0,0,0,0.6);';
+    box.innerHTML = `
+        <h3 style="margin:0 0 8px;font-size:15px;">🔐 Permissão necessária</h3>
+        <div style="font-size:13px;margin-bottom:8px;">O agente quer executar a ferramenta <b style="color:#d29922;">${escapeHtml(data.tool)}</b>.</div>
+        ${data.label ? `<div style="font-size:12px;color:#8b949e;margin-bottom:8px;">${escapeHtml(data.label)}</div>` : ''}
+        ${argsStr ? `<div style="font-size:11px;color:#6e7681;background:#0d1117;padding:8px;border-radius:6px;margin-bottom:12px;max-height:120px;overflow:auto;white-space:pre-wrap;word-break:break-all;">${escapeHtml(argsStr)}</div>` : ''}
+        <div style="display:flex;gap:8px;flex-wrap:wrap;">
+            <button class="perm-btn" data-allow="1" data-always="0" style="padding:8px 14px;background:#238636;border:none;border-radius:6px;color:#fff;cursor:pointer;font-size:13px;font-weight:600;">✅ Permitir</button>
+            <button class="perm-btn" data-allow="1" data-always="1" style="padding:8px 14px;background:#1f6feb;border:none;border-radius:6px;color:#fff;cursor:pointer;font-size:13px;">🔓 Sempre permitir</button>
+            <button class="perm-btn" data-allow="0" data-always="0" style="padding:8px 14px;background:#30363d;border:none;border-radius:6px;color:#fff;cursor:pointer;font-size:13px;">⛔ Negar</button>
+            <button class="perm-btn" data-allow="0" data-always="1" style="padding:8px 14px;background:#da3633;border:none;border-radius:6px;color:#fff;cursor:pointer;font-size:13px;">🚫 Sempre negar</button>
+        </div>`;
+    overlay.appendChild(box);
+    document.body.appendChild(overlay);
+    const respond = function(allow, always) {
+        overlay.remove();
+        sendStreamingMessage({ type: 'interaction-response', id: data.id, value: { allow, always } });
+        resetStreamTimeout();
+    };
+    box.querySelectorAll('.perm-btn').forEach(b => {
+        b.addEventListener('click', () => respond(b.dataset.allow === '1', b.dataset.always === '1'));
+    });
+}
+
+function showQuestionPrompt(data) {
+    const overlay = document.createElement('div');
+    overlay.style.cssText = 'position:fixed;top:0;left:0;width:100%;height:100%;background:rgba(0,0,0,0.6);display:flex;align-items:center;justify-content:center;z-index:9500;';
+    const box = document.createElement('div');
+    box.style.cssText = 'background:#161b22;border:1px solid #58a6ff;border-radius:10px;padding:20px;width:460px;max-width:90vw;box-shadow:0 8px 32px rgba(0,0,0,0.6);';
+    box.innerHTML = `
+        <h3 style="margin:0 0 8px;font-size:15px;">💬 O agente pergunta</h3>
+        <div style="font-size:13px;margin-bottom:12px;">${escapeHtml(data.pergunta)}</div>
+        <input type="text" id="questionAnswerInput" placeholder="Sua resposta..." style="width:100%;padding:8px 12px;background:#0d1117;border:1px solid #30363d;border-radius:6px;color:#e6edf3;font-size:13px;box-sizing:border-box;margin-bottom:12px;">
+        <div style="display:flex;gap:8px;justify-content:flex-end;">
+            <button id="questionCancelBtn" style="padding:8px 14px;background:#30363d;border:none;border-radius:6px;color:#fff;cursor:pointer;font-size:13px;">Pular</button>
+            <button id="questionSendBtn" style="padding:8px 14px;background:#1f6feb;border:none;border-radius:6px;color:#fff;cursor:pointer;font-size:13px;font-weight:600;">Enviar</button>
+        </div>`;
+    overlay.appendChild(box);
+    document.body.appendChild(overlay);
+    const input = box.querySelector('#questionAnswerInput');
+    const respond = function(value) {
+        overlay.remove();
+        sendStreamingMessage({ type: 'interaction-response', id: data.id, value });
+        resetStreamTimeout();
+    };
+    const send = function() { const v = input.value.trim(); if (v) respond({ resposta: v }); };
+    box.querySelector('#questionSendBtn').addEventListener('click', send);
+    input.addEventListener('keypress', (e) => { if (e.key === 'Enter') send(); });
+    box.querySelector('#questionCancelBtn').addEventListener('click', () => respond(null));
+    setTimeout(() => input.focus(), 50);
+}
+
+function renderAgentTodos(todos) {
+    if (!todos || !todos.length) return;
+    const lines = todos.map((t) => {
+        const icon = t.status === 'completed' ? '✅' : t.status === 'in_progress' ? '🔨' : '⬜';
+        return `${icon} ${t.titulo}`;
+    }).join('\n');
+    addMessage('system', '📋 Plano de tarefas:\n' + lines);
+}
+
 function showApprovalModal(data) {
     const hasSugestoes = data.sugestoes && Array.isArray(data.sugestoes) && data.sugestoes.length > 0;
     const hasArquivos = data.arquivos && data.arquivos.length > 0;
@@ -3622,6 +4238,8 @@ function showApprovalModal(data) {
     }
 
     pendingApproval = data;
+    acceptedFilesMap = {};
+
     document.getElementById('approvalResumo').textContent = data.resumo || '';
     const list = document.getElementById('approvalFilesList');
     list.innerHTML = '';
@@ -3638,8 +4256,8 @@ function showApprovalModal(data) {
             if (s.id === 'custom') {
                 btnHtml += `<div class="sugestao-custom-wrap" style="margin:4px 0;">
                     <button class="sugestao-btn sugestao-custom-btn" data-sid="${escapeHtml(s.id)}" data-planid="${escapeHtml(data.planId)}" style="display:block;width:100%;text-align:left;padding:8px 12px;background:#21262d;border:1px solid #30363d;border-radius:6px;color:#e6edf3;cursor:pointer;font-size:13px;">${impactLabel} <b>${escapeHtml(s.titulo)}</b><br><span style="font-size:11px;color:#8b949e;">${escapeHtml(s.descricao)}</span></button>
-                    <input type="text" class="sugestao-custom-input" placeholder="Descreva exatamente o que deseja..." style="display:none;width:100%;margin-top:4px;padding:6px 8px;background:#0d1117;border:1px solid #30363d;border-radius:4px;color:#e6edf3;font-size:12px;box-sizing:border-box;">
-                    <button class="sugestao-custom-send" style="display:none;margin-top:4px;padding:4px 12px;background:#1f6feb;border:none;border-radius:4px;color:#fff;cursor:pointer;font-size:12px;">Enviar</button>
+                    <textarea class="sugestao-custom-input" rows="3" placeholder="Descreva exatamente o que você deseja, com o nível de detalhe que preferir..." style="display:none;width:100%;margin-top:6px;padding:8px 10px;background:#0d1117;border:1px solid #58a6ff;border-radius:6px;color:#e6edf3;font-size:13px;box-sizing:border-box;resize:vertical;font-family:inherit;"></textarea>
+                    <button class="sugestao-custom-send" style="display:none;margin-top:6px;padding:6px 14px;background:#1f6feb;border:none;border-radius:6px;color:#fff;cursor:pointer;font-size:13px;font-weight:600;">🚀 Enviar</button>
                 </div>`;
             } else {
                 btnHtml += `<button class="sugestao-btn" data-sid="${escapeHtml(s.id)}" data-planid="${escapeHtml(data.planId)}" style="display:block;width:100%;text-align:left;padding:8px 12px;margin:4px 0;background:#21262d;border:1px solid #30363d;border-radius:6px;color:#e6edf3;cursor:pointer;font-size:13px;">${impactLabel} <b>${escapeHtml(s.titulo)}</b><br><span style="font-size:11px;color:#8b949e;">${escapeHtml(s.descricao)}</span></button>`;
@@ -3668,11 +4286,12 @@ function showApprovalModal(data) {
                             send.removeEventListener('click', execCustom);
                             doExecuteSuggestion(data, this.dataset.planid || data.planId, this.dataset.sid, val);
                         }.bind(this));
-                        input.addEventListener('keypress', function execCustomEnter(e) {
-                            if (e.key !== 'Enter') return;
+                        input.addEventListener('keydown', function execCustomEnter(e) {
+                            if (e.key !== 'Enter' || (!e.ctrlKey && !e.metaKey)) return;
+                            e.preventDefault();
                             const val = input.value.trim();
                             if (!val) return;
-                            input.removeEventListener('keypress', execCustomEnter);
+                            input.removeEventListener('keydown', execCustomEnter);
                             doExecuteSuggestion(data, this.dataset.planid || data.planId, this.dataset.sid, val);
                         }.bind(this));
                         return;
@@ -3688,6 +4307,10 @@ function showApprovalModal(data) {
             stopAutoExecCountdown();
             closeApprovalModal();
             isStreaming = true;
+            taskConcluded = false;
+            if (concludeTimer) { clearTimeout(concludeTimer); concludeTimer = null; }
+            if (noProgressTimer) { clearTimeout(noProgressTimer); noProgressTimer = null; }
+            armMaxTaskTimer();
             document.getElementById('sendButton').disabled = true;
             document.getElementById('cancelButton').style.display = 'inline-block';
             const topFill = document.getElementById('progressBarFill');
@@ -3717,7 +4340,7 @@ function showApprovalModal(data) {
                     <span style="font-size:11px;color:#8b949e;margin-left:4px;">${s.impacto === 'alto' ? '🔴 alto' : s.impacto === 'médio' ? '🟡 médio' : '🟢 baixo'}</span>
                 </label>
                 <div style="margin:2px 0 4px 30px;font-size:12px;color:#8b949e;">${escapeHtml(s.descricao)}</div>
-                ${isCustom ? '<input type="text" class="custom-request-input" placeholder="Descreva exatamente o que deseja..." style="display:none;width:calc(100% - 36px);margin:4px 0 4px 30px;padding:6px 8px;background:#0d1117;border:1px solid #30363d;border-radius:4px;color:#e6edf3;font-size:12px;">' : ''}
+                ${isCustom ? '<textarea class="custom-request-input" rows="3" placeholder="Descreva exatamente o que você deseja, com o nível de detalhe que preferir..." style="display:none;width:calc(100% - 36px);margin:6px 0 4px 30px;padding:6px 8px;background:#0d1117;border:1px solid #58a6ff;border-radius:6px;color:#e6edf3;font-size:13px;box-sizing:border-box;resize:vertical;font-family:inherit;"></textarea>' : ''}
                 ${(s.arquivos || []).map(a => `<div style="margin:1px 0 1px 30px;font-size:11px;color:#6e7681;">📄 ${escapeHtml(a.caminho)} (${escapeHtml(a.acao || 'modificar')})</div>`).join('')}
             `;
             if (isCustom) {
@@ -3733,39 +4356,95 @@ function showApprovalModal(data) {
     } else {
         for (let i = 0; i < data.arquivos.length; i++) {
             const f = data.arquivos[i];
+            const fileIdx = i;
+            acceptedFilesMap[fileIdx] = true;
+
             const row = document.createElement('div');
-            row.className = 'approval-file';
+            row.className = 'approval-file approval-file-expandable';
+            row.dataset.fileIdx = fileIdx;
             const actionText = f.acao === 'criar' ? '🆕 Criar' : f.acao === 'deletar' ? '🗑️ Deletar' : '✏️ Modificar';
             const actionClass = f.acao === 'criar' ? 'acao-criar' : f.acao === 'deletar' ? 'acao-deletar' : 'acao-modificar';
-            const hasContent = f.conteudo && f.conteudo.length > 0;
-            const fileId = 'af_' + i;
-            row.dataset.fileIdx = i;
+            const hasDiff = f.acao === 'modificar' && f.originalConteudo !== undefined && f.conteudo;
+            const byteLen = f.conteudo ? f.conteudo.length : 0;
 
-            let headerHtml = '<div class="approval-file-header">';
-            headerHtml += '<input type="checkbox" class="approval-file-toggle" checked data-idx="' + i + '" title="Incluir/excluir este arquivo">';
+            let headerHtml = '<div class="approval-file-header" style="display:flex;align-items:center;gap:8px;cursor:pointer;padding:2px 0;">';
+            headerHtml += '<input type="checkbox" class="approval-file-toggle" checked data-idx="' + fileIdx + '" title="Incluir/excluir este arquivo">';
             headerHtml += '<span class="approval-acao ' + actionClass + '">' + actionText + '</span>';
-            headerHtml += '<span class="approval-caminho">' + escapeHtml(f.caminho) + '</span>';
-            if (hasContent) {
-                headerHtml += '<span style="font-size:10px;color:#484f58;margin-left:auto;">' + (f.conteudo || '').length + ' bytes</span>';
-                headerHtml += '<span class="approval-file-chevron">▶</span>';
+            headerHtml += '<span class="approval-caminho" style="flex:1;">' + escapeHtml(f.caminho) + '</span>';
+            if (byteLen > 0) {
+                headerHtml += '<span style="font-size:10px;color:#484f58;">' + byteLen + ' bytes</span>';
             }
+            headerHtml += '<button class="approval-accept-btn" data-idx="' + fileIdx + '" title="Aceitar alteração" style="padding:2px 8px;background:#238636;border:none;border-radius:4px;color:#fff;cursor:pointer;font-size:11px;font-weight:600;">✅</button>';
+            headerHtml += '<button class="approval-reject-btn" data-idx="' + fileIdx + '" title="Rejeitar alteração" style="padding:2px 8px;background:#da3633;border:none;border-radius:4px;color:#fff;cursor:pointer;font-size:11px;font-weight:600;">❌</button>';
+            if (hasDiff) {
+                headerHtml += '<button class="approval-diff-btn" data-idx="' + fileIdx + '" title="Ver diff lado a lado" style="padding:2px 8px;background:#21262d;border:1px solid #30363d;border-radius:4px;color:#c9d1d9;cursor:pointer;font-size:11px;">👁️ Diff</button>';
+            }
+            if (f.explicacao) headerHtml += '<span style="font-size:10px;color:#6e7681;margin-left:4px;" title="' + escapeHtml(f.explicacao) + '">💬</span>';
             headerHtml += '</div>';
 
-            let editorHtml = '';
-            if (hasContent) {
-                editorHtml = '<div class="approval-file-editor">';
-                editorHtml += '<textarea class="approval-content-editor" id="' + fileId + '" spellcheck="false">' + escapeHtml(f.conteudo || '') + '</textarea>';
-                editorHtml += '</div>';
+            let previewHtml = '';
+            if (byteLen > 0 && !hasDiff) {
+                const preview = f.conteudo.slice(0, 500);
+                const more = f.conteudo.length > 500 ? '\n... (truncado)' : '';
+                previewHtml = '<div class="approval-diff-preview" style="display:none;margin-top:4px;padding:6px 8px;background:#0d1117;border:1px solid #30363d;border-radius:4px;font-family:Consolas,monospace;font-size:11px;color:#7ee787;max-height:150px;overflow-y:auto;white-space:pre-wrap;">' + escapeHtml(preview + more) + '</div>';
+            } else if (hasDiff) {
+                previewHtml = '<div class="approval-diff-preview" style="display:none;margin-top:4px;">' +
+                    '<div class="approval-diff-container" id="approvalDiff_' + fileIdx + '" style="height:260px;border:1px solid #30363d;border-radius:4px;overflow:hidden;"></div>' +
+                    '</div>';
             }
 
-            row.innerHTML = headerHtml + editorHtml;
-            if (hasContent) {
-                const header = row.querySelector('.approval-file-header');
-                header.addEventListener('click', function(e) {
-                    if (e.target.classList.contains('approval-file-toggle')) return;
-                    row.classList.toggle('active');
+            row.innerHTML = headerHtml + previewHtml;
+
+            const toggle = row.querySelector('.approval-file-toggle');
+            const acceptBtn = row.querySelector('.approval-accept-btn');
+            const rejectBtn = row.querySelector('.approval-reject-btn');
+
+            toggle.addEventListener('change', function() {
+                acceptedFilesMap[fileIdx] = this.checked;
+                updateAcceptRejectButtons(row, fileIdx);
+            });
+
+            acceptBtn.addEventListener('click', function(e) {
+                e.stopPropagation();
+                acceptedFilesMap[fileIdx] = true;
+                toggle.checked = true;
+                updateAcceptRejectButtons(row, fileIdx);
+            });
+
+            rejectBtn.addEventListener('click', function(e) {
+                e.stopPropagation();
+                acceptedFilesMap[fileIdx] = false;
+                toggle.checked = false;
+                updateAcceptRejectButtons(row, fileIdx);
+            });
+
+            const diffBtn = row.querySelector('.approval-diff-btn');
+            if (diffBtn) {
+                diffBtn.addEventListener('click', function(e) {
+                    e.stopPropagation();
+                    const previewDiv = row.querySelector('.approval-diff-preview');
+                    const isVisible = previewDiv.style.display !== 'none';
+                    if (isVisible) {
+                        previewDiv.style.display = 'none';
+                        disposeApprovalDiff(fileIdx);
+                    } else {
+                        previewDiv.style.display = 'block';
+                        renderApprovalDiff(fileIdx, f.originalConteudo || '', f.conteudo || '');
+                    }
                 });
             }
+
+            const header = row.querySelector('.approval-file-header');
+            if (header && !diffBtn) {
+                header.addEventListener('click', function(e) {
+                    if (e.target.tagName === 'INPUT' || e.target.tagName === 'BUTTON') return;
+                    const previewDiv = row.querySelector('.approval-diff-preview');
+                    if (previewDiv) {
+                        previewDiv.style.display = previewDiv.style.display === 'none' ? 'block' : 'none';
+                    }
+                });
+            }
+
             if (f.explicacao) row.title = f.explicacao;
             list.appendChild(row);
         }
@@ -3776,6 +4455,59 @@ function showApprovalModal(data) {
 
     stopAutoExecCountdown();
     return true;
+}
+
+function updateAcceptRejectButtons(row, idx) {
+    const acceptBtn = row.querySelector('.approval-accept-btn');
+    const rejectBtn = row.querySelector('.approval-reject-btn');
+    if (acceptedFilesMap[idx]) {
+        acceptBtn.style.background = '#238636';
+        acceptBtn.style.opacity = '1';
+        rejectBtn.style.background = '#21262d';
+        rejectBtn.style.opacity = '0.5';
+    } else {
+        acceptBtn.style.background = '#21262d';
+        acceptBtn.style.opacity = '0.5';
+        rejectBtn.style.background = '#da3633';
+        rejectBtn.style.opacity = '1';
+    }
+}
+
+function renderApprovalDiff(idx, original, modified) {
+    disposeApprovalDiff(idx);
+    const container = document.getElementById('approvalDiff_' + idx);
+    if (!container || !monacoReady) return;
+
+    try {
+        const diffEditor = monaco.editor.createDiffEditor(container, {
+            automaticLayout: true,
+            readOnly: true,
+            renderSideBySide: true,
+            fontSize: 12,
+            theme: document.body.classList.contains('theme-light') ? 'vs' : 'vs-dark',
+            minimap: { enabled: false },
+            scrollBeyondLastLine: false,
+        });
+        const originalModel = monaco.editor.createModel(original || '', 'plaintext');
+        const modifiedModel = monaco.editor.createModel(modified || '', 'plaintext');
+        diffEditor.setModel({ original: originalModel, modified: modifiedModel });
+        fileDiffEditors.push({ idx, diffEditor, originalModel, modifiedModel });
+    } catch (e) {}
+}
+
+function disposeApprovalDiff(idx) {
+    const entry = fileDiffEditors.find(e => e.idx === idx);
+    if (entry) {
+        try { entry.diffEditor.dispose(); } catch (e) {}
+        fileDiffEditors = fileDiffEditors.filter(e => e.idx !== idx);
+    }
+}
+
+function disposeAllApprovalDiffs() {
+    for (const entry of fileDiffEditors) {
+        try { entry.diffEditor.dispose(); } catch (e) {}
+    }
+    fileDiffEditors = [];
 }
 
 function startAutoExecCountdown() {
@@ -3819,18 +4551,12 @@ function executePendingPlan() {
             payload.customRequest = customInput.value.trim();
         }
     } else if (pendingApproval.arquivos) {
-        const toggles = document.getElementById('approvalFilesList').querySelectorAll('.approval-file-toggle');
-        const includeIdxs = new Set();
-        toggles.forEach(cb => { if (cb.checked) includeIdxs.add(parseInt(cb.dataset.idx)); });
-        payload.arquivos = pendingApproval.arquivos.filter((f, i) => includeIdxs.has(i)).map((f, i) => {
-            const editor = document.getElementById('af_' + i);
-            return {
-                caminho: f.caminho,
-                acao: f.acao,
-                explicacao: f.explicacao || '',
-                conteudo: editor ? editor.value : (f.conteudo || '')
-            };
-        });
+        payload.arquivos = pendingApproval.arquivos.filter((f, i) => acceptedFilesMap[i] !== false).map((f) => ({
+            caminho: f.caminho,
+            acao: f.acao,
+            explicacao: f.explicacao || '',
+            conteudo: f.conteudo || ''
+        }));
     }
     const noteInput = document.getElementById('approvalNoteInput');
     if (noteInput && noteInput.value.trim()) {
@@ -3851,6 +4577,7 @@ function cancelApproval() {
 }
 
 function closeApprovalModal() {
+    disposeAllApprovalDiffs();
     document.getElementById('approvalModal').style.display = 'none';
 }
 
@@ -3860,7 +4587,23 @@ function closeApprovalModal() {
 function sendMessage() {
     const input = document.getElementById('chatInput');
     let message = input.value.trim();
-    if (!message || isStreaming || isRunning) return;
+
+    if (isStreaming || isRunning) {
+        // Saneamento: o flag de streaming pode ficar preso em true sem trabalho
+        // real (ex.: 'done' perdido, aba inativa que throttles os setInterval de
+        // auto-cura). Se o backend está mudo e nenhuma fase está em execução,
+        // conclui a tarefa pendente em vez de bloquear o envio para sempre.
+        var noRealWork = !isRunning
+            && Date.now() - lastBackendActivity > 20000
+            && !activityItems.some(function(i) { return i.status === 'running' && !i.end; });
+        if (noRealWork) {
+            try { forceConcludeTask(); } catch (e) {}
+        } else {
+            if (message) showToast('⏳ Aguarde a tarefa atual terminar');
+            return;
+        }
+    }
+    if (!message) return;
 
     if (attachedFiles.length) {
         message = buildAttachmentPrompt(message);
@@ -3887,14 +4630,23 @@ function sendMessage() {
     input.value = '';
     addMessage('user', message);
     isStreaming = true;
-    document.getElementById('sendButton').disabled = true;
+    resetStreamTimeout();
+    const sendBtn = document.getElementById('sendButton');
+    sendBtn.disabled = true;
+    sendBtn.textContent = '⏳ Enviando...';
     document.getElementById('cancelButton').style.display = 'inline-block';
 
     processedFiles = 0;
     totalFilesToProcess = 0;
     agentMessages = {};
+    if (hideProgressTimer) { clearTimeout(hideProgressTimer); hideProgressTimer = null; }
     hideProgress();
     closeApprovalModal();
+    taskConcluded = false;
+    concludedTaskFiles = [];
+    if (concludeTimer) { clearTimeout(concludeTimer); concludeTimer = null; }
+    if (noProgressTimer) { clearTimeout(noProgressTimer); noProgressTimer = null; }
+    armMaxTaskTimer();
 
     const effectiveMode = isPlanMode ? 'clarify' : currentMode;
 
@@ -3912,17 +4664,27 @@ function sendMessage() {
     startTaskActivity((modelName || provider) + ' · ' + (message.length > 48 ? message.slice(0, 48) + '…' : message));
     startAnalysisActivity();
 
-    sendStreamingMessage({
+    const payload = {
         type: 'stream',
         message: message,
         model: currentModel,
         provider: provider,
-        mode: effectiveMode,
+        mode: smartMode ? 'auto' : effectiveMode,
         projectPath: currentProjectPath,
         token: BACKEND_TOKEN,
         history: collectChatHistory(),
-        reviewMode: reviewMode
-    });
+        reviewMode: !smartMode && reviewMode
+    };
+
+    const images = attachedFiles.filter(f => f.type === 'image' && f.dataUrl);
+    if (images.length) {
+        payload.images = images.map(f => ({ name: f.name, dataUrl: f.dataUrl }));
+    }
+    attachedFiles = [];
+    const previewContainer = document.getElementById('attachmentPreview');
+    if (previewContainer) previewContainer.remove();
+
+    sendStreamingMessage(payload);
 }
 
 function collectChatHistory() {
@@ -3938,40 +4700,113 @@ function collectChatHistory() {
     return items.slice(-15);
 }
 
+// Restaura o botão de enviar ao estado normal. Separado para a auto-cura
+// também liberar a UI sem depender do endTask (que nem sempre roda quando as
+// atividades terminam mas o 'done' não chega).
+function resetSendButton() {
+    var sendBtn = document.getElementById('sendButton');
+    if (sendBtn) { sendBtn.disabled = false; sendBtn.textContent = 'Enviar'; }
+    var cancelBtn = document.getElementById('cancelButton');
+    if (cancelBtn) cancelBtn.style.display = 'none';
+}
+
 function endTask(toastMsg) {
     const finalStatus = toastMsg && (toastMsg.includes('cancelada') || toastMsg.includes('cancelled')) ? 'cancelled'
         : toastMsg && (toastMsg.includes('❌') || toastMsg.includes('Erro') || toastMsg.includes('error')) ? 'error'
         : 'success';
-    finishAnalysisActivity(finalStatus === 'success');
-    setActivityStatus('task', finalStatus, { error: toastMsg && finalStatus === 'error' ? toastMsg : '' });
-    if (finalStatus === 'error' || finalStatus === 'cancelled') {
+
+    // Marca a tarefa como concluída ANTES de qualquer limpeza: caminhos como o
+    // stream timeout e a conexão perdida chamam endTask diretamente, e sem isso
+    // o estado fica taskConcluded=false + isStreaming=false (nada mais dispara).
+    taskConcluded = true;
+
+    // 1) Sempre limpa streaming/botão PRIMEIRO, independente do que vier abaixo.
+    //    Nenhuma falha de helper pode deixar a UI presa em "Enviando.../Executando".
+    try {
+        isStreaming = false;
+        clearStreamTimeout();
+        if (maxTaskTimer) { clearTimeout(maxTaskTimer); maxTaskTimer = null; }
+        if (concludeTimer) { clearTimeout(concludeTimer); concludeTimer = null; }
+        if (noProgressTimer) { clearTimeout(noProgressTimer); noProgressTimer = null; }
+        resetSendButton();
+        var cancelBtn = document.getElementById('cancelButton');
+        if (cancelBtn) cancelBtn.style.display = 'none';
+        stopAutoExecCountdown();
+        closeApprovalModal();
+    } catch (e) {
+        isStreaming = false;
+        console.error('endTask cleanup error:', e);
+    }
+
+    // 2) Encerra qualquer atividade pendente (running) conforme o resultado
+    try {
+        // Barra de progresso completa ao finalizar: em modo agente direto não há
+        // mensagem 'plan' (que seta totalFilesToProcess), então a barra ficaria
+        // presa em 0%/parcial. Ao concluir com sucesso, leva a 100% e mostra o
+        // preenchimento terminar antes de esconder (com pequeno atraso).
+        if (finalStatus === 'success') {
+            totalFilesToProcess = Math.max(totalFilesToProcess, 1);
+            processedFiles = totalFilesToProcess;
+            updateProgressUI();
+            if (hideProgressTimer) { clearTimeout(hideProgressTimer); hideProgressTimer = null; }
+            hideProgressTimer = setTimeout(hideProgress, 800);
+        } else {
+            if (hideProgressTimer) { clearTimeout(hideProgressTimer); hideProgressTimer = null; }
+            hideProgress();
+        }
         for (const item of activityItems) {
             if (item.status === 'running') setActivityStatus(item.id, finalStatus);
         }
+        finishAnalysisActivity(finalStatus === 'success');
+        setActivityStatus('task', finalStatus, { error: toastMsg && finalStatus === 'error' ? toastMsg : '' });
+        updatePipeline('done', finalStatus === 'success' ? 'done' : finalStatus === 'cancelled' ? 'cancelled' : 'error');
+    } catch (e) {
+        // A tarefa nunca pode ficar marcada como "Executando" sem um fim
+        if (typeof setActivityStatus === 'function') {
+            try { setActivityStatus('task', finalStatus); } catch (e2) {}
+        }
     }
-    updatePipeline('done', finalStatus === 'success' ? 'done' : finalStatus === 'cancelled' ? 'cancelled' : 'error');
+
+    var taskDurMs = null;
     if (terminalBlockStart > 0) {
-        var totalMs = Date.now() - terminalBlockStart;
-        var totalStr = totalMs < 1000 ? Math.round(totalMs) + 'ms' : (totalMs / 1000).toFixed(1) + 's';
-        terminalAdd('block-end', (toastMsg || 'Concluído').replace(/^✅\s*/, '') + ' · ' + totalStr);
+        try {
+            taskDurMs = Date.now() - terminalBlockStart;
+            var totalMs = taskDurMs;
+            var totalStr = totalMs < 1000 ? Math.round(totalMs) + 'ms' : (totalMs / 1000).toFixed(1) + 's';
+            terminalAdd('block-end', (toastMsg || 'Concluído').replace(/^✅\s*/, '') + ' · ' + totalStr);
+        } catch (e) {}
     }
-    if (toastMsg) showToast(toastMsg);
-    isStreaming = false;
-    document.getElementById('sendButton').disabled = false;
-    document.getElementById('cancelButton').style.display = 'none';
-    hideProgress();
-    stopAutoExecCountdown();
-    closeApprovalModal();
-    saveChatHistory();
+    if (toastMsg) {
+        recordTaskLog(finalStatus, toastMsg, taskDurMs);
+        showToast(toastMsg);
+    }
+    try { saveChatHistory(); } catch (e) {}
+}
+
+// O cancelamento precisa ir no MESMO socket da sessão que está transmitindo a
+// tarefa. No multi-agente, o stream roda no ws da sessão (window.ws via syncState),
+// e não no ws lexical do connectWebSocket — enviar no ws errado não interrompe nada.
+function getStreamingSocket() {
+    if (typeof window !== 'undefined' && window.ws && window.ws.readyState === WebSocket.OPEN) return window.ws;
+    if (ws && ws.readyState === WebSocket.OPEN) return ws;
+    return null;
 }
 
 function cancelTask() {
-    if (ws && ws.readyState === WebSocket.OPEN) {
-        ws.send(JSON.stringify({ type: 'cancel' }));
+    if (!isStreaming) {
+        document.getElementById('cancelButton').style.display = 'none';
+        return;
+    }
+    var sock = getStreamingSocket();
+    if (sock) {
+        try { sock.send(JSON.stringify({ type: 'cancel' })); } catch (e) {}
         document.getElementById('cancelButton').style.display = 'none';
         showToast('⏹️ Cancelando...');
+        setTimeout(() => {
+            if (isStreaming) endTask('⏹️ Tarefa cancelada (timeout)');
+        }, 3000);
     } else {
-        showToast('⏹️ Sem conexão com o backend');
+        endTask('⏹️ Tarefa cancelada');
     }
 }
 
@@ -3993,16 +4828,17 @@ function setProgress(total) {
 }
 
 function updateProgressUI() {
-    const pct = totalFilesToProcess > 0 ? Math.round((processedFiles / totalFilesToProcess) * 100) : 0;
+    const pct = totalFilesToProcess > 0 ? Math.min(Math.round((processedFiles / totalFilesToProcess) * 100), 100) : 0;
     const fill = document.getElementById('progressFill');
     const text = document.getElementById('progressText');
     const topFill = document.getElementById('progressBarFill');
     if (fill) fill.style.width = pct + '%';
-    if (text) text.textContent = `${processedFiles}/${totalFilesToProcess}`;
+    if (text) text.textContent = `${Math.min(processedFiles, totalFilesToProcess || processedFiles)}/${totalFilesToProcess || processedFiles}`;
     if (topFill) topFill.style.width = pct + '%';
 }
 
 function hideProgress() {
+    if (hideProgressTimer) { clearTimeout(hideProgressTimer); hideProgressTimer = null; }
     const bar = document.getElementById('progressBar');
     const topBar = document.getElementById('progressBarContainer');
     const topFill = document.getElementById('progressBarFill');
@@ -4011,6 +4847,8 @@ function hideProgress() {
     if (topBar) topBar.style.display = 'none';
     if (topFill) { topFill.classList.remove('indeterminate'); topFill.style.width = '0%'; }
     if (progressFill) { progressFill.classList.remove('indeterminate'); progressFill.style.width = '0%'; }
+    const text = document.getElementById('progressText');
+    if (text) text.textContent = '';
     processedFiles = 0;
     totalFilesToProcess = 0;
 }
@@ -4031,6 +4869,62 @@ function fmtDur(ms) {
     const m = Math.floor(s / 60);
     return `${m}m ${s % 60}s`;
 }
+
+// Duração "ao vivo" para itens em execução.
+function liveDur(startTs) {
+    return fmtDur(Date.now() - (startTs || Date.now()));
+}
+
+// Atualiza a cada segundo o tempo decorrido dos itens de atividade em execução,
+// deixando visível que a tarefa está rodando (e há quanto tempo) — não travada.
+setInterval(function() {
+    // Auto-cura: um item só pode permanecer "Executando" enquanto o backend está
+    // realmente trabalhando. Nenhuma flag (isStreaming, sessões multi-agente) é
+    // confiável — todas podem ficar inconsistentes. Dois sinais sólidos:
+    //   1. taskConcluded=true  → a tarefa já terminou, sobrar item é órfão;
+    //   2. backend silencioso há 60s → o agente morreu/pendu (o progressTimer
+    //      dos testes emite a cada 20s, então 60s de silêncio é inequívoco).
+    var taskDone = taskConcluded && !isRunning;
+    var backendSilent = Date.now() - lastBackendActivity > 60000;
+    if (backendSilent && isStreaming && !taskConcluded) {
+        // O backend ficou mudo por 60s mas o 'done' não chegou e o chat segue
+        // "Enviando...". Pode não haver item órfão (todos finalizados pelos
+        // file-status/test-status), então a auto-cura de itens não ajuda — é
+        // preciso concluir a tarefa de verdade (restaura botão, isStreaming etc.).
+        forceConcludeTask();
+    } else if (isStreaming && !taskConcluded && Date.now() - lastBackendActivity > 20000) {
+        // Gatilho rápido: todas as fases visíveis terminaram (nenhum item em
+        // "running"), o backend emudeceu há 20s mas o 'done' não veio — o chat
+        // fica preso em "Enviando..." sem o usuário conseguir enviar outra
+        // mensagem. Conclui a tarefa para liberar a UI imediatamente.
+        var anyRunning = false;
+        for (const item of activityItems) {
+            if (item.status === 'running' && !item.end) { anyRunning = true; break; }
+        }
+        if (!anyRunning) {
+            forceConcludeTask();
+        }
+    } else if (taskDone || backendSilent) {
+        var hadStuck = false;
+        for (const item of activityItems) {
+            if (item.status === 'running' && !item.end) {
+                setActivityStatus(item.id, 'success');
+                hadStuck = true;
+            }
+        }
+        // A tarefa terminou (ou o backend está mudo): mesmo sem item preso, a
+        // barra de progresso e o botão podem ter ficado "executando" porque o
+        // endTask não rodou nesse caminho. Restaura os dois sempre que detectar
+        // o fim — incondicional, não só quando havia item órfão.
+        try { resetSendButton(); } catch (e) {}
+        try { hideProgress(); } catch (e) {}
+    }
+    for (const item of activityItems) {
+        if (item.status !== 'running') continue;
+        const el = document.getElementById('act-dur-' + item.id);
+        if (el) el.textContent = '⏱️ ' + liveDur(item.startTs);
+    }
+}, 1000);
 
 function upsertActivity(id, patch) {
     let item = activityItems.find(a => a.id === id);
@@ -4159,14 +5053,17 @@ function terminalAdd(type, text, meta) {
     renderTerminal();
 }
 
-function terminalFinishTool(id, status) {
+function terminalFinishTool(id, status, errorDetail) {
     var line = null;
     for (var i = terminalLines.length - 1; i >= 0; i--) {
         if (terminalLines[i].id === id) { line = terminalLines[i]; break; }
     }
     if (line) {
         line.type = status === 'error' ? 'error' : 'tool';
-        if (status === 'error') line.icon = '❌';
+        if (status === 'error') {
+            line.icon = '❌';
+            if (errorDetail) line.detail = errorDetail;
+        }
     }
     renderTerminal();
 }
@@ -4209,6 +5106,32 @@ function clearTerminal() {
     renderTerminal();
 }
 
+function buildActivityItemEl(item) {
+    const div = document.createElement('div');
+    div.className = `act-item ${item.status}`;
+    let statusText = item.status === 'running' ? 'Executando' : item.status === 'success' ? 'Concluído' : item.status === 'error' ? 'Erro' : item.status === 'cancelled' ? 'Cancelado' : '—';
+    if (item.status === 'running' && item.end) statusText = 'Concluído';
+    let html = `
+        <div class="act-top">
+            <span class="act-icon">${item.icon}</span>
+            <span class="act-label">${escapeHtml(item.label || 'Processo')}</span>
+            <span class="act-status-pill ${item.status}">${statusText}</span>
+        </div>
+    `;
+    if (item.file) html += `<div class="act-file">${escapeHtml(item.file)}</div>`;
+    const durHtml = item.end
+        ? `<span class="act-dur">⏱️ ${fmtDur(item.end - item.startTs)}</span>`
+        : `<span class="act-dur" id="act-dur-${item.id}">⏱️ ${liveDur(item.startTs)}</span>`;
+    html += `<div class="act-times">
+        <span class="time">▶️ ${fmtTime(item.start)}</span>
+        <span class="time">⏹️ ${fmtTime(item.end)}</span>
+        ${durHtml}
+    </div>`;
+    if (item.error) html += `<div class="act-error">❌ ${escapeHtml(item.error)}</div>`;
+    div.innerHTML = html;
+    return div;
+}
+
 function renderActivity() {
     const list = document.getElementById('activityList');
     if (!list) return;
@@ -4217,28 +5140,74 @@ function renderActivity() {
         return;
     }
     list.innerHTML = '';
-    for (const item of activityItems) {
-        const statusText = item.status === 'running' ? 'Executando' : item.status === 'success' ? 'Concluído' : item.status === 'error' ? 'Erro' : item.status === 'cancelled' ? 'Cancelado' : '—';
-        const div = document.createElement('div');
-        div.className = `act-item ${item.status}`;
-        let html = `
-            <div class="act-top">
-                <span class="act-icon">${item.icon}</span>
-                <span class="act-label">${escapeHtml(item.label || 'Processo')}</span>
-                <span class="act-status-pill ${item.status}">${statusText}</span>
-            </div>
-        `;
-        if (item.file) html += `<div class="act-file">${escapeHtml(item.file)}</div>`;
-        html += `<div class="act-times">
-            <span class="time">▶️ ${fmtTime(item.start)}</span>
-            <span class="time">⏹️ ${fmtTime(item.end)}</span>
-            ${item.end ? `<span class="act-dur">⏱️ ${fmtDur(item.end - item.startTs)}</span>` : ''}
-        </div>`;
-        if (item.error) html += `<div class="act-error">❌ ${escapeHtml(item.error)}</div>`;
-        div.innerHTML = html;
-        list.appendChild(div);
+    // Limite de visibilidade: com muitas tarefas acumuladas o painel fica longo.
+    // Mostra os últimos 20 itens e oferece "mostrar mais" (sem afetar a lógica).
+    const MAX_VISIBLE = 20;
+    const hasMore = activityItems.length > MAX_VISIBLE;
+    const visible = hasMore ? activityItems.slice(-MAX_VISIBLE) : activityItems;
+    for (const item of visible) {
+        list.appendChild(buildActivityItemEl(item));
+    }
+    if (hasMore) {
+        const btn = document.createElement('button');
+        btn.textContent = `▼ Mostrar tudo (${activityItems.length - MAX_VISIBLE} anteriores)`;
+        btn.className = 'btn-toolbar';
+        btn.style.cssText = 'width:100%;margin:6px 0;font-size:11px;padding:4px;cursor:pointer;';
+        btn.onclick = function() {
+            list.innerHTML = '';
+            for (const item of activityItems) {
+                list.appendChild(buildActivityItemEl(item));
+            }
+            list.scrollTop = list.scrollHeight;
+        };
+        list.appendChild(btn);
     }
     list.scrollTop = list.scrollHeight;
+}
+
+// ===== HISTÓRICO DE MENSAGENS (conclusões/erros) =====
+function getTaskLog() {
+    try { return JSON.parse(localStorage.getItem(TASK_LOG_KEY)) || []; } catch (e) { return []; }
+}
+
+function saveTaskLog(list) {
+    try { localStorage.setItem(TASK_LOG_KEY, JSON.stringify(list.slice(-200))); } catch (e) {}
+}
+
+function recordTaskLog(status, message, durationMs) {
+    if (!message) return;
+    const list = getTaskLog();
+    list.push({ ts: Date.now(), status, message: String(message), dur: durationMs ? Math.round(durationMs) : null });
+    saveTaskLog(list);
+    renderTaskLog();
+}
+
+function renderTaskLog() {
+    const listEl = document.getElementById('taskLogList');
+    if (!listEl) return;
+    const log = getTaskLog();
+    if (!log.length) {
+        listEl.innerHTML = '<div class="activity-empty">Nenhuma mensagem registrada ainda.<br><span class="activity-empty-sub">As conclusões/erros das tarefas aparecem aqui</span></div>';
+        return;
+    }
+    const statusLabel = { success: 'Sucesso', error: 'Erro', cancelled: 'Cancelado' };
+    const statusIcon = { success: '✅', error: '❌', cancelled: '⏹️' };
+    listEl.innerHTML = log.slice().reverse().map(function(item) {
+        const s = statusLabel[item.status] || item.status || '—';
+        const icon = statusIcon[item.status] || '📄';
+        const durHtml = item.dur ? `<span class="tl-dur">⏱️ ${fmtDur(item.dur)}</span>` : '';
+        return `<div class="task-log-item">
+            <div class="tl-time">${icon} <span class="tl-status ${escapeHtml(item.status || '')}">${escapeHtml(s)}</span> · ${fmtTime(item.ts)}${durHtml}</div>
+            <div class="tl-msg">${escapeHtml(item.message)}</div>
+        </div>`;
+    }).join('');
+    listEl.scrollTop = listEl.scrollHeight;
+}
+
+function clearTaskLog() {
+    try { localStorage.removeItem(TASK_LOG_KEY); } catch (e) {}
+    renderTaskLog();
+    showToast('🗑️ Histórico de mensagens limpo');
 }
 
 // ===== HOOKS DE ATIVIDADE =====
@@ -4257,12 +5226,23 @@ function startAnalysisActivity() {
 }
 
 function finishAnalysisActivity(success) {
+    // Idempotente: não sobrescreve um status final já definido (ex.: a análise
+    // falhou e depois um file-status tardio não pode reescrever para sucesso).
+    const item = activityItems.find(a => a.id === 'analysis');
+    if (item && item.status !== 'running') return;
     setActivityStatus('analysis', success ? 'success' : 'error');
 }
 
 function fileActivity(file, status) {
     const id = `file:${file}`;
     if (status === 'editing') {
+        // Se a tarefa já foi concluída (auto-conclusão ou 'done'), um status
+        // 'editing' tardio (pós-execução/commit) não pode criar um item preso
+        // em "Executando" para sempre. Já marca como concluído.
+        if (taskConcluded || !isStreaming) {
+            upsertActivity(id, { kind: 'file', icon: '✏️', label: 'Arquivo modificado', file, status: 'success', end: Date.now(), error: '' });
+            return;
+        }
         upsertActivity(id, { kind: 'file', icon: '✏️', label: 'Alterando arquivo', file, status: 'running', error: '' });
         return;
     }
@@ -4367,6 +5347,7 @@ function addMessage(role, content, agentId = null) {
     }
     container.appendChild(div);
     container.scrollTop = container.scrollHeight;
+    colorizeCodeBlocks(div);
     scheduleSaveChatHistory();
 }
 
@@ -4377,6 +5358,7 @@ function updateAgentMessage(agentId, content) {
     if (div) {
         const contentDiv = div.querySelector('.msg-content');
         contentDiv.innerHTML = renderChatContent(content);
+        colorizeCodeBlocks(contentDiv);
         const container = document.getElementById('messages');
         container.scrollTop = container.scrollHeight;
         scheduleSaveChatHistory();
@@ -4476,6 +5458,12 @@ function openConfigModal() {
         }
     }).catch(function() {});
 
+    apiFetch('/api/config/permissions').then(function(r) { return r.json(); }).then(function(data) {
+        if (data && Array.isArray(data.ask)) {
+            document.getElementById('configAskTools').value = data.ask.join(', ');
+        }
+    }).catch(function() {});
+
     // Limpa os valores (nunca expõe a chave real)
     document.getElementById('geminiKeyInput').value = '';
     document.getElementById('deepseekKeyInput').value = '';
@@ -4543,6 +5531,10 @@ async function saveConfig() {
         });
     }
 
+    try {
+        await savePermissionsFromConfig();
+    } catch(e) {}
+
     if (!geminiKey && !deepseekKey && !opencodeKey) {
         showConfigStatus('✅ Configurações salvas!', 'success');
         setTimeout(closeConfigModal, 1500);
@@ -4573,6 +5565,32 @@ function showConfigStatus(msg, type) {
     el.textContent = msg;
     el.className = type;
     el.style.display = 'block';
+}
+
+async function savePermissionsFromConfig() {
+    const el = document.getElementById('configAskTools');
+    if (!el) return;
+    const ask = el.value.split(',').map(function(s) { return s.trim(); }).filter(Boolean);
+    await apiFetch('/api/config/permissions', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ ask })
+    });
+}
+
+async function resetPermissions() {
+    try {
+        const res = await apiFetch('/api/config/permissions/reset', { method: 'POST' });
+        const data = await res.json();
+        if (data.success) {
+            showToast('🔓 Decisões "sempre permitir/negar" resetadas');
+            apiFetch('/api/config/permissions').then(function(r) { return r.json(); }).then(function(d) {
+                if (d && Array.isArray(d.ask)) document.getElementById('configAskTools').value = d.ask.join(', ');
+            }).catch(function() {});
+        }
+    } catch (e) {
+        showToast('❌ Erro ao resetar permissões');
+    }
 }
 
 // =============================================
@@ -4793,8 +5811,18 @@ function closeSnapshotModal() {
 // =============================================
 var PROVIDER_MODELS = {
     gemini: [
+        { value: 'gemini-3.7-flash', label: 'Gemini 3.7 Flash' },
+        { value: 'gemini-3.6-flash', label: 'Gemini 3.6 Flash' },
+        { value: 'gemini-3.5-flash', label: 'Gemini 3.5 Flash' },
+        { value: 'gemini-3.5-flash-lite', label: 'Gemini 3.5 Flash Lite' },
+        { value: 'gemini-3.1-pro', label: 'Gemini 3.1 Pro' },
+        { value: 'gemini-3.1-flash-lite', label: 'Gemini 3.1 Flash Lite' },
+        { value: 'gemini-3-flash', label: 'Gemini 3 Flash' },
+        { value: 'gemini-2.5-pro', label: 'Gemini 2.5 Pro' },
         { value: 'gemini-2.5-flash', label: 'Gemini 2.5 Flash' },
-        { value: 'gemini-2.5-pro', label: 'Gemini 2.5 Pro' }
+        { value: 'gemini-2.5-flash-lite', label: 'Gemini 2.5 Flash Lite' },
+        { value: 'gemini-2-flash', label: 'Gemini 2 Flash' },
+        { value: 'gemini-2-flash-lite', label: 'Gemini 2 Flash Lite' }
     ],
     deepseek: [
         { value: 'deepseek-v4-flash', label: 'DeepSeek V4 Flash' },
@@ -4805,7 +5833,9 @@ var PROVIDER_MODELS = {
         { value: 'gpt-4o-mini', label: 'GPT-4o Mini' }
     ],
     claude: [
-        { value: 'claude-sonnet-4', label: 'Claude Sonnet 4' },
+        { value: 'claude-fable-5', label: 'Claude Fable 5' },
+        { value: 'claude-opus-5', label: 'Claude Opus 5' },
+        { value: 'claude-sonnet-5', label: 'Claude Sonnet 5' },
         { value: 'claude-haiku-4.5', label: 'Claude Haiku 4.5' }
     ],
     opencode: []
@@ -4895,24 +5925,51 @@ function applyOpenCodeToggle(enabled) {
 //  TEMA CLARO/ESCURO
 // =============================================
 function initTheme() {
-    let theme = 'dark';
-    try { theme = localStorage.getItem(THEME_KEY) || 'dark'; } catch (e) {}
+    let theme = 'auto';
+    try { theme = localStorage.getItem(THEME_KEY) || 'auto'; } catch (e) {}
     applyTheme(theme);
+    if (theme === 'auto') {
+        try {
+            window.matchMedia('(prefers-color-scheme: dark)').addEventListener('change', function(e) {
+                var savedTheme = 'auto';
+                try { savedTheme = localStorage.getItem(THEME_KEY) || 'auto'; } catch (e) {}
+                if (savedTheme === 'auto') applyTheme(e.matches ? 'dark' : 'light');
+            });
+        } catch (e) {}
+    }
+}
+
+function resolveTheme(theme) {
+    if (theme === 'auto') {
+        try { return window.matchMedia && window.matchMedia('(prefers-color-scheme: dark)').matches ? 'dark' : 'light'; } catch (e) { return 'dark'; }
+    }
+    if (theme === 'light' || theme === 'dark') return theme;
+    return 'dark';
 }
 
 function applyTheme(theme) {
-    const isLight = theme === 'light';
+    var resolved = resolveTheme(theme);
+    var isLight = resolved === 'light';
     document.body.classList.toggle('theme-light', isLight);
-    document.getElementById('themeBtn').textContent = isLight ? '🌙' : '☀️';
+    document.getElementById('themeBtn').textContent = theme === 'auto' ? (isLight ? '☀️' : '🌙') : (isLight ? '🌙' : '☀️');
+    if (monacoEditor) monaco.editor.setTheme(resolved === 'light' ? 'vs' : 'vs-dark');
 }
 
 function toggleTheme() {
-    const isLight = document.body.classList.contains('theme-light');
-    const newTheme = isLight ? 'dark' : 'light';
-    applyTheme(newTheme);
+    var isLight = document.body.classList.contains('theme-light');
+    var currentTheme = 'dark';
+    try { currentTheme = localStorage.getItem(THEME_KEY) || 'auto'; } catch (e) {}
+    var resolved = resolveTheme(currentTheme);
+    var newTheme;
+    if (currentTheme === 'auto') {
+        newTheme = resolved === 'dark' ? 'light' : 'dark';
+    } else {
+        newTheme = resolved === 'dark' ? 'light' : (currentTheme === 'dark' ? 'auto' : 'dark');
+    }
     try { localStorage.setItem(THEME_KEY, newTheme); } catch (e) {}
-    if (monacoEditor) monaco.editor.setTheme(newTheme === 'light' ? 'vs' : 'vs-dark');
-    showToast(isLight ? '🌙 Tema escuro' : '☀️ Tema claro');
+    applyTheme(newTheme);
+    var labels = { dark: '🌙 Tema escuro', light: '☀️ Tema claro', auto: '🔄 Tema automático' };
+    showToast(labels[newTheme] || newTheme);
 }
 
 // =============================================
@@ -4953,13 +6010,15 @@ async function showGitBlame() {
 function renderChatContent(text) {
     if (!text) return '';
     if (!text.includes('```') && !text.includes('**') && !text.includes('#') && !text.includes('- '))
-        return escapeHtml(text).replace(/\n/g, '<br>');
+        return linkifyFilePaths(escapeHtml(text).replace(/\n/g, '<br>'));
     let html = '';
     const parts = text.split(/(```[\s\S]*?```)/g);
     for (const part of parts) {
         if (part.startsWith('```')) {
-            const code = part.replace(/```\w*\n?/, '').replace(/```$/, '');
-            html += '<pre><code>' + escapeHtml(code) + '</code></pre>';
+            const langMatch = part.match(/```(\w+)?\n?/);
+            const lang = langMatch ? (langMatch[1] || 'plaintext') : 'plaintext';
+            let code = part.replace(/```\w*\n?/, '').replace(/```$/, '');
+            html += '<pre><code class="language-' + escapeHtml(lang) + '" data-lang="' + escapeHtml(lang) + '">' + highlightCode(code, lang) + '</code></pre>';
         } else {
             let p = escapeHtml(part);
             p = p.replace(/\*\*(.+?)\*\*/g, '<strong>$1</strong>');
@@ -4970,10 +6029,56 @@ function renderChatContent(text) {
             p = p.replace(/^# (.+)$/gm, '<h2>$1</h2>');
             p = p.replace(/^- (.+)$/gm, '<li>$1</li>');
             p = p.replace(/\n/g, '<br>');
+            p = linkifyFilePaths(p);
             html += p;
         }
     }
     return html;
+}
+
+function linkifyFilePaths(html) {
+    return html.replace(/([\w.\-/\\]+\.(jsx?|tsx?|html?|css|scss|less|json|md|py|rb|go|rs|java|c|cpp|h|php|sql|yaml|yml|xml|sh|bat|env|lock)(:\d+)?)/gi, function(match) {
+        if (match.includes('<') || match.includes('>') || match.includes('&')) return match;
+        var path = match.replace(/:(\d+)$/, '');
+        var line = (match.match(/:(\d+)$/) || [])[1] || null;
+        var onClick = line
+            ? 'onclick="openFileAtLine(\'' + escapeHtml(path) + '\',' + line + ')"'
+            : 'onclick="openReferencedFile(\'' + escapeHtml(path) + '\')"';
+        return '<span class="chat-file-link" ' + onClick + ' title="Abrir ' + escapeHtml(path) + '">' + match + '</span>';
+    });
+}
+
+function highlightCode(code, lang) {
+    return escapeHtml(code);
+}
+
+function colorizeCodeBlocks(container) {
+    if (!monacoReady || !container) return;
+    const blocks = container.querySelectorAll('code[data-lang]');
+    for (const block of blocks) {
+        const lang = block.getAttribute('data-lang') || 'plaintext';
+        try {
+            const monacoLang = getMonacoLanguage('file.' + lang);
+            monaco.editor.colorizeElement(block, { theme: document.body.classList.contains('theme-light') ? 'vs' : 'vs-dark', mimeType: monacoLang });
+        } catch (e) {}
+    }
+}
+
+function openReferencedFile(filePath) {
+    if (!filePath) return;
+    loadTabInEditor(filePath, true);
+}
+
+function openFileAtLine(filePath, line) {
+    if (!filePath) return;
+    openReferencedFile(filePath);
+    setTimeout(function() {
+        if (monacoEditor && monacoEditor.getModel()) {
+            var ln = parseInt(line) || 1;
+            monacoEditor.revealLineInCenter(ln);
+            monacoEditor.setPosition({ lineNumber: ln, column: 1 });
+        }
+    }, 500);
 }
 
 let mdPreviewVisible = false, mdPreviewPanel = null;
@@ -5026,10 +6131,23 @@ function initStatusBar() {
         <span class="footer-sep">|</span>
         <span>UTF-8</span>
         <span style="flex:1;"></span>
+        <span id="providerIndicator" style="color:#58a6ff;">🤖 Gemini</span>
+        <span class="footer-sep">|</span>
         <button class="btn-toolbar" id="footerBlameBtn" title="Git Blame" style="font-size:10px;padding:2px 8px;">👤</button>
         <span class="footer-sep">|</span>
         <span id="backendStatus" class="status-offline">🔴 Desconectado</span>`;
     document.getElementById('footerBlameBtn').addEventListener('click', showGitBlame);
+}
+
+function updateProviderIndicator(provider) {
+    const el = document.getElementById('providerIndicator');
+    if (!el) return;
+    const icons = { gemini: '🟢', deepseek: '🔵', openai: '🟠', claude: '🟣', opencode: '⚫' };
+    const labels = { gemini: 'Gemini', deepseek: 'DeepSeek', openai: 'OpenAI', claude: 'Claude', opencode: 'OpenCode' };
+    const model = document.getElementById('modelSelect')?.value || '';
+    const shortModel = model.split('/').pop().replace('gemini-', 'G:').replace('deepseek-', 'D:').replace('gpt-', 'GPT:').replace('claude-', 'C:').slice(0, 20);
+    el.textContent = (icons[provider] || '🤖') + ' ' + (labels[provider] || provider) + (shortModel ? ' · ' + shortModel : '');
+    el.title = 'Provider: ' + (labels[provider] || provider) + ' | Modelo: ' + model;
 }
 
 // =============================================
@@ -5285,9 +6403,13 @@ async function saveRules() {
 const _origHandleWsMessage = handleWsMessage;
 handleWsMessage = function(data) {
     if (data.type === 'diagnostics') {
-        window._lastDiagnosticsErrors = data.errors || [];
+        // Só mostra o botão para erros reais (não avisos/falsos positivos)
+        var filtered = (data.errors || []).filter(function(e) {
+            return e.severity === 'error' && !(e.message || '').includes('pode não estar definido neste escopo');
+        });
+        window._lastDiagnosticsErrors = filtered;
         var btn = document.getElementById('fixErrorsBtn');
-        if (btn) btn.style.display = data.errors && data.errors.length ? 'inline-block' : 'none';
+        if (btn) btn.style.display = filtered.length ? 'inline-block' : 'none';
     }
     if (data.type === 'done') {
         _origHandleWsMessage(data);
@@ -6081,6 +7203,92 @@ function insertSnippet(snippet) {
 }
 
 // =============================================
+//  AI INLINE COMPLETIONS (ghost text — PRIORIDADE 2)
+// =============================================
+let _inlineCompletionDebounce = null;
+let _inlineCompletionCache = null;
+let _inlineCompletionCacheKey = '';
+let _inlineCompletionAbort = null;
+
+async function provideAIInlineCompletions(model, position, context, token) {
+    if (!monacoReady || !activeTabPath) return { items: [] };
+    if (token && token.isCancellationRequested) return { items: [] };
+
+    const provider = document.getElementById('providerSelect')?.value || 'gemini';
+    if (provider === 'opencode') return { items: [] };
+
+    const word = model.getWordUntilPosition(position);
+    const prefix = model.getValueInRange({
+        startLineNumber: 1, startColumn: 1,
+        endLineNumber: position.lineNumber, endColumn: position.column
+    });
+    const suffix = model.getValueInRange({
+        startLineNumber: position.lineNumber, startColumn: position.column,
+        endLineNumber: model.getLineCount(), endColumn: model.getLineMaxColumn(model.getLineCount())
+    });
+
+    const trimmedPrefix = prefix.trimEnd();
+    if (trimmedPrefix.length < 3) return { items: [] };
+
+    const lastLine = trimmedPrefix.split('\n').pop() || '';
+    if (lastLine.trim().length < 2) return { items: [] };
+
+    const cacheKey = `${activeTabPath}:${position.lineNumber}:${position.column}:${lastLine.slice(-40)}`;
+    if (_inlineCompletionCache && _inlineCompletionCacheKey === cacheKey && _inlineCompletionCache.length > 0) {
+        return { items: _inlineCompletionCache };
+    }
+
+    return new Promise((resolve) => {
+        if (_inlineCompletionDebounce) clearTimeout(_inlineCompletionDebounce);
+        if (_inlineCompletionAbort) _inlineCompletionAbort.abort();
+        _inlineCompletionAbort = new AbortController();
+
+        _inlineCompletionDebounce = setTimeout(async () => {
+            try {
+                const lang = getMonacoLanguage(activeTabPath);
+                const res = await fetch(`${BACKEND_URL}/api/ai/inline-completion`, {
+                    method: 'POST',
+                    headers: {
+                        'Content-Type': 'application/json',
+                        'Authorization': BACKEND_TOKEN ? `Bearer ${BACKEND_TOKEN}` : ''
+                    },
+                    body: JSON.stringify({
+                        prefix: prefix.slice(-3000),
+                        suffix: suffix.slice(0, 500),
+                        filePath: activeTabPath,
+                        provider: provider,
+                        language: lang
+                    }),
+                    signal: _inlineCompletionAbort.signal
+                });
+                const data = await res.json();
+                const completion = (data.completion || '').trim();
+                if (!completion || completion.length < 2) {
+                    _inlineCompletionCache = [];
+                    resolve({ items: [] });
+                    return;
+                }
+
+                const items = [{
+                    insertText: completion,
+                    range: new monaco.Range(
+                        position.lineNumber, position.column,
+                        position.lineNumber, position.column
+                    ),
+                    filterText: completion
+                }];
+                _inlineCompletionCache = items;
+                _inlineCompletionCacheKey = cacheKey;
+                resolve({ items });
+            } catch (e) {
+                _inlineCompletionCache = [];
+                resolve({ items: [] });
+            }
+        }, 400);
+    });
+}
+
+// =============================================
 //  INTELLISENSE PROVIDERS (LSP-like via analyzer)
 // =============================================
 let _aedCompletionCache = null;
@@ -6509,6 +7717,44 @@ function getWorkspaceFolders() {
 // =============================================
 //  RENAME PROVIDER (F2)
 // =============================================
+
+function provideAIQuickFixes(model, range, context) {
+    const actions = [];
+    if (!context.markers || context.markers.length === 0) return { actions, dispose: function() {} };
+
+    const errors = context.markers.filter(function(m) { return m.severity === monaco.MarkerSeverity.Error; });
+    if (errors.length === 0) return { actions, dispose: function() {} };
+
+    actions.push({
+        title: '🔧 Corrigir erros com IA',
+        kind: 'quickfix',
+        diagnostics: context.markers,
+        isAI: true,
+        edit: {
+            edits: []
+        },
+        command: {
+            id: 'ai-fix-errors',
+            title: 'Corrigir com IA',
+            arguments: [model.uri, errors]
+        }
+    });
+
+    actions.push({
+        title: '💡 Explicar erros com IA',
+        kind: 'refactor',
+        diagnostics: context.markers,
+        isAI: true,
+        edit: { edits: [] },
+        command: {
+            id: 'ai-explain-errors',
+            title: 'Explicar com IA',
+            arguments: [model.uri, context.markers]
+        }
+    });
+
+    return { actions: actions, dispose: function() {} };
+}
 async function provideAedRenameEdits(model, position, newName) {
     const word = model.getWordAtPosition(position);
     if (!word) return null;
@@ -6906,6 +8152,7 @@ function switchActivityBar(panelName) {
     if (panelName === 'git') sidebarGitRefresh();
     if (panelName === 'docker') sidebarDockerRefresh();
     if (panelName === 'search') { document.getElementById('sidebarSearchInput').focus(); }
+    if (panelName === 'log') renderTaskLog();
 }
 
 // =============================================
@@ -6978,14 +8225,21 @@ function updateBottomProblems(errorsList) {
     var content = document.getElementById('bottomProblemsContent');
     var countEl = document.getElementById('statusErrors');
     if (!content) return;
-    if (!errorsList || !errorsList.length) {
+
+    var filtered = (errorsList || []).filter(function(e) {
+        return !(e.message || '').includes('pode não estar definido neste escopo');
+    });
+
+    if (!filtered.length) {
         content.innerHTML = '<div style="padding:12px;color:#8b949e;font-size:12px;">Nenhum problema detectado.</div>';
-        if (countEl) countEl.textContent = '0 x';
+        if (countEl) countEl.textContent = '0';
+        var btn = document.getElementById('fixErrorsBtn');
+        if (btn) btn.style.display = 'none';
         return;
     }
     var errCount = 0, warnCount = 0, html = '';
-    for (var i = 0; i < errorsList.length; i++) {
-        var e = errorsList[i];
+    for (var i = 0; i < filtered.length; i++) {
+        var e = filtered[i];
         var icon = e.severity === 'error' ? 'X' : '!';
         var color = e.severity === 'error' ? '#f85149' : '#d29922';
         if (e.severity === 'error') errCount++; else warnCount++;
@@ -6998,7 +8252,7 @@ function updateBottomProblems(errorsList) {
     var summary = [];
     if (errCount) summary.push(errCount + ' x');
     if (warnCount) summary.push(warnCount + ' !');
-    if (countEl) countEl.textContent = summary.join(' ') || '0 x';
+    if (countEl) countEl.textContent = summary.join(' ') || '0';
     content.querySelectorAll('[data-file]').forEach(function(el) {
         el.addEventListener('click', function() { openFile(el.dataset.file); });
     });
@@ -7427,6 +8681,18 @@ function openOpenCodeModelBrowser() {
 window._lastDiagnosticsErrors = [];
 
 function fixErrorsWithAI() {
+    if (isStreaming || isRunning) {
+        // Mesmo saneamento: stream preso sem trabalho real não bloqueia.
+        var noRealWork = !isRunning
+            && Date.now() - lastBackendActivity > 20000
+            && !activityItems.some(function(i) { return i.status === 'running' && !i.end; });
+        if (noRealWork) {
+            try { forceConcludeTask(); } catch (e) {}
+        } else {
+            showToast('⏳ Aguarde a tarefa atual terminar');
+            return;
+        }
+    }
     var errors = window._lastDiagnosticsErrors || [];
     if (!errors.length) {
         var problems = document.getElementById('bottomProblemsContent');
@@ -7442,31 +8708,43 @@ function fixErrorsWithAI() {
     }
     if (!errors.length) { showToast('Nenhum erro para corrigir'); return; }
 
-    // Show button when there are errors
     document.getElementById('fixErrorsBtn').style.display = 'none';
 
-    var msg = 'Corrija os seguintes erros encontrados no projeto:\n\n';
-    for (var i = 0; i < Math.min(errors.length, 15); i++) {
-        var e = errors[i];
+    var realErrors = errors.filter(function(e) {
+        return e.severity === 'error' && !e.message.includes('pode não estar definido neste escopo');
+    });
+    var warnings = errors.filter(function(e) {
+        return e.severity !== 'error' || e.message.includes('pode não estar definido neste escopo');
+    });
+
+    if (!realErrors.length && warnings.length > 0) {
+        showToast('⚠️ Os avisos listados são falsos positivos do analisador (parâmetros de função). Nenhuma correção necessária.');
+        return;
+    }
+
+    var msg = 'Corrija APENAS erros reais (não avisos de escopo):\n\n';
+    for (var i = 0; i < Math.min(realErrors.length, 15); i++) {
+        var e = realErrors[i];
         msg += '- [' + (e.file || 'arquivo').replace(/\\/g, '/').split('/').pop() + ':' + (e.line || '') + '] ' + e.message + '\n';
     }
-    if (errors.length > 15) msg += '... +' + (errors.length - 15) + ' erros adicionais';
-    msg += '\nCorrija todos esses problemas nos arquivos correspondentes.';
+    if (realErrors.length > 15) msg += '... +' + (realErrors.length - 15) + ' erros adicionais';
+    msg += '\n⚠️ IGNORE avisos de escopo como "X pode não estar definido neste escopo" — são falsos positivos do analisador em objetos literais JS. Corrija apenas erros de sintaxe, referências quebradas ou lógica incorreta.';
 
     document.getElementById('chatInput').value = msg;
-    // Garante que o botão de envio está habilitado
-    isStreaming = false;
-    isRunning = false;
-    document.getElementById('sendButton').disabled = false;
     sendMessage();
 }
 
 // Hook into diagnostics to track last errors for the fix button
 var _origUpdateBottomProblems = updateBottomProblems;
 updateBottomProblems = function(errorsList) {
-    window._lastDiagnosticsErrors = errorsList || [];
+    // O botão "Corrigir erros" só aparece para erros REAIS (severity error),
+    // excluindo falsos positivos de escopo. Avisos não devem manter o botão visível.
+    var filtered = (errorsList || []).filter(function(e) {
+        return e.severity === 'error' && !(e.message || '').includes('pode não estar definido neste escopo');
+    });
+    window._lastDiagnosticsErrors = filtered;
     var btn = document.getElementById('fixErrorsBtn');
-    if (btn) btn.style.display = errorsList && errorsList.length ? 'inline-block' : 'none';
+    if (btn) btn.style.display = filtered.length ? 'inline-block' : 'none';
     return _origUpdateBottomProblems(errorsList);
 };
 
@@ -7537,7 +8815,7 @@ setInterval(function() {
     var btn = document.getElementById('logsHeaderBtn');
     if (!btn || !_logEntries.length) return;
     var recentErrors = _logEntries.filter(function(e) {
-        return e.type === 'deepseek-api' || e.type === 'plan-execute' || e.type === 'error';
+        return e.type && e.type.includes('api') || e.type === 'plan-execute' || e.type === 'error' || e.type === 'json-parse';
     }).length;
     if (recentErrors > 0) {
         btn.style.borderColor = '#f85149';

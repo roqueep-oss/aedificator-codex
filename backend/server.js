@@ -63,12 +63,37 @@ app.get('/project/*', (req, res) => {
 const server = http.createServer(app);
 const wss = new WebSocket.Server({ server });
 
+// Heartbeat: mantém conexões vivas durante tarefas longas (análises/instalações
+// de vários minutos podem deixar o socket ocioso e derrubá-lo, perdendo o 'done'
+// e travando a UI em "Enviando..."). Também detecta conexões mortas.
+// Só inicia quando o servidor é o entrypoint (require.main) — quando o módulo é
+// carregado por testes, o interval manteria o processo vivo e travaria o `npm test`.
+let heartbeatInterval = null;
+function startHeartbeat() {
+    if (heartbeatInterval) return;
+    heartbeatInterval = setInterval(() => {
+        for (const client of wss.clients) {
+            if (client.isAlive === false) {
+                client.terminate();
+                continue;
+            }
+            client.isAlive = false;
+            client.ping();
+        }
+    }, 30000);
+}
+
 const runner = require('./runner');
 const debuggerRunner = require('./debugger');
 const analyzer = require('./analyzer');
 const remote = require('./remote');
 
 const PORT = process.env.PORT || 3001;
+
+// Versão do protocolo do backend: usada pelo main.js para detectar um backend
+// antigo ainda rodando na porta (o `isBackendRunning` reutilizaria um processo
+// com bugs já corrigidos). Incremente ao mudar o comportamento do fluxo WS/API.
+const BACKEND_PROTOCOL_VERSION = '3';
 
 // =============================================
 //  AUTENTICAÇÃO LOCAL
@@ -152,7 +177,6 @@ function setProjectRoot(newPath) {
         return true;
     }
     console.log(`❌ Diretório não encontrado: ${resolvedPath}`);
-    PROJECT_ROOT = null;
     return false;
 }
 
@@ -235,13 +259,19 @@ let config = {
         apiKey: process.env.ANTHROPIC_API_KEY || '',
         model: 'claude-sonnet-5'
     },
-    autoCommit: true
+    autoCommit: true,
+    toolPermissions: {
+        ask: ['delete_file', 'file_rename', 'exec_command', 'git_commit', 'git_push', 'git_publish', 'docker_run', 'ssh_exec', 'snapshot_restore'],
+        grants: {}
+    }
 };
 
 const TOKEN_PRICES = {
     deepseek: {
         '__default': { input: 0.14, output: 0.28, cache: 0.0028 },
         models: {
+            'deepseek-chat': { input: 0.27, output: 1.10, cache: 0.07 },
+            'deepseek-reasoner': { input: 0.55, output: 2.19, cache: 0.14 },
             'deepseek-v4-flash': { input: 0.14, output: 0.28, cache: 0.0028 },
             'deepseek-v4-pro': { input: 0.435, output: 0.87, cache: 0.0036 }
         }
@@ -249,8 +279,18 @@ const TOKEN_PRICES = {
     gemini: {
         '__default': { input: 0.15, output: 0.60 },
         models: {
+            'gemini-3.7-flash': { input: 0.15, output: 0.60 },
+            'gemini-3.6-flash': { input: 0.15, output: 0.60 },
+            'gemini-3.5-flash': { input: 0.15, output: 0.60 },
+            'gemini-3.5-flash-lite': { input: 0.075, output: 0.30 },
+            'gemini-3.1-pro': { input: 1.25, output: 5.00 },
+            'gemini-3.1-flash-lite': { input: 0.075, output: 0.30 },
+            'gemini-3-flash': { input: 0.15, output: 0.60 },
+            'gemini-2.5-pro': { input: 1.25, output: 5.00 },
             'gemini-2.5-flash': { input: 0.15, output: 0.60 },
-            'gemini-2.5-pro': { input: 1.25, output: 5.00 }
+            'gemini-2.5-flash-lite': { input: 0.075, output: 0.30 },
+            'gemini-2-flash': { input: 0.15, output: 0.60 },
+            'gemini-2-flash-lite': { input: 0.075, output: 0.30 }
         }
     },
     openai: {
@@ -263,7 +303,9 @@ const TOKEN_PRICES = {
     claude: {
         '__default': { input: 3.00, output: 15.00 },
         models: {
-            'claude-sonnet-4': { input: 3.00, output: 15.00 },
+            'claude-fable-5': { input: 15.00, output: 75.00 },
+            'claude-opus-5': { input: 15.00, output: 75.00 },
+            'claude-sonnet-5': { input: 3.00, output: 15.00 },
             'claude-haiku-4.5': { input: 1.00, output: 5.00 }
         }
     },
@@ -302,7 +344,7 @@ async function fetchUsdBrlRate() {
                 const saved = fs.existsSync(pricingFile) ? JSON.parse(fs.readFileSync(pricingFile, 'utf-8')) : {};
                 saved.usdBrl = rate;
                 fs.writeFileSync(pricingFile, JSON.stringify(saved), 'utf-8');
-            } catch (e) {}
+            } catch (e) { logError('json-parse', 'Erro ao salvar pricing.json', e.message); }
         }
     } catch (e) {
         console.log(`⚠️ Não foi possível obter cotação: ${e.message}`);
@@ -317,7 +359,16 @@ async function fetchAiPrices(forceRefresh) {
     _aiPricesLastFetch = now;
 
     const pricingFile = path.join(__dirname, 'pricing.json');
-    const saved = fs.existsSync(pricingFile) ? JSON.parse(fs.readFileSync(pricingFile, 'utf-8')) : {};
+    let saved = {};
+    try {
+        if (fs.existsSync(pricingFile)) {
+            const raw = fs.readFileSync(pricingFile, 'utf-8');
+            if (raw && raw.trim()) saved = JSON.parse(raw);
+        }
+    } catch (e) {
+        logError('json-parse', 'Erro ao ler pricing.json', e.message);
+        saved = {};
+    }
 
     const prompt = `Retorne APENAS um JSON válido (sem markdown, sem explicação) com os preços atuais por 1 milhão de tokens (USD) para estas IAs:
 
@@ -354,9 +405,11 @@ Atualize os valores com os preços REAIS atuais de cada provedor. Retorne SOMENT
         if (!provider.hasKey) continue;
         try {
             const response = await provider.call(prompt);
-            const jsonMatch = response.match(/\{[\s\S]*\}/);
-            if (jsonMatch) {
-                const newPrices = JSON.parse(jsonMatch[0]);
+            // Usa o extractJson robusto (trata markdown ```json, thinking blocks
+            // e texto extra ao redor) em vez do regex simples — modelos costumam
+            // embrulhar o JSON e o regex {…} quebrava com comas/vírgulas extras.
+            const newPrices = extractJson(response);
+            if (newPrices && typeof newPrices === 'object') {
                 for (const [p, models] of Object.entries(newPrices)) {
                     if (TOKEN_PRICES[p] && models && typeof models === 'object') {
                         for (const [model, price] of Object.entries(models)) {
@@ -376,6 +429,7 @@ Atualize os valores com os preços REAIS atuais de cada provedor. Retorne SOMENT
             }
         } catch (e) {
             console.log(`⚠️ ${provider.name} indisponível para preços: ${e.message}`);
+            logError('ai-prices', `Falha ao buscar preços via ${provider.name}`, e.message);
         }
     }
 
@@ -476,7 +530,7 @@ if (fs.existsSync(configPath)) {
         if (savedConfig.gemini?.apiKey) config.gemini.apiKey = decryptSecret(savedConfig.gemini.apiKey);
         if (savedConfig.gemini?.model) config.gemini.model = savedConfig.gemini.model;
         if (savedConfig.deepseek?.apiKey) config.deepseek.apiKey = decryptSecret(savedConfig.deepseek.apiKey);
-        if (savedConfig.deepseek?.model) config.deepseek.model = savedConfig.deepseek.model;
+        if (savedConfig.deepseek?.model) config.deepseek.model = normalizeDeepseekModel(savedConfig.deepseek.model);
         if (savedConfig.deepseek?.reasoningEffort) config.deepseek.reasoningEffort = savedConfig.deepseek.reasoningEffort;
         if (savedConfig.opencode?.apiKey) config.opencode.apiKey = decryptSecret(savedConfig.opencode.apiKey);
         if (savedConfig.opencode?.model) config.opencode.model = savedConfig.opencode.model;
@@ -484,19 +538,40 @@ if (fs.existsSync(configPath)) {
         if (savedConfig.openai?.model) config.openai.model = savedConfig.openai.model;
         if (savedConfig.claude?.apiKey) config.claude.apiKey = decryptSecret(savedConfig.claude.apiKey);
         if (savedConfig.claude?.model) config.claude.model = savedConfig.claude.model;
+        if (savedConfig.toolPermissions) {
+            if (Array.isArray(savedConfig.toolPermissions.ask)) config.toolPermissions.ask = savedConfig.toolPermissions.ask;
+            if (savedConfig.toolPermissions.grants && typeof savedConfig.toolPermissions.grants === 'object') config.toolPermissions.grants = savedConfig.toolPermissions.grants;
+        }
+        const undecrypted = ['gemini', 'deepseek', 'opencode', 'openai', 'claude'].filter(p =>
+            savedConfig[p]?.apiKey && String(savedConfig[p].apiKey).startsWith('enc:v1:') && !config[p].apiKey
+        );
+        if (undecrypted.length) {
+            console.log(`⚠️ ATENÇÃO: chaves de ${undecrypted.join(', ')} não puderam ser decifradas — possível divergência de BACKEND_SECRET entre .env e userData/.backend-secret.`);
+        }
         console.log('✅ Configuração carregada');
     } catch (e) {
         console.log('⚠️ Erro ao carregar configuração');
+        logError('json-parse', 'Erro ao carregar config.json', e.message);
     }
 }
 
 function saveConfigToFile() {
+    let existing = {};
+    try {
+        if (fs.existsSync(configPath)) existing = JSON.parse(fs.readFileSync(configPath, 'utf-8'));
+    } catch (e) {}
+
+    // Se a chave em memória ficou vazia (ex.: secret divergente na carga),
+    // preserva o valor criptografado já existente em disco em vez de sobrescrever com vazio.
+    const encOr = (key, stored) => key ? encryptSecret(key) : (stored || '');
+
     const fileConfig = {
-        gemini: { apiKey: encryptSecret(config.gemini.apiKey), model: config.gemini.model },
-        deepseek: { apiKey: encryptSecret(config.deepseek.apiKey), model: config.deepseek.model, reasoningEffort: config.deepseek.reasoningEffort },
-        opencode: { apiKey: encryptSecret(config.opencode.apiKey), model: config.opencode.model },
-        openai: { apiKey: encryptSecret(config.openai.apiKey), model: config.openai.model },
-        claude: { apiKey: encryptSecret(config.claude.apiKey), model: config.claude.model }
+        gemini: { apiKey: encOr(config.gemini.apiKey, existing.gemini?.apiKey), model: config.gemini.model },
+        deepseek: { apiKey: encOr(config.deepseek.apiKey, existing.deepseek?.apiKey), model: config.deepseek.model, reasoningEffort: config.deepseek.reasoningEffort },
+        opencode: { apiKey: encOr(config.opencode.apiKey, existing.opencode?.apiKey), model: config.opencode.model },
+        openai: { apiKey: encOr(config.openai.apiKey, existing.openai?.apiKey), model: config.openai.model },
+        claude: { apiKey: encOr(config.claude.apiKey, existing.claude?.apiKey), model: config.claude.model },
+        toolPermissions: config.toolPermissions
     };
     fs.writeFileSync(configPath, JSON.stringify(fileConfig, null, 2));
 }
@@ -510,11 +585,13 @@ const IGNORED_DIRS = new Set(['node_modules', '.git', 'dist', 'build', '.next', 
 const MAX_CONTEXT_FILES = 500;
 
 function getProjectPath(relativePath) {
+    if (!PROJECT_ROOT) return null;
     return path.join(PROJECT_ROOT, relativePath || '');
 }
 
 // ===== RESOLVE CAMINHO GARANTINDO QUE FICA DENTRO DO PROJETO =====
 function resolveSafePath(relativePath) {
+    if (!PROJECT_ROOT) return null;
     const root = path.resolve(PROJECT_ROOT);
     const resolved = path.resolve(root, relativePath || '');
     if (resolved !== root && !resolved.startsWith(root + path.sep)) {
@@ -563,26 +640,26 @@ function buildFallbackSugestoes(task, aiText) {
     const prefix = context && context !== cleanTask ? context + ' — ' : '';
 
     return {
-        resumo: aiText || ('Solicitação: ' + cleanTask),
+        resumo: 'Como você quer implementar: ' + cleanTask + '?',
         sugestoes: [
             {
                 id: 's1',
-                titulo: 'Opção A (completa): ' + prefix + cleanTask,
-                descricao: 'Implementação robusta com todos os recursos, validações, testes automatizados e cobertura total.',
+                titulo: '🔴 Completo: ' + cleanTask,
+                descricao: 'Implementação robusta com validações, testes e cobertura total.',
                 impacto: 'alto',
                 arquivos: []
             },
             {
                 id: 's2',
-                titulo: 'Opção B (média): ' + prefix + cleanTask,
-                descricao: 'Funcionalidades principais com cobertura moderada. Bom equilíbrio entre escopo, qualidade e prazo.',
+                titulo: '🟡 Médio: ' + cleanTask,
+                descricao: 'Funcionalidades principais. Bom equilíbrio entre escopo e prazo.',
                 impacto: 'médio',
                 arquivos: []
             },
             {
                 id: 's3',
-                titulo: 'Opção C (mínima): ' + prefix + cleanTask,
-                descricao: 'Apenas o essencial para funcionar. Ideal para validar a ideia ou prototipar rapidamente.',
+                titulo: '🟢 Mínimo: ' + cleanTask,
+                descricao: 'Apenas o essencial. Rápido de implementar.',
                 impacto: 'baixo',
                 arquivos: []
             },
@@ -608,7 +685,7 @@ function writeFileContent(filePath, content) {
         if (!fs.existsSync(dir)) {
             fs.mkdirSync(dir, { recursive: true });
         }
-        fs.writeFileSync(fullPath, content, 'utf-8');
+        fs.writeFileSync(fullPath, stripBOM(content), 'utf-8');
         invalidateProjectCache();
         console.log(`✅ Arquivo escrito: ${fullPath}`);
         return true;
@@ -777,6 +854,45 @@ function getFileTree(dirPath = '', prefix = '', count = { n: 0 }) {
 //  FUNÇÕES DE IA
 // =============================================
 
+async function retryWithBackoff(fn, { maxRetries = 3, baseDelay = 1000, maxDelay = 15000, onRetry = null, signal = null } = {}) {
+    let lastError;
+    for (let attempt = 0; attempt <= maxRetries; attempt++) {
+        if (signal && signal.aborted) {
+            const err = new Error('Tarefa cancelada');
+            err.name = 'AbortError';
+            throw err;
+        }
+        try {
+            return await fn();
+        } catch (e) {
+            lastError = e;
+            const isRetryable = e.message?.includes('429') || e.message?.includes('500') || e.message?.includes('502') || e.message?.includes('503') || e.message?.includes('Limite de requisições') || e.message?.includes('rate') || e.message?.includes('timeout');
+            if (!isRetryable || attempt >= maxRetries) throw e;
+            const delay = Math.min(baseDelay * Math.pow(2, attempt) + Math.random() * 500, maxDelay);
+            if (onRetry) onRetry(attempt + 1, maxRetries, Math.round(delay / 1000));
+            await new Promise(resolve => setTimeout(resolve, delay));
+        }
+    }
+    throw lastError;
+}
+
+function getProviderErrorHint(statusCode, errorBody, provider) {
+    const msg = (errorBody || '').toLowerCase();
+    if (statusCode === 401 || msg.includes('invalid api key') || msg.includes('incorrect api key') || msg.includes('unauthorized'))
+        return `🔑 Chave API ${provider.toUpperCase()} inválida. Verifique em Configurações.`;
+    if (statusCode === 402 || msg.includes('insufficient_quota') || msg.includes('billing') || msg.includes('credit') || msg.includes('balance'))
+        return `💰 Créditos ${provider.toUpperCase()} esgotados. Recarregue no site do provedor.`;
+    if (statusCode === 429 || msg.includes('rate limit') || msg.includes('too many requests'))
+        return `⏳ Limite de requisições ${provider.toUpperCase()} atingido. Aguarde alguns minutos.`;
+    if (statusCode === 403 || msg.includes('forbidden') || msg.includes('region'))
+        return `🚫 Acesso negado à API ${provider.toUpperCase()}. Verifique permissões e região.`;
+    if (statusCode >= 500)
+        return `🔥 Servidor ${provider.toUpperCase()} instável. Tente novamente em alguns segundos.`;
+    return '';
+}
+
+const RETRY_STATUSES = new Set([429, 500, 502, 503, 504]);
+
 async function fetchWithTimeout(url, options = {}, timeoutMs = 120000, externalSignal) {
     const timeoutController = new AbortController();
     const timer = setTimeout(() => timeoutController.abort(), timeoutMs);
@@ -805,20 +921,36 @@ async function callGemini(prompt, onChunk, signal) {
         ? `https://generativelanguage.googleapis.com/v1beta/models/${model}:streamGenerateContent?alt=sse&key=${apiKey}`
         : `https://generativelanguage.googleapis.com/v1beta/models/${model}:generateContent?key=${apiKey}`;
 
+    const parts = [];
+
+    if (_pendingImages && _pendingImages.length) {
+        for (const img of _pendingImages) {
+            if (img.dataUrl) {
+                const match = img.dataUrl.match(/^data:(image\/\w+);base64,(.+)/);
+                if (match) {
+                    parts.push({ inlineData: { mimeType: match[1], data: match[2] } });
+                }
+            }
+        }
+        clearPendingImages();
+    }
+
+    parts.push({ text: prompt });
+
     const response = await fetchWithTimeout(url, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: safeJsonStringify({
-            contents: [{ parts: [{ text: prompt }] }]
+            contents: [{ parts }]
         })
     }, 120000, signal);
 
     if (!response.ok) {
         const error = await response.text();
-        if (response.status === 429 || error.includes('RESOURCE_EXHAUSTED') || error.includes('spending cap')) {
-            throw new Error('Limite da API Gemini atingido. Acesse https://ai.studio/spend para aumentar o spending cap ou troque de provider no Aedificator (DeepSeek, OpenAI, Claude).');
-        }
-        throw new Error(`Erro na API Gemini: ${response.status} - ${error}`);
+        const hint = getProviderErrorHint(response.status, error, 'gemini');
+        const msg = hint || `Erro na API Gemini: ${response.status} - ${error.slice(0, 300)}`;
+        logError('gemini-api', msg, error.slice(0, 500));
+        throw new Error(msg);
     }
 
     if (!useStream) {
@@ -834,7 +966,11 @@ async function callGemini(prompt, onChunk, signal) {
     let lastGeminiUsage = null;
 
     while (true) {
-        if (signal && signal.aborted) break;
+        if (signal && signal.aborted) {
+            const err = new Error('Tarefa cancelada');
+            err.name = 'AbortError';
+            throw err;
+        }
         const { done, value } = await reader.read();
         if (done) break;
         buffer += decoder.decode(value, { stream: true });
@@ -1115,6 +1251,10 @@ function listOpenCodeModels(allModels = false) {
 }
 
 // ===== MONTA O PROMPT DO OPEncode COM MODO E HISTÓRICO =====
+// Regra de idioma: todo diálogo do chat deve ser em português do Brasil.
+const LANGUAGE_RULE = `
+IDIOMA (OBRIGATÓRIO): Responda SEMPRE em português do Brasil (pt-BR), mesmo que o código, comentários ou trechos da conversa estejam em inglês. Use vocabulário brasileiro (ex.: "arquivo", "pasta", "executar", "teste").`;
+
 function buildOpenCodePrompt(message, mode, history) {
     const modeInstruction = MODE_INSTRUCTIONS[mode] || MODE_INSTRUCTIONS.cowork;
     const historyText = (history && history.length)
@@ -1122,6 +1262,7 @@ function buildOpenCodePrompt(message, mode, history) {
         : '(sem histórico)';
 
     return `Você é o Aedificator Codex IDE, um assistente de desenvolvimento prático que opera no diretório atual do projeto.
+${LANGUAGE_RULE}
 
 ${getQualityRules()}
 
@@ -1275,7 +1416,7 @@ function getToolIcon(toolName) {
         glob: '🔍', grep: '🔎',
         task: '🤖', agent: '🤖', subagent: '🤖',
         webfetch: '🌐', websearch: '🔎',
-        todowrite: '📝', question: '❓',
+        todowrite: '📝', todo: '📝', question: '❓',
         skill: '🎯', lsp: '🔬',
         list_files: '📂', delete_file: '🗑️', search_code: '🔎',
         generate_tests: '🧪', exec_command: '⚡'
@@ -1289,11 +1430,11 @@ function buildToolLabel(toolName, input) {
     const cmd = inp.command || inp.cmd || inp.comando || '';
     const filePath = inp.filePath || inp.path || inp.file || inp.file_path || inp.caminho || '';
     const pattern = inp.pattern || inp.regex || inp.padrao || '';
-    const desc = inp.description || inp.desc || inp.prompt || '';
+    const desc = inp.description || inp.desc || inp.prompt || inp.descricao || '';
     const url = inp.url || '';
     const query = inp.query || '';
     const name = inp.name || '';
-    const question = inp.question || '';
+    const question = inp.question || inp.pergunta || '';
     if (!t || t.length < 2) {
         const firstArg = cmd || filePath || pattern || desc || url || '';
         return firstArg ? firstArg.slice(0, 50) : 'ferramenta';
@@ -1317,7 +1458,7 @@ function buildToolLabel(toolName, input) {
             return `Pesquisando: ${(query || pattern || '').slice(0, 60)}`;
         case 'task': case 'agent': case 'subagent':
             return `Sub-agente: ${(desc || prompt || '').slice(0, 60)}`;
-        case 'todowrite':
+        case 'todowrite': case 'todo':
             return `Planejando tarefas`;
         case 'question':
             return `Perguntando: ${(question || '').slice(0, 60)}`;
@@ -1533,7 +1674,7 @@ let _deepseekCachePrefix = '';
 let _deepseekCacheKey = '';
 
 function getDeepseekCachePrefix() {
-    const key = PROJECT_ROOT + '|' + (config.deepseek.model || 'deepseek-v4-flash');
+    const key = PROJECT_ROOT + '|' + (config.deepseek.model || 'deepseek-chat');
     if (_deepseekCachePrefix && _deepseekCacheKey === key) return _deepseekCachePrefix;
     _deepseekCacheKey = key;
     _deepseekCachePrefix = getQualityRules() + '\nDIRETÓRIO: ' + PROJECT_ROOT + '\n';
@@ -1545,26 +1686,42 @@ function invalidateDeepseekCache() {
     _deepseekCacheKey = '';
 }
 
+function normalizeDeepseekModel(model) {
+    if (model === 'deepseek-chat') return 'deepseek-v4-flash';
+    if (model === 'deepseek-reasoner') return 'deepseek-v4-flash';
+    if (model === 'deepseek-v4-flash-free') return 'deepseek-v4-flash';
+    return model;
+}
+
 async function callDeepSeek(prompt, onChunk, signal) {
     const apiKey = config.deepseek.apiKey;
     if (!apiKey) {
         throw new Error('Chave API DeepSeek não configurada!');
     }
 
+    let finalPrompt = prompt;
+    if (_pendingImages && _pendingImages.length) {
+        finalPrompt = `[O usuário anexou ${_pendingImages.length} imagem(ns). O DeepSeek não suporta visão — use as instruções textuais do usuário.]\n\n${prompt}`;
+        clearPendingImages();
+    }
+
     const cachePrefix = getDeepseekCachePrefix();
+    const model = config.deepseek.model || 'deepseek-v4-flash';
     const url = 'https://api.deepseek.com/chat/completions';
     const safePrompt = sanitizeForJson(prompt);
     const safeSystem = sanitizeForJson(cachePrefix);
-    const body = safeJsonStringify({
-        model: config.deepseek.model || 'deepseek-v4-flash',
+    const bodyObj = {
+        model,
         messages: [
             { role: 'system', content: safeSystem },
             { role: 'user', content: safePrompt }
         ],
-        thinking: { type: 'enabled' },
-        reasoning_effort: config.deepseek.reasoningEffort || 'medium',
         stream: true
-    });
+    };
+    if (model === 'deepseek-v4-pro') {
+        bodyObj.reasoning_effort = config.deepseek.reasoningEffort || 'medium';
+    }
+    const body = safeJsonStringify(bodyObj);
     const response = await fetchWithTimeout(url, {
         method: 'POST',
         headers: {
@@ -1572,19 +1729,13 @@ async function callDeepSeek(prompt, onChunk, signal) {
             'Authorization': `Bearer ${apiKey}`
         },
         body
-    }, 120000, signal);
+    }, 60000, signal);
 
     if (!response.ok) {
         const error = await response.text().catch(() => '');
         const statusCode = response.status;
-        let errorMsg;
-        if (statusCode === 429) {
-            errorMsg = 'Limite de requisições da API DeepSeek atingido. Aguarde alguns minutos ou troque de provider.';
-        } else if (statusCode === 402 || error.includes('insufficient_quota')) {
-            errorMsg = 'Créditos da API DeepSeek esgotados. Recarregue em https://platform.deepseek.com ou troque de provider.';
-        } else {
-            errorMsg = `Erro na API DeepSeek: ${statusCode}${error ? ' - ' + error.slice(0, 200) : ''}`;
-        }
+        const hint = getProviderErrorHint(statusCode, error, 'deepseek');
+        let errorMsg = hint || `Erro na API DeepSeek: ${statusCode}${error ? ' - ' + error.slice(0, 200) : ''}`;
         logError('deepseek-api', errorMsg, `status=${statusCode} body=${error.slice(0, 300)}`);
         throw new Error(errorMsg);
     }
@@ -1597,7 +1748,11 @@ async function callDeepSeek(prompt, onChunk, signal) {
     let reasoningSent = false;
 
     while (true) {
-        if (signal && signal.aborted) break;
+        if (signal && signal.aborted) {
+            const err = new Error('Tarefa cancelada');
+            err.name = 'AbortError';
+            throw err;
+        }
         const { done, value } = await reader.read();
         if (done) break;
         const chunk = decoder.decode(value);
@@ -1657,11 +1812,20 @@ async function callOpenAI(prompt, onChunk, signal) {
 
     return new Promise((resolve, reject) => {
         const url = new URL('https://api.openai.com/v1/chat/completions');
+        const userContent = [];
+        const oaiImages = getImagePartsForOpenAI();
+        if (oaiImages) {
+            userContent.push(...oaiImages);
+            clearPendingImages();
+        }
+        userContent.push({ type: 'text', text: prompt });
+        const userMsg = oaiImages ? { role: 'user', content: userContent } : { role: 'user', content: prompt };
+
         const body = JSON.stringify({
             model,
             messages: [
-                { role: 'system', content: 'You are a coding assistant. Respond in the language of the user. Return valid JSON when requested.' },
-                { role: 'user', content: prompt }
+                { role: 'system', content: 'You are a coding assistant.' + LANGUAGE_RULE + ' Return valid JSON when requested.' },
+                userMsg
             ],
             temperature: 0.3,
             stream: false
@@ -1678,9 +1842,10 @@ async function callOpenAI(prompt, onChunk, signal) {
         }).then(async (res) => {
             if (!res.ok) {
                 const err = await res.text();
-                if (res.status === 429) throw new Error('Limite de requisições da API OpenAI atingido. Aguarde ou troque de provider.');
-                if (res.status === 402 || err.includes('insufficient_quota')) throw new Error('Créditos da API OpenAI esgotados. Recarregue em https://platform.openai.com ou troque de provider.');
-                throw new Error(`OpenAI HTTP ${res.status}: ${err.slice(0, 200)}`);
+                const hint = getProviderErrorHint(res.status, err, 'openai');
+                const msg = hint || `OpenAI HTTP ${res.status}: ${err.slice(0, 200)}`;
+                logError('openai-api', msg, err.slice(0, 500));
+                throw new Error(msg);
             }
             const data = await res.json();
             const text = data.choices?.[0]?.message?.content || '';
@@ -1699,11 +1864,22 @@ async function callClaude(prompt, onChunk, signal, forcedModel) {
 
     return new Promise((resolve, reject) => {
         const url = new URL('https://api.anthropic.com/v1/messages');
+        const userContent = [];
+        const claudeImages = getImagePartsForClaude();
+        if (claudeImages && claudeImages.length) {
+            userContent.push(...claudeImages);
+            clearPendingImages();
+        }
+        userContent.push({ type: 'text', text: prompt });
+        const userMsg = claudeImages && claudeImages.length
+            ? { role: 'user', content: userContent }
+            : { role: 'user', content: prompt };
+
         const body = JSON.stringify({
             model,
             max_tokens: 4096,
             system: 'You are an IDE agent. You MUST respond ONLY with valid JSON. No explanations, no markdown, no conversation — just the JSON object. The response must start with { and end with }.',
-            messages: [{ role: 'user', content: prompt }]
+            messages: [userMsg]
         });
 
         const abort = new AbortController();
@@ -1721,9 +1897,10 @@ async function callClaude(prompt, onChunk, signal, forcedModel) {
         }).then(async (res) => {
             if (!res.ok) {
                 const err = await res.text();
-                if (res.status === 429) throw new Error('Limite de requisições da API Claude atingido. Aguarde ou troque de provider.');
-                if (res.status === 402 || err.includes('insufficient_quota') || err.includes('billing')) throw new Error('Créditos da API Claude esgotados. Recarregue em https://console.anthropic.com ou troque de provider.');
-                throw new Error(`Claude HTTP ${res.status}: ${err.slice(0, 200)}`);
+                const hint = getProviderErrorHint(res.status, err, 'claude');
+                const msg = hint || `Claude HTTP ${res.status}: ${err.slice(0, 200)}`;
+                logError('claude-api', msg, err.slice(0, 500));
+                throw new Error(msg);
             }
             const data = await res.json();
             const text = data.content?.[0]?.text || '';
@@ -1784,56 +1961,435 @@ const MODE_INSTRUCTIONS = {
 // =============================================
 //  MODO AGENTE — FERRAMENTAS
 // =============================================
-const AGENT_TOOLS = [
-    { name: 'read_file', description: 'Lê o conteúdo completo de um arquivo', parameters: { caminho: 'string' } },
-    { name: 'write_file', description: 'Cria ou sobrescreve um arquivo com o conteúdo fornecido', parameters: { caminho: 'string', conteudo: 'string' } },
-    { name: 'delete_file', description: 'Remove um arquivo', parameters: { caminho: 'string' } },
-    { name: 'list_files', description: 'Lista arquivos e pastas de um diretório', parameters: { diretorio: 'string (opcional, padrão: raiz)' } },
-    { name: 'search_code', description: 'Busca por um padrão (regex) nos arquivos do projeto', parameters: { padrao: 'string', diretorio: 'string (opcional)' } },
-    { name: 'exec_command', description: 'Executa um comando shell no diretório do projeto', parameters: { comando: 'string' } },
-    { name: 'generate_tests', description: 'Gera testes unitários para um arquivo de código. O arquivo deve existir. Retorna o caminho do arquivo de teste criado e o resultado da execução.', parameters: { caminho: 'string' } },
-    { name: 'browser_navigate', description: 'Navega o browser para uma URL. Use para testar frontend.', parameters: { url: 'string' } },
-    { name: 'browser_screenshot', description: 'Tira screenshot da página atual do browser.', parameters: {} },
-    { name: 'browser_click', description: 'Clica em um elemento CSS na página.', parameters: { selector: 'string' } },
-    { name: 'browser_type', description: 'Digita texto em um campo input/textarea.', parameters: { selector: 'string', text: 'string' } },
-    { name: 'browser_evaluate', description: 'Executa JavaScript na página e retorna o resultado.', parameters: { js: 'string' } },
-    { name: 'browser_console', description: 'Lê os logs do console do browser.', parameters: {} },
-    { name: 'git_publish', description: 'Publica uma release: faz commit (se houver mudanças), cria tag semver e push para o remote. Use após concluir uma feature.', parameters: { mensagem: 'string (opcional, mensagem do commit)' } },
-    { name: 'git_status', description: 'Mostra o status do git (arquivos modificados, staged, untracked)', parameters: {} },
-    { name: 'git_diff', description: 'Mostra diff das alterações atuais (unstaged)', parameters: {} },
-    { name: 'git_log', description: 'Mostra histórico de commits (últimos 10)', parameters: {} },
-    { name: 'git_commit', description: 'Faz commit das alterações staged. Use git_status antes.', parameters: { mensagem: 'string' } },
-    { name: 'git_push', description: 'Faz push dos commits para o remote', parameters: {} },
-    { name: 'git_pull', description: 'Faz pull do remote', parameters: {} },
-    { name: 'git_branch', description: 'Lista branches locais e remotas', parameters: {} },
-    { name: 'git_stash', description: 'Salva alterações não commitadas no stash (push ou pop)', parameters: { acao: 'string (push ou pop)' } },
-    { name: 'file_rename', description: 'Renomeia ou move um arquivo/pasta', parameters: { origem: 'string', destino: 'string' } },
-    { name: 'file_mkdir', description: 'Cria um diretório (e diretórios pais se necessário)', parameters: { caminho: 'string' } },
-    { name: 'analyzer_validate', description: 'Valida um arquivo de código e retorna erros/avisos', parameters: { caminho: 'string' } },
-    { name: 'analyzer_symbols', description: 'Extrai símbolos (funções, classes, variáveis) de um arquivo', parameters: { caminho: 'string' } },
-    { name: 'test_run', description: 'Executa os testes do projeto e retorna o resultado', parameters: {} },
-    { name: 'snapshot_create', description: 'Cria um snapshot completo do estado atual do projeto', parameters: { rotulo: 'string (opcional, nome do snapshot)' } },
-    { name: 'snapshot_list', description: 'Lista todos os snapshots salvos', parameters: {} },
-    { name: 'snapshot_restore', description: 'Restaura o projeto para um snapshot anterior', parameters: { rotulo: 'string' } },
-    { name: 'debug_start', description: 'Inicia uma sessão de debug Node.js para um arquivo', parameters: { arquivo: 'string' } },
-    { name: 'debug_stop', description: 'Para a sessão de debug atual', parameters: {} },
-    { name: 'debug_step', description: 'Avança um passo no debug (step over)', parameters: {} },
-    { name: 'debug_resume', description: 'Continua a execução até o próximo breakpoint', parameters: {} },
-    { name: 'ssh_exec', description: 'Executa um comando no servidor remoto via SSH', parameters: { comando: 'string' } },
-    { name: 'ssh_status', description: 'Verifica o status da conexão SSH remota', parameters: {} },
-    { name: 'docker_run', description: 'Executa um container Docker com a imagem especificada', parameters: { comando: 'string' } },
-    { name: 'undo', description: 'Desfaz a última alteração de arquivo feita pelo agente', parameters: {} },
-    { name: 'redo', description: 'Refaz a última alteração desfeita', parameters: {} },
-    { name: 'search_replace', description: 'Busca e substitui texto em arquivos do projeto', parameters: { padrao: 'string', substituto: 'string', caminho: 'string (opcional, arquivo ou diretório)' } },
-    { name: 'browser_content', description: 'Obtém o conteúdo HTML/textual da página atual do browser', parameters: {} }
-];
+const TOOL_SCHEMAS = {
+    read_file: {
+        name: 'read_file',
+        description: 'Lê o conteúdo completo de um arquivo do projeto. Retorna o conteúdo com diagnóstico de erros para arquivos de código.',
+        parameters: {
+            type: 'object',
+            properties: { caminho: { type: 'string', description: 'Caminho relativo do arquivo a partir da raiz do projeto' } },
+            required: ['caminho']
+        }
+    },
+    write_file: {
+        name: 'write_file',
+        description: 'Cria ou sobrescreve um arquivo com o conteúdo completo. O diretório pai é criado automaticamente se não existir. Use para criar novos arquivos ou substituir arquivos existentes inteiros.',
+        parameters: {
+            type: 'object',
+            properties: {
+                caminho: { type: 'string', description: 'Caminho relativo do arquivo a ser criado/modificado' },
+                conteudo: { type: 'string', description: 'Conteúdo COMPLETO do arquivo' }
+            },
+            required: ['caminho', 'conteudo']
+        }
+    },
+    delete_file: {
+        name: 'delete_file',
+        description: 'Remove um arquivo do projeto permanentemente.',
+        parameters: {
+            type: 'object',
+            properties: { caminho: { type: 'string', description: 'Caminho relativo do arquivo a ser removido' } },
+            required: ['caminho']
+        }
+    },
+    list_files: {
+        name: 'list_files',
+        description: 'Lista arquivos e pastas de um diretório do projeto.',
+        parameters: {
+            type: 'object',
+            properties: { diretorio: { type: 'string', description: 'Caminho relativo do diretório. Omita ou use "" para a raiz.' } },
+            required: []
+        }
+    },
+    search_code: {
+        name: 'search_code',
+        description: 'Busca por um padrão (regex) nos arquivos do projeto. Use para encontrar funções, classes, imports ou padrões de código.',
+        parameters: {
+            type: 'object',
+            properties: {
+                padrao: { type: 'string', description: 'Padrão regex para buscar no código' },
+                diretorio: { type: 'string', description: 'Diretório onde buscar (opcional, padrão: raiz do projeto)' }
+            },
+            required: ['padrao']
+        }
+    },
+    exec_command: {
+        name: 'exec_command',
+        description: 'Executa um comando shell no diretório do projeto. Use para rodar testes, builds, lint, npm/pip install, git commands não cobertos por outras tools, ou scripts de verificação.',
+        parameters: {
+            type: 'object',
+            properties: { comando: { type: 'string', description: 'Comando shell completo a ser executado' } },
+            required: ['comando']
+        }
+    },
+    search_replace: {
+        name: 'search_replace',
+        description: 'Busca e substitui texto em arquivos do projeto. Mais eficiente que write_file para mudanças pontuais.',
+        parameters: {
+            type: 'object',
+            properties: {
+                padrao: { type: 'string', description: 'Texto exato a ser encontrado e substituído' },
+                substituto: { type: 'string', description: 'Novo texto que substituirá o padrão' },
+                caminho: { type: 'string', description: 'Arquivo ou diretório onde aplicar (opcional, padrão: todo o projeto)' }
+            },
+            required: ['padrao', 'substituto']
+        }
+    },
+    file_rename: {
+        name: 'file_rename',
+        description: 'Renomeia ou move um arquivo/pasta do projeto.',
+        parameters: {
+            type: 'object',
+            properties: {
+                origem: { type: 'string', description: 'Caminho relativo atual do arquivo/pasta' },
+                destino: { type: 'string', description: 'Novo caminho relativo' }
+            },
+            required: ['origem', 'destino']
+        }
+    },
+    file_mkdir: {
+        name: 'file_mkdir',
+        description: 'Cria um diretório (e diretórios pais se necessário).',
+        parameters: {
+            type: 'object',
+            properties: { caminho: { type: 'string', description: 'Caminho relativo do diretório a ser criado' } },
+            required: ['caminho']
+        }
+    },
+    analyzer_validate: {
+        name: 'analyzer_validate',
+        description: 'Valida um arquivo de código e retorna erros e avisos de sintaxe/lint.',
+        parameters: {
+            type: 'object',
+            properties: { caminho: { type: 'string', description: 'Caminho relativo do arquivo a ser validado' } },
+            required: ['caminho']
+        }
+    },
+    analyzer_symbols: {
+        name: 'analyzer_symbols',
+        description: 'Extrai símbolos (funções, classes, variáveis, imports) de um arquivo de código.',
+        parameters: {
+            type: 'object',
+            properties: { caminho: { type: 'string', description: 'Caminho relativo do arquivo' } },
+            required: ['caminho']
+        }
+    },
+    test_run: {
+        name: 'test_run',
+        description: 'Executa os testes do projeto (jest, pytest, go test, cargo test) e retorna o resultado.',
+        parameters: { type: 'object', properties: {}, required: [] }
+    },
+    undo: {
+        name: 'undo',
+        description: 'Desfaz a última alteração de arquivo feita pelo agente. Use se cometeu um erro.',
+        parameters: { type: 'object', properties: {}, required: [] }
+    },
+    redo: {
+        name: 'redo',
+        description: 'Refaz a última alteração desfeita pelo undo.',
+        parameters: { type: 'object', properties: {}, required: [] }
+    },
+    generate_tests: {
+        name: 'generate_tests',
+        description: 'Gera testes unitários para um arquivo de código existente e executa os testes.',
+        parameters: {
+            type: 'object',
+            properties: { caminho: { type: 'string', description: 'Caminho relativo do arquivo para gerar testes' } },
+            required: ['caminho']
+        }
+    },
+    browser_navigate: {
+        name: 'browser_navigate',
+        description: 'Navega o browser Playwright para uma URL. Use para testar frontend web.',
+        parameters: {
+            type: 'object',
+            properties: { url: { type: 'string', description: 'URL completa para navegar (ex: http://localhost:3000)' } },
+            required: ['url']
+        }
+    },
+    browser_screenshot: {
+        name: 'browser_screenshot',
+        description: 'Tira um screenshot da página atual do browser.',
+        parameters: { type: 'object', properties: {}, required: [] }
+    },
+    browser_click: {
+        name: 'browser_click',
+        description: 'Clica em um elemento CSS na página do browser.',
+        parameters: {
+            type: 'object',
+            properties: { selector: { type: 'string', description: 'Seletor CSS do elemento a clicar' } },
+            required: ['selector']
+        }
+    },
+    browser_type: {
+        name: 'browser_type',
+        description: 'Digita texto em um campo input/textarea na página do browser.',
+        parameters: {
+            type: 'object',
+            properties: {
+                selector: { type: 'string', description: 'Seletor CSS do campo input/textarea' },
+                text: { type: 'string', description: 'Texto a ser digitado' }
+            },
+            required: ['selector', 'text']
+        }
+    },
+    browser_evaluate: {
+        name: 'browser_evaluate',
+        description: 'Executa JavaScript na página do browser e retorna o resultado.',
+        parameters: {
+            type: 'object',
+            properties: { js: { type: 'string', description: 'Código JavaScript a ser executado na página' } },
+            required: ['js']
+        }
+    },
+    browser_console: {
+        name: 'browser_console',
+        description: 'Lê os logs do console do browser atual.',
+        parameters: { type: 'object', properties: {}, required: [] }
+    },
+    browser_content: {
+        name: 'browser_content',
+        description: 'Obtém o conteúdo HTML completo da página atual do browser.',
+        parameters: { type: 'object', properties: {}, required: [] }
+    },
+    git_publish: {
+        name: 'git_publish',
+        description: 'Publica uma release: faz commit, cria tag semver e push. Use após concluir uma feature.',
+        parameters: {
+            type: 'object',
+            properties: { mensagem: { type: 'string', description: 'Mensagem do commit (opcional)' } },
+            required: []
+        }
+    },
+    git_status: {
+        name: 'git_status',
+        description: 'Mostra o status do git (arquivos modificados, staged, untracked).',
+        parameters: { type: 'object', properties: {}, required: [] }
+    },
+    git_diff: {
+        name: 'git_diff',
+        description: 'Mostra o diff das alterações atuais (unstaged).',
+        parameters: { type: 'object', properties: {}, required: [] }
+    },
+    git_log: {
+        name: 'git_log',
+        description: 'Mostra histórico de commits (últimos 10).',
+        parameters: { type: 'object', properties: {}, required: [] }
+    },
+    git_commit: {
+        name: 'git_commit',
+        description: 'Faz commit das alterações staged. Use git_status antes para ver o que será commitado.',
+        parameters: {
+            type: 'object',
+            properties: { mensagem: { type: 'string', description: 'Mensagem descritiva do commit' } },
+            required: ['mensagem']
+        }
+    },
+    git_push: {
+        name: 'git_push',
+        description: 'Faz push dos commits para o remote.',
+        parameters: { type: 'object', properties: {}, required: [] }
+    },
+    git_pull: {
+        name: 'git_pull',
+        description: 'Faz pull das alterações do remote.',
+        parameters: { type: 'object', properties: {}, required: [] }
+    },
+    git_branch: {
+        name: 'git_branch',
+        description: 'Lista branches locais e remotas.',
+        parameters: { type: 'object', properties: {}, required: [] }
+    },
+    git_stash: {
+        name: 'git_stash',
+        description: 'Salva ou restaura alterações não commitadas no stash.',
+        parameters: {
+            type: 'object',
+            properties: { acao: { type: 'string', description: '"push" para salvar ou "pop" para restaurar' } },
+            required: ['acao']
+        }
+    },
+    snapshot_create: {
+        name: 'snapshot_create',
+        description: 'Cria um snapshot completo do estado atual do projeto para backup.',
+        parameters: {
+            type: 'object',
+            properties: { rotulo: { type: 'string', description: 'Nome descritivo do snapshot (opcional)' } },
+            required: []
+        }
+    },
+    snapshot_list: {
+        name: 'snapshot_list',
+        description: 'Lista todos os snapshots salvos do projeto.',
+        parameters: { type: 'object', properties: {}, required: [] }
+    },
+    snapshot_restore: {
+        name: 'snapshot_restore',
+        description: 'Restaura o projeto para um snapshot anterior. CUIDADO: desfaz todas as alterações posteriores.',
+        parameters: {
+            type: 'object',
+            properties: { rotulo: { type: 'string', description: 'Nome do snapshot para restaurar' } },
+            required: ['rotulo']
+        }
+    },
+    debug_start: {
+        name: 'debug_start',
+        description: 'Inicia uma sessão de debug Node.js para um arquivo.',
+        parameters: {
+            type: 'object',
+            properties: { arquivo: { type: 'string', description: 'Caminho do arquivo para debugar' } },
+            required: ['arquivo']
+        }
+    },
+    debug_stop: {
+        name: 'debug_stop',
+        description: 'Para a sessão de debug atual.',
+        parameters: { type: 'object', properties: {}, required: [] }
+    },
+    debug_step: {
+        name: 'debug_step',
+        description: 'Avança um passo no debug (step over).',
+        parameters: { type: 'object', properties: {}, required: [] }
+    },
+    debug_resume: {
+        name: 'debug_resume',
+        description: 'Continua a execução até o próximo breakpoint.',
+        parameters: { type: 'object', properties: {}, required: [] }
+    },
+    ssh_exec: {
+        name: 'ssh_exec',
+        description: 'Executa um comando no servidor remoto via SSH. Requer conexão SSH ativa.',
+        parameters: {
+            type: 'object',
+            properties: { comando: { type: 'string', description: 'Comando a ser executado no servidor remoto' } },
+            required: ['comando']
+        }
+    },
+    ssh_status: {
+        name: 'ssh_status',
+        description: 'Verifica o status da conexão SSH com o servidor remoto.',
+        parameters: { type: 'object', properties: {}, required: [] }
+    },
+    docker_run: {
+        name: 'docker_run',
+        description: 'Executa um container Docker com a imagem especificada. O comando deve começar com "docker".',
+        parameters: {
+            type: 'object',
+            properties: { comando: { type: 'string', description: 'Comando docker completo' } },
+            required: ['comando']
+        }
+    },
+    task: {
+        name: 'task',
+        description: 'Delega uma subtarefa a um subagente isolado (somente leitura) que investiga o projeto e retorna um resumo. Use para buscas complexas, exploração de código ou análises paralelas sem poluir o contexto do agente principal.',
+        parameters: {
+            type: 'object',
+            properties: { descricao: { type: 'string', description: 'Descrição detalhada da subtarefa a ser executada pelo subagente' } },
+            required: ['descricao']
+        }
+    },
+    question: {
+        name: 'question',
+        description: 'Faz uma pergunta ao usuário e aguarda a resposta. Use quando precisar de uma decisão, esclarecimento ou preferência do usuário durante a execução.',
+        parameters: {
+            type: 'object',
+            properties: { pergunta: { type: 'string', description: 'A pergunta a ser feita ao usuário' } },
+            required: ['pergunta']
+        }
+    },
+    todo: {
+        name: 'todo',
+        description: 'Cria ou atualiza a lista de tarefas do plano atual. Use para expor um plano rastreável do trabalho em andamento.',
+        parameters: {
+            type: 'object',
+            properties: {
+                tarefas: {
+                    type: 'array',
+                    description: 'Lista de tarefas, cada uma como { "titulo": "...", "status": "pending|in_progress|completed" }',
+                    items: { type: 'object', properties: { titulo: { type: 'string' }, status: { type: 'string' } } }
+                }
+            },
+            required: ['tarefas']
+        }
+    }
+};
+
+const AGENT_TOOLS = Object.values(TOOL_SCHEMAS).map(t => ({
+    name: t.name,
+    description: t.description,
+    parameters: Object.fromEntries(
+        Object.entries(t.parameters.properties || {}).map(([k, v]) => [k, v.description || v.type || 'string'])
+    )
+}));
+
+function stripBOM(text) {
+    return typeof text === 'string' ? text.replace(/^\uFEFF+/, '') : text;
+}
+
+function normalizeLine(line) {
+    return line.trim().replace(/\s+/g, ' ');
+}
+
+function replaceIgnoringIndent(content, pattern, replacement) {
+    const pLines = pattern.split('\n').map(l => l.trim()).filter(l => l.length > 0);
+    if (!pLines.length) return content;
+    const pNormalized = pLines.map(normalizeLine);
+    const cLines = content.split('\n');
+    for (let i = 0; i <= cLines.length - pLines.length; i++) {
+        let ok = true;
+        for (let j = 0; j < pLines.length; j++) {
+            if (normalizeLine(cLines[i + j]) !== pNormalized[j]) { ok = false; break; }
+        }
+        if (ok) {
+            const indent = (cLines[i].match(/^\s*/) || [''])[0];
+            const rLines = replacement.split('\n').map((l, idx) => idx === 0 ? indent + l.trim() : l);
+            cLines.splice(i, pLines.length, ...rLines);
+            return cLines.join('\n');
+        }
+    }
+    return content;
+}
+
+function replaceInContent(content, pattern, replacement) {
+    if (content.includes(pattern)) {
+        return { content: content.split(pattern).join(replacement), matched: true };
+    }
+    let matched = false;
+    try {
+        const regex = new RegExp(pattern, 'g');
+        const replaced = content.replace(regex, replacement);
+        if (replaced !== content) { content = replaced; matched = true; }
+    } catch (e) {}
+    if (!matched) {
+        const normalized = replaceIgnoringIndent(content, pattern, replacement);
+        if (normalized !== content) { content = normalized; matched = true; }
+    }
+    if (!matched) {
+        const lines = content.split('\n');
+        const pLines = pattern.split('\n').map(l => l.trim()).filter(l => l.length > 0);
+        let found = false;
+        for (let i = 0; i < lines.length && !found; i++) {
+            const trimmed = lines[i].trim();
+            if (!trimmed) continue;
+            for (const p of pLines) {
+                if (p && trimmed.includes(p)) {
+                    lines[i] = lines[i].replace(p, replacement.trim());
+                    found = true;
+                    break;
+                }
+            }
+        }
+        if (found) { content = lines.join('\n'); matched = true; }
+    }
+    return { content, matched };
+}
 
 async function executeAgentTool(name, args) {
     switch (name) {
         case 'read_file': {
             const full = resolveSafePath(args.caminho || '');
             if (!full || !fs.existsSync(full)) return 'Erro: arquivo não encontrado';
-            const content = fs.readFileSync(full, 'utf-8').slice(0, 50000);
+            const content = stripBOM(fs.readFileSync(full, 'utf-8')).slice(0, 50000);
             const ext = path.extname(args.caminho).toLowerCase();
             if (['.js', '.ts', '.jsx', '.tsx', '.py', '.go', '.rs', '.c', '.cpp', '.h'].includes(ext)) {
                 try {
@@ -1851,12 +2407,13 @@ async function executeAgentTool(name, args) {
             if (!full) return 'Erro: caminho inválido';
             const dir = path.dirname(full);
             if (!fs.existsSync(dir)) fs.mkdirSync(dir, { recursive: true });
-            fs.writeFileSync(full, args.conteudo || '', 'utf-8');
+            const cleanContent = stripBOM(args.conteudo || '');
+            fs.writeFileSync(full, cleanContent, 'utf-8');
             const ext = path.extname(args.caminho).toLowerCase();
-            let result = `Arquivo ${args.caminho} salvo (${(args.conteudo||'').length} bytes)`;
+            let result = `Arquivo ${args.caminho} salvo (${cleanContent.length} bytes)`;
             if (['.js', '.ts', '.jsx', '.tsx', '.py', '.go', '.rs', '.c', '.cpp', '.h'].includes(ext)) {
                 try {
-                    const validation = analyzer.validateCode(args.conteudo || '', args.caminho, PROJECT_ROOT);
+                    const validation = analyzer.validateCode(cleanContent, args.caminho, PROJECT_ROOT);
                     const errs = validation.errors.filter(e => e.severity === 'error');
                     const warns = validation.errors.filter(e => e.severity === 'warning');
                     if (errs.length > 0) result += `\n⚠️ ${errs.length} erro(s): ${errs.slice(0, 5).map(e => `Ln ${e.line}: ${e.message}`).join('; ')}`;
@@ -1911,8 +2468,32 @@ async function executeAgentTool(name, args) {
             const cmd = args.comando || '';
             if (!cmd) return 'Erro: comando vazio';
             try {
-                const result = require('child_process').execSync(cmd, { cwd: PROJECT_ROOT, timeout: 30000, encoding: 'utf-8', maxBuffer: 1024 * 1024 });
-                return result.slice(0, 10000) || '(sem saída)';
+                if (agentStreamCallback) {
+                    agentStreamCallback('Sistema', `$ ${cmd}\n`);
+                    const chunks = [];
+                    const child = require('child_process').spawn(cmd, [], { cwd: PROJECT_ROOT, shell: true, stdio: ['ignore', 'pipe', 'pipe'] });
+                    registerChildProcess(child);
+                    const killTimer = setTimeout(() => killChildTree(child), 30000);
+                    child.stdout.on('data', (d) => {
+                        const text = d.toString();
+                        chunks.push(text);
+                        agentStreamCallback('Sistema', text);
+                    });
+                    child.stderr.on('data', (d) => {
+                        const text = d.toString();
+                        chunks.push(text);
+                        agentStreamCallback('Sistema', text);
+                    });
+                    const code = await new Promise((resolve) => {
+                        child.on('close', (c) => { clearTimeout(killTimer); resolve(c); });
+                        child.on('error', () => { clearTimeout(killTimer); resolve(-1); });
+                    });
+                    const output = chunks.join('').slice(0, 10000);
+                    return code === 0 ? (output || '(sem saída)') : `Erro (código ${code}): ${output.slice(0, 2000)}`;
+                } else {
+                    const result = require('child_process').execSync(cmd, { cwd: PROJECT_ROOT, timeout: 30000, encoding: 'utf-8', maxBuffer: 1024 * 1024 });
+                    return result.slice(0, 10000) || '(sem saída)';
+                }
             } catch (e) {
                 return `Erro (código ${e.status}): ${(e.stderr || e.message || '').slice(0, 2000)}`;
             }
@@ -2046,43 +2627,55 @@ async function executeAgentTool(name, args) {
         case 'search_replace': {
             try {
                 const base = resolveSafePath(args.caminho || '');
-                const pattern = args.padrao || '';
+                const pattern = stripBOM(args.padrao || '');
                 const replacement = args.substituto || '';
                 if (!pattern) return 'Erro: informe o padrão';
                 const files = base && fs.existsSync(base) ? (fs.statSync(base).isDirectory() ? getAllFiles(base, { n: 0 }).slice(0, 50) : [base]) : getAllFiles(PROJECT_ROOT, { n: 0 }).slice(0, 50);
                 let count = 0;
                 for (const f of files) {
                     if (!fs.statSync(f).isFile()) continue;
-                    let content = fs.readFileSync(f, 'utf-8');
-                    let before = content;
-                    try {
-                        const regex = new RegExp(pattern, 'g');
-                        content = content.replace(regex, replacement);
-                    } catch (regexErr) {
-                        if (content.includes(pattern)) {
-                            content = content.split(pattern).join(replacement);
-                        } else {
-                            const lines = content.split('\n');
-                            let found = false;
-                            for (let i = 0; i < lines.length; i++) {
-                                const trimmed = lines[i].trim();
-                                if (trimmed && pattern.trim() && (trimmed.includes(pattern.trim()) || pattern.trim().includes(trimmed.slice(0, 40)))) {
-                                    lines[i] = lines[i].replace(pattern.trim(), replacement.trim());
-                                    found = true;
-                                }
-                            }
-                            if (found) content = lines.join('\n');
-                            else continue;
-                        }
-                    }
-                    if (content !== before) {
+                    const content = stripBOM(fs.readFileSync(f, 'utf-8'));
+                    const before = content;
+                    const { content: newContent, matched } = replaceInContent(content, pattern, replacement);
+                    if (matched && newContent !== before) {
                         backupFromContent(path.relative(PROJECT_ROOT, f), before);
-                        fs.writeFileSync(f, content, 'utf-8');
+                        fs.writeFileSync(f, newContent, 'utf-8');
                         count++;
                     }
                 }
                 return count > 0 ? `${count} arquivo(s) alterado(s)` : 'Nenhum arquivo alterado (padrão não encontrado em nenhum arquivo). Tente usar write_file para reescrever o arquivo inteiro.';
             } catch (e) { return `Erro: ${e.message}`; }
+        }
+        case 'task': {
+            const descricao = args.descricao || args.task || '';
+            if (!descricao) return 'Erro: descrição da subtarefa vazia';
+            const subProvider = _currentAgentProvider || 'gemini';
+            const subSignal = _currentAgentSignal || null;
+            const subPrompt = `Você é um subagente de investigação. Execute APENAS esta subtarefa e retorne um resumo conciso do resultado.\n\nSUBTAREFA: ${descricao}\n\nUse as ferramentas de leitura (read_file, search_code, list_files, analyzer_symbols) para investigar. NÃO modifique arquivos.`;
+            try {
+                const summary = await runAgentLoop(subPrompt, null, subSignal, 'plan', [], subProvider);
+                return summary ? `Subagente concluído: ${summary.slice(0, 2000)}` : 'Subagente concluído sem resumo';
+            } catch (e) {
+                return `Erro no subagente: ${e.message}`;
+            }
+        }
+        case 'question': {
+            const pergunta = args.pergunta || args.question || '';
+            if (!pergunta) return 'Erro: pergunta vazia';
+            const response = await requestUserInteraction('question', { pergunta }, _currentAgentSignal || null);
+            if (!response || !response.resposta) return 'Usuário não respondeu.';
+            return `Resposta do usuário: ${response.resposta}`;
+        }
+        case 'todo': {
+            const tarefas = Array.isArray(args.tarefas) ? args.tarefas : [];
+            _agentTodos = tarefas.map((t, i) => {
+                const titulo = typeof t === 'string' ? t : (t.titulo || t.title || 'Tarefa ' + (i + 1));
+                const status = typeof t === 'string' ? 'pending' : (t.status || 'pending');
+                return { titulo, status };
+            });
+            const list = _agentTodos.map((t, i) => `${i + 1}. [${t.status}] ${t.titulo}`).join('\n');
+            if (agentStreamCallback) agentStreamCallback('todo', JSON.stringify(_agentTodos));
+            return `Plano de tarefas atualizado:\n${list || '(vazio)'}`;
         }
         default: {
             if (name === 'browser_content') {
@@ -2102,21 +2695,21 @@ async function executeAgentTool(name, args) {
 }
 
 function getAllToolDeclarations() {
-    const builtin = AGENT_TOOLS.map(t => ({
-        name: t.name,
-        description: t.description,
-        parameters: {
-            type: 'object',
-            properties: Object.fromEntries(Object.entries(t.parameters).map(([k, v]) => [k, { type: 'string', description: v }])),
-            required: Object.keys(t.parameters)
-        }
-    }));
+    const builtin = Object.values(TOOL_SCHEMAS);
     const mcpTools = mcpManager.getAllTools().map(t => ({
         name: t.name,
         description: t.description,
         parameters: { type: 'object', properties: t.parameters || {}, required: Object.keys(t.parameters || {}) }
     }));
     return [...builtin, ...mcpTools];
+}
+
+function getAgentToolsForMode(mode) {
+    const allTools = getAllToolDeclarations();
+    if (mode === 'review' || mode === 'plan') {
+        return allTools.filter(t => !['write_file', 'delete_file', 'search_replace', 'file_rename', 'exec_command', 'git_commit', 'git_push', 'git_publish', 'docker_run', 'ssh_exec', 'undo', 'redo', 'snapshot_restore', 'browser_navigate', 'browser_click', 'browser_type', 'task'].includes(t.name));
+    }
+    return allTools;
 }
 
 function getQualityRules() {
@@ -2182,76 +2775,106 @@ function getLanguageQualityRules() {
     }
 }
 
+const AGENT_BEHAVIOR_RULES = `
+REGRAS DE EXECUÇÃO:
+- AUTO-CORREÇÃO: após cada write_file ou search_replace, SE o resultado do validador mostrar ERROS REAIS (não avisos de escopo como "pode não estar definido neste escopo", que são falsos positivos), corrija-os NO MESMO ARQUIVO antes de seguir para outro. Máximo ~3 tentativas por arquivo.
+- VERIFICAÇÃO FINAL: antes de concluir, releia os arquivos alterados (read_file), valide a sintaxe e, se houver testes no projeto, rode test_run. Corrija erros reais antes de finalizar.
+- EDIÇÃO CIRÚRGICA: prefira search_replace para alterações pontuais em arquivos existentes. Use write_file apenas para arquivos novos ou reescritas completas necessárias.
+- NÃO EXECUTE SERVIDORES/NPM INSTALL/DEPENDÊNCIAS: evite comandos que não terminam (ex.: node app.js, npm run dev, servidores). Use exec_command apenas para validação rápida (testes, lint, sintaxe) e sempre com fim definido.
+- CONVERGÊNCIA: se uma iteração não produziu progresso novo em relação à anterior, FINALIZE a tarefa imediatamente — não repita a mesma ferramenta/comando em loop.
+- AMBIGUIDADE: se o pedido for genuinamente ambíguo e houver 2+ direções válidas, use a ferramenta question para perguntar ao usuário ANTES de implementar.${LANGUAGE_RULE}`;
+
 function getAgentSystemPrompt(task) {
-    const fileTree = getFileTree('', '', { n: 0 }).slice(0, 2000);
-    return `${getQualityRules()}\n\nDIRETÓRIO: ${PROJECT_ROOT}\n${fileTree ? '\nESTRUTURA:\n' + fileTree : ''}\n\nTAREFA: ${task}\n\nCICLO: 1.Explore 2.Implemente 3.Compile e corrija erros até passar 4.Gere e execute testes 5.Revise segurança (injeção, XSS, secrets, validação) 6.Reporte resultados. Se for app novo: APP_SPEC.md primeiro.\n\nAPÓS ENTREGAR: pergunte se precisa de ajuste de UI/UX.`;
+    const fileTree = getFileTree('', '', { n: 0 }).slice(0, 1500);
+    let imageNote = '';
+    if (_pendingImages && _pendingImages.length) {
+        imageNote = `\n🖼️ ${_pendingImages.length} imagem(ns) anexada(s). Analise para entender o estado da UI.`;
+    }
+    return `Você é um agente de desenvolvimento no Aedificator Codex IDE. Seja direto, conciso e acionável.
+
+${LANGUAGE_RULE}
+
+${getQualityRules()}
+
+DIRETÓRIO: ${PROJECT_ROOT}
+${fileTree ? 'ESTRUTURA:\n' + fileTree : ''}${imageNote}
+
+TAREFA: ${task}
+
+COMPORTAMENTO:
+- TRABALHE INCREMENTALMENTE: 1-2 arquivos por vez, valide, depois prossiga.
+- Use search_code para evitar duplicar funções já existentes.
+- Após concluir, responda em 1-2 linhas com o que foi feito.
+${AGENT_BEHAVIOR_RULES}`;
 }
 
 function getDeepSeekAgentPrompt(task) {
     const fileTree = getFileTree('', '', { n: 0 }).slice(0, 1200);
-    return `Você é um agente de desenvolvimento. REGRAS ABSOLUTAS:
+    let imageNote = '';
+    if (_pendingImages && _pendingImages.length) {
+        imageNote = `\n⚠️ O usuário anexou ${_pendingImages.length} imagem(ns). O DeepSeek NÃO suporta visão — use apenas as instruções textuais.`;
+    }
+    return `Você é um agente de desenvolvimento no Aedificator Codex IDE. Seja direto e conciso.
+
+${LANGUAGE_RULE}
 
 1. DIRETÓRIO: ${PROJECT_ROOT}
 ${fileTree ? 'ESTRUTURA:\n' + fileTree : '(pasta vazia)'}
 
 2. TAREFA: ${task}
 
-3. COMPORTAMENTO OBRIGATÓRIO:
-- ⛔ MÁXIMO 5 LEITURAS de arquivos. Depois disso, APENAS write_file
-- ⛔ NUNCA leia o mesmo arquivo duas vezes
-- ✅ Use list_files 1x no início para ver a estrutura
-- ✅ Use read_file APENAS nos arquivos que vai modificar
-- ✅ Use write_file para criar/modificar arquivos INTEIROS
-- ✅ Após todas as alterações, retorne APENAS o texto final da resposta
-
-4. ${getQualityRules().split('\\n').slice(0, 2).join('\\n')}`;
+3. COMPORTAMENTO:
+- Na PRIMEIRA iteração, já faça a alteração. NÃO fique lendo arquivos.
+- NÃO configure Jest, npm, package.json. Apenas corrija o código.
+- NÃO use exec_command para ls/dir/cat/type/npm/npx.
+- Máximo 3 leituras. Depois APENAS altere/escreva.
+- 1 arquivo por vez. Escreva, veja os erros, corrija. Depois faça o próximo.
+${AGENT_BEHAVIOR_RULES}`;
 }
 
-async function runAgentLoopGemini(task, onChunk, signal, mode, history, provider) {
-    const systemPrompt = getAgentSystemPrompt(task);
-    const messages = [{ role: 'user', parts: [{ text: systemPrompt }] }];
+// =============================================
+//  AGENT LOOP UNIFICADO — adapter de provider + ferramentas
+// =============================================
 
-    const toolDeclarations = getAllToolDeclarations();
+// Formato canônico de mensagem:
+//   { role: 'system' | 'user' | 'assistant' | 'tool', content, tool_calls?, tool_call_id?, name? }
 
-    let iteration = 0;
-    const maxIterations = 20;
-
-    while (iteration < maxIterations) {
-        if (signal && signal.aborted) break;
-        iteration++;
-
-        const geminiKey = config.gemini.apiKey;
-        if (!geminiKey) throw new Error('Chave Gemini não configurada');
-
-        const url = new URL(`https://generativelanguage.googleapis.com/v1beta/models/${config.gemini.model || 'gemini-2.5-flash'}:streamGenerateContent?alt=sse&key=${geminiKey}`);
-        const body = JSON.stringify({
-            contents: messages,
-            tools: [{ functionDeclarations: toolDeclarations }],
-            toolConfig: { functionCallingConfig: { mode: 'AUTO' } }
-        });
-
-        const responseText = await fetchGeminiStreamRaw(url, body, onChunk, signal);
-        const parsed = parseGeminiResponse(responseText, messages, onChunk);
-
-        if (parsed.done) return parsed.summary;
-        if (parsed.toolCalls.length === 0) {
-            return parsed.summary || 'Agente concluído';
-        }
-
-        for (const tc of parsed.toolCalls) {
-            const gemToolId = 'gem_' + tc.name + '_' + Date.now();
-            if (onChunk) onChunk('activity', JSON.stringify({
-                ev: 'tool_start', id: gemToolId,
-                tool: tc.name, label: buildToolLabel(tc.name, tc.args), icon: getToolIcon(tc.name),
-                file: tc.args.filePath || tc.args.path || tc.args.file || tc.args.caminho || ''
-            }));
-            const result = await executeAgentTool(tc.name, tc.args);
-            if (onChunk) onChunk('activity', JSON.stringify({ ev: 'tool_end', id: gemToolId, isError: false }));
-            messages.push({ role: 'model', parts: [{ functionCall: { name: tc.name, args: tc.args } }] });
-            messages.push({ role: 'user', parts: [{ functionResponse: { name: tc.name, response: { result: String(result).slice(0, 8000) } } }] });
+function geminiContentsFromCanonical(messages) {
+    const contents = [];
+    let systemText = '';
+    let systemApplied = false;
+    let firstUser = true;
+    for (const m of messages) {
+        if (m.role === 'system') { systemText += (systemText ? '\n' : '') + m.content; continue; }
+        if (m.role === 'assistant') {
+            const parts = [];
+            if (m.content) parts.push({ text: m.content });
+            for (const tc of (m.tool_calls || [])) {
+                const part = { functionCall: { name: tc.name, args: tc.args } };
+                if (tc.thought_signature) part.thoughtSignature = tc.thought_signature;
+                parts.push(part);
+            }
+            contents.push({ role: 'model', parts: parts.length ? parts : [{ text: '' }] });
+        } else if (m.role === 'tool') {
+            contents.push({ role: 'user', parts: [{ functionResponse: { name: m.name, response: { result: String(m.content).slice(0, 8000) } } }] });
+        } else {
+            const parts = [];
+            if (systemText && !systemApplied) { parts.push({ text: systemText }); systemApplied = true; }
+            if (firstUser && _pendingImages && _pendingImages.length) {
+                for (const img of _pendingImages) {
+                    if (img.dataUrl) {
+                        const match = img.dataUrl.match(/^data:(image\/\w+);base64,(.+)/);
+                        if (match) parts.push({ inlineData: { mimeType: match[1], data: match[2] } });
+                    }
+                }
+                clearPendingImages();
+            }
+            firstUser = false;
+            parts.push({ text: m.content });
+            contents.push({ role: 'user', parts });
         }
     }
-    return 'Limite de iterações atingido';
+    return contents;
 }
 
 async function fetchGeminiStreamRaw(url, body, onChunk, signal) {
@@ -2262,24 +2885,30 @@ async function fetchGeminiStreamRaw(url, body, onChunk, signal) {
     }, 120000, signal);
     if (!response.ok) {
         const err = await response.text();
-        throw new Error(`Gemini HTTP ${response.status}: ${err.slice(0, 300)}`);
+        const hint = getProviderErrorHint(response.status, err, 'gemini');
+        const msg = hint || `Gemini HTTP ${response.status}: ${err.slice(0, 300)}`;
+        logError('gemini-api', msg, err.slice(0, 500));
+        throw new Error(msg);
     }
     const reader = response.body.getReader();
     const decoder = new TextDecoder();
     let fullText = '';
     while (true) {
-        if (signal && signal.aborted) break;
+        if (signal && signal.aborted) {
+            const err = new Error('Tarefa cancelada');
+            err.name = 'AbortError';
+            throw err;
+        }
         const { done, value } = await reader.read();
         if (done) break;
-        const chunk = decoder.decode(value, { stream: true });
-        fullText += chunk;
+        fullText += decoder.decode(value, { stream: true });
     }
     return fullText;
 }
 
-function parseGeminiResponse(rawText, messages, onChunk) {
+function parseGeminiAgentResponse(rawText) {
     const toolCalls = [];
-    let summary = '';
+    let text = '';
     const lines = rawText.split('\n');
     for (const line of lines) {
         if (!line.startsWith('data: ')) continue;
@@ -2290,38 +2919,80 @@ function parseGeminiResponse(rawText, messages, onChunk) {
             const parts = candidate.content?.parts || [];
             for (const part of parts) {
                 if (part.functionCall) {
-                    const args = part.functionCall.args || {};
-                    const name = part.functionCall.name;
-                    toolCalls.push({ name, args });
-                    if (onChunk) onChunk('Sistema', `🔧 ${name}(${Object.values(args).join(', ').slice(0, 60)})\n`);
+                    const tc = { id: 'gem_' + Date.now() + '_' + toolCalls.length, name: part.functionCall.name, args: part.functionCall.args || {} };
+                    const ts = part.thoughtSignature || part.thought_signature || part.functionCall.thoughtSignature || part.functionCall.thought_signature;
+                    if (ts) tc.thought_signature = ts;
+                    toolCalls.push(tc);
                 }
-                if (part.text) {
-                    summary += part.text;
-                    if (onChunk) onChunk('Assistente', part.text);
-                }
+                if (part.text) text += part.text;
             }
         } catch (e) {}
     }
-    const finishReason = extractFinishReason(rawText);
-    return { toolCalls, summary, done: toolCalls.length === 0 && finishReason !== 'TOOL_CALLS' };
+    return { text, toolCalls };
 }
 
-function extractFinishReason(rawText) {
-    const lines = rawText.split('\n');
-    for (const line of lines) {
-        if (!line.startsWith('data: ')) continue;
-        try {
-            const json = JSON.parse(line.slice(6));
-            return json.candidates?.[0]?.finishReason || '';
-        } catch (e) {}
+async function callAgentGemini(messages, tools, signal) {
+    const geminiKey = config.gemini.apiKey;
+    if (!geminiKey) throw new Error('Chave Gemini não configurada');
+    const url = new URL(`https://generativelanguage.googleapis.com/v1beta/models/${config.gemini.model || 'gemini-2.5-flash'}:streamGenerateContent?alt=sse&key=${geminiKey}`);
+    const toolDeclarations = tools.map(t => ({ name: t.name, description: t.description, parameters: t.parameters }));
+    const body = JSON.stringify({
+        contents: geminiContentsFromCanonical(messages),
+        tools: [{ functionDeclarations: toolDeclarations }],
+        toolConfig: { functionCallingConfig: { mode: 'AUTO' } }
+    });
+    const raw = await fetchGeminiStreamRaw(url, body, null, signal);
+    return parseGeminiAgentResponse(raw);
+}
+
+function openAIMessagesFromCanonical(messages, allowImages) {
+    const out = [];
+    let firstUser = true;
+    for (const m of messages) {
+        if (m.role === 'system') { out.push({ role: 'system', content: m.content }); continue; }
+        if (m.role === 'assistant') {
+            const entry = { role: 'assistant', content: m.content || null };
+            if (m.tool_calls && m.tool_calls.length) {
+                entry.tool_calls = m.tool_calls.map(tc => ({ id: tc.id, type: 'function', function: { name: tc.name, arguments: JSON.stringify(tc.args) } }));
+            }
+            out.push(entry);
+        } else if (m.role === 'tool') {
+            out.push({ role: 'tool', tool_call_id: m.tool_call_id, content: String(m.content).slice(0, 8000) });
+        } else {
+            if (firstUser && allowImages) {
+                firstUser = false;
+                const images = getImagePartsForOpenAI();
+                if (images) {
+                    out.push({ role: 'user', content: [...images, { type: 'text', text: m.content }] });
+                    clearPendingImages();
+                    continue;
+                }
+            }
+            firstUser = false;
+            out.push({ role: 'user', content: m.content });
+        }
     }
-    return '';
+
+    // Sanitização: descarta tool messages órfãos (sem um "assistant" com
+    // tool_calls antes). A API OpenAI/DeepSeek rejeita com HTTP 400 se um "tool"
+    // não for resposta a uma chamada de ferramenta anterior.
+    const cleaned = [];
+    let expectingTool = false;
+    for (const m of out) {
+        if (m.role === 'assistant' && m.tool_calls && m.tool_calls.length) {
+            expectingTool = true;
+            cleaned.push(m);
+        } else if (m.role === 'tool') {
+            if (expectingTool) cleaned.push(m);
+        } else {
+            expectingTool = false;
+            cleaned.push(m);
+        }
+    }
+    return cleaned;
 }
 
-// =============================================
-//  AGENT LOOP — DEEPSEEK / OPENAI (tool_use)
-// =============================================
-async function runAgentLoopOpenAI(task, onChunk, signal, provider) {
+async function callAgentOpenAICompatible(provider, messages, tools, signal, onChunk) {
     const apiKey = provider === 'deepseek' ? config.deepseek.apiKey : config.openai.apiKey;
     if (!apiKey) throw new Error(`Chave ${provider} não configurada`);
     const baseUrl = provider === 'deepseek'
@@ -2329,146 +3000,411 @@ async function runAgentLoopOpenAI(task, onChunk, signal, provider) {
         : 'https://api.openai.com/v1/chat/completions';
     const model = provider === 'deepseek' ? (config.deepseek.model || 'deepseek-v4-flash') : (config.openai.model || 'gpt-4o');
 
-    const tools = getAllToolDeclarations().map(t => ({
-        type: 'function',
-        function: {
-            name: t.name,
-            description: t.description,
-            parameters: t.parameters
+    const toolDefs = tools.map(t => ({ type: 'function', function: { name: t.name, description: t.description, parameters: t.parameters } }));
+    const body = { model, messages: openAIMessagesFromCanonical(messages, provider !== 'deepseek'), tools: toolDefs, tool_choice: 'auto', max_tokens: 8192 };
+
+    // Timeout por tentativa: uma API que não responde não pode travar a tarefa
+    // em "Executando" por tempo indeterminado (o watchdog é o último recurso).
+    // 120s POR TENTATIVA: tool-calling (reasoning + múltiplas tool calls com
+    // contexto grande) facilmente ultrapassa 60s. O timer é recriado a cada
+    // tentativa — se fosse compartilhado, o retry herdaria o tempo já gasto e
+    // abortaria imediatamente após a primeira tentativa demorada.
+    const API_TIMEOUT_MS = 120000;
+    const baseSignal = signal;
+
+    let response;
+    try {
+        response = await retryWithBackoff(
+            () => {
+                // Cria o timeout FRESCO por tentativa (o sinal externo é imutável).
+                const attemptSignal = baseSignal && typeof baseSignal.aborted === 'boolean' && typeof AbortSignal.any === 'function'
+                    ? AbortSignal.any([baseSignal, AbortSignal.timeout(API_TIMEOUT_MS)])
+                    : baseSignal;
+                return fetch(baseUrl, {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json', 'Authorization': `Bearer ${apiKey}` },
+                    body: safeJsonStringify(body),
+                    signal: attemptSignal
+                });
+            },
+            {
+                maxRetries: 1,
+                baseDelay: 2000,
+                onRetry: (attempt, max, delay) => {
+                    if (onChunk) onChunk('Sistema', `⏳ Retry ${attempt}/${max}... aguardando ${delay}s\n`);
+                },
+                signal: baseSignal
+            }
+        );
+    } catch (fetchErr) {
+        const hint = getProviderErrorHint(0, fetchErr.message, provider);
+        const msg = hint ? hint : `❌ ${provider} indisponível: ${fetchErr.message.slice(0, 150)}`;
+        if (onChunk) onChunk('Sistema', msg + '\n');
+        throw new Error(msg);
+    }
+    if (!response.ok) {
+        const errorBody = await response.text().catch(() => '');
+        const hint = getProviderErrorHint(response.status, errorBody, provider);
+        throw new Error(hint || `${provider} HTTP ${response.status}: ${errorBody.slice(0, 200)}`);
+    }
+
+    const data = await response.json();
+    const msg = data.choices?.[0]?.message;
+    if (!msg) return { text: 'Sem resposta', toolCalls: [] };
+    const toolCalls = (msg.tool_calls || []).map(tc => {
+        let args = {};
+        try {
+            args = JSON.parse(tc.function.arguments || '{}');
+        } catch (e) {
+            logError('tool-args', `JSON inválido nos argumentos de ${tc.function.name}`, e.message.slice(0, 200));
         }
-    }));
+        return { id: tc.id, name: tc.function.name, args };
+    });
+    return { text: msg.content || '', toolCalls };
+}
 
-    const systemPrompt = provider === 'deepseek' ? getDeepSeekAgentPrompt(task) : getAgentSystemPrompt(task);
-    const messages = [{ role: 'system', content: systemPrompt },
-        { role: 'user', content: task }];
-
-    let iteration = 0;
-    const maxIterations = 20;
-    let filesRead = 0;
-
-    while (iteration < maxIterations) {
-        if (signal && signal.aborted) break;
-        iteration++;
-        if (filesRead >= 5 && onChunk) onChunk('Sistema', '⚠️ Já leu 5+ arquivos. Use AGORA write_file para fazer alterações.\n');
-        if (iteration === 10 && onChunk) onChunk('Sistema', '⚠️ Iteração 10/20 — PARE de ler e FAÇA as alterações com write_file.\n');
-        if (iteration >= 18 && onChunk) onChunk('Sistema', '⚠️ Últimas iterações — entregue o resultado JÁ.\n');
-
-        const body = { model, messages, tools, tool_choice: 'auto', max_tokens: 4096 };
-        const response = await fetch(baseUrl, {
-            method: 'POST',
-            headers: { 'Content-Type': 'application/json', 'Authorization': `Bearer ${apiKey}` },
-            body: safeJsonStringify(body),
-            signal
-        });
-        if (!response.ok) throw new Error(`${provider} HTTP ${response.status}: ${(await response.text()).slice(0, 300)}`);
-
-        const data = await response.json();
-        const msg = data.choices?.[0]?.message;
-        if (!msg) return 'Sem resposta';
-
-        messages.push(msg);
-
-        if (msg.content && onChunk) onChunk('Assistente', msg.content);
-
-        const toolCalls = msg.tool_calls || [];
-        if (toolCalls.length === 0) {
-            return msg.content || 'Agente concluído';
-        }
-
-        for (const tc of toolCalls) {
-            const args = JSON.parse(tc.function.arguments || '{}');
-            if (onChunk) onChunk('Sistema', `🔧 ${tc.function.name}(${Object.values(args).join(', ').slice(0, 60)})\n`);
-            if (onChunk) onChunk('activity', JSON.stringify({
-                ev: 'tool_start', id: tc.id, tool: tc.function.name,
-                label: buildToolLabel(tc.function.name, args), icon: getToolIcon(tc.function.name),
-                file: args.filePath || args.path || args.file || args.caminho || ''
-            }));
-            const result = await executeAgentTool(tc.function.name, args);
-            if (tc.function.name === 'read_file' || tc.function.name === 'list_files') {
-                filesRead++;
-                if (filesRead === 8) {
-                    messages.push({ role: 'system', content: '⚠️ VOCÊ JÁ LEU 8 ARQUIVOS. NÃO LEIA MAIS NADA. Use write_file AGORA para fazer as alterações. Não use mais read_file, list_files ou search_code.' });
+function claudeMessagesFromCanonical(messages) {
+    const out = [];
+    let systemText = '';
+    let systemApplied = false;
+    let firstUser = true;
+    for (const m of messages) {
+        if (m.role === 'system') { systemText += (systemText ? '\n' : '') + m.content; continue; }
+        if (m.role === 'assistant') {
+            const blocks = [];
+            if (m.content) blocks.push({ type: 'text', text: m.content });
+            for (const tc of (m.tool_calls || [])) blocks.push({ type: 'tool_use', id: tc.id, name: tc.name, input: tc.args });
+            out.push({ role: 'assistant', content: blocks.length ? blocks : [{ type: 'text', text: '' }] });
+        } else if (m.role === 'tool') {
+            out.push({ role: 'user', content: [{ type: 'tool_result', tool_use_id: m.tool_call_id, content: String(m.content).slice(0, 8000) }] });
+        } else {
+            let text = m.content;
+            if (systemText && !systemApplied) { text = systemText + '\n\n' + text; systemApplied = true; }
+            if (firstUser) {
+                firstUser = false;
+                const images = getImagePartsForClaude();
+                if (images && images.length) {
+                    out.push({ role: 'user', content: [...images, { type: 'text', text }] });
+                    clearPendingImages();
+                    continue;
                 }
             }
-            if (onChunk) onChunk('activity', JSON.stringify({ ev: 'tool_end', id: tc.id, isError: false }));
-            messages.push({ role: 'tool', tool_call_id: tc.id, content: String(result).slice(0, 8000) });
+            out.push({ role: 'user', content: text });
         }
     }
-    return 'Limite de iterações atingido';
+    return out;
 }
 
-// =============================================
-//  AGENT LOOP — CLAUDE (tool_use)
-// =============================================
-async function runAgentLoopClaude(task, onChunk, signal) {
+async function callAgentClaude(messages, tools, signal) {
     const apiKey = config.claude.apiKey;
     if (!apiKey) throw new Error('Chave Claude não configurada');
-    const model = config.claude.model || 'claude-sonnet-4-6';
+    const model = config.claude.model || 'claude-sonnet-5';
+    const toolDefs = tools.map(t => ({ name: t.name, description: t.description, input_schema: t.parameters }));
 
-    const tools = getAllToolDeclarations().map(t => ({
-        name: t.name,
-        description: t.description,
-        input_schema: t.parameters
-    }));
+    const response = await fetch('https://api.anthropic.com/v1/messages', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', 'x-api-key': apiKey, 'anthropic-version': '2023-06-01' },
+        body: safeJsonStringify({ model, max_tokens: 4096, messages: claudeMessagesFromCanonical(messages), tools: toolDefs }),
+        signal
+    });
+    if (!response.ok) throw new Error(`Claude HTTP ${response.status}: ${(await response.text()).slice(0, 300)}`);
 
-    const messages = [{ role: 'user', content: getAgentSystemPrompt(task) }];
-
-    let iteration = 0;
-    const maxIterations = 20;
-
-    while (iteration < maxIterations) {
-        if (signal && signal.aborted) break;
-        iteration++;
-
-        const response = await fetch('https://api.anthropic.com/v1/messages', {
-            method: 'POST',
-            headers: { 'Content-Type': 'application/json', 'x-api-key': apiKey, 'anthropic-version': '2023-06-01' },
-            body: safeJsonStringify({ model, max_tokens: 4096, messages, tools }),
-            signal
-        });
-        if (!response.ok) throw new Error(`Claude HTTP ${response.status}: ${(await response.text()).slice(0, 300)}`);
-
-        const data = await response.json();
-        const content = data.content || [];
-
-        let textContent = '';
-        const toolUses = [];
-
-        for (const block of content) {
-            if (block.type === 'text') textContent += block.text;
-            if (block.type === 'tool_use') toolUses.push(block);
-        }
-
-        if (textContent && onChunk) onChunk('Assistente', textContent);
-        messages.push({ role: 'assistant', content });
-
-        if (toolUses.length === 0) return textContent || 'Agente concluído';
-
-        const toolResults = [];
-        for (const tu of toolUses) {
-            if (onChunk) onChunk('Sistema', `🔧 ${tu.name}(${Object.values(tu.input || {}).join(', ').slice(0, 60)})\n`);
-            if (onChunk) onChunk('activity', JSON.stringify({
-                ev: 'tool_start', id: tu.id, tool: tu.name,
-                label: buildToolLabel(tu.name, tu.input || {}), icon: getToolIcon(tu.name),
-                file: (tu.input || {}).filePath || (tu.input || {}).path || (tu.input || {}).file || (tu.input || {}).caminho || ''
-            }));
-            const result = await executeAgentTool(tu.name, tu.input || {});
-            if (onChunk) onChunk('activity', JSON.stringify({ ev: 'tool_end', id: tu.id, isError: false }));
-            toolResults.push({ type: 'tool_result', tool_use_id: tu.id, content: String(result).slice(0, 8000) });
-        }
-        messages.push({ role: 'user', content: toolResults });
+    const data = await response.json();
+    const content = data.content || [];
+    let text = '';
+    const toolCalls = [];
+    for (const block of content) {
+        if (block.type === 'text') text += block.text;
+        if (block.type === 'tool_use') toolCalls.push({ id: block.id, name: block.name, args: block.input || {} });
     }
-    return 'Limite de iterações atingido';
+    return { text, toolCalls };
+}
+
+async function callAgentProvider(provider, messages, tools, signal, onChunk) {
+    if (provider === 'gemini') return await callAgentGemini(messages, tools, signal);
+    if (provider === 'deepseek' || provider === 'openai') return await callAgentOpenAICompatible(provider, messages, tools, signal, onChunk);
+    if (provider === 'claude') return await callAgentClaude(messages, tools, signal);
+    throw new Error(`Modo agente não suportado para ${provider}`);
+}
+
+function getConfiguredProviders() {
+    const providers = [];
+    if (config.gemini?.apiKey) providers.push('gemini');
+    if (config.deepseek?.apiKey) providers.push('deepseek');
+    if (config.openai?.apiKey) providers.push('openai');
+    if (config.claude?.apiKey) providers.push('claude');
+    return providers;
+}
+
+function isNetworkError(err) {
+    const m = String((err && err.message) || '').toLowerCase();
+    return /fetch failed|enetunreach|econnrefused|econnreset|etimedout|timeout|network|socket hang up|failed to fetch|temporary failure/i.test(m);
+}
+
+async function callAgentProviderWithFallback(primary, messages, tools, signal, onChunk, activeProviderRef) {
+    const candidates = [primary, ...getConfiguredProviders().filter(p => p !== primary)];
+    let lastErr = null;
+    for (const candidate of candidates) {
+        try {
+            const result = await callAgentProvider(candidate, messages, tools, signal, onChunk);
+            if (candidate !== primary) {
+                if (onChunk) onChunk('Sistema', `🔁 Provider ${candidate} assumiu (fallback automático).\n`);
+                if (activeProviderRef) activeProviderRef.value = candidate;
+                _currentAgentProvider = candidate;
+            }
+            return result;
+        } catch (err) {
+            lastErr = err;
+            const networkErr = isNetworkError(err);
+            const isLast = candidate === candidates[candidates.length - 1];
+            if (isLast) break;
+            if (onChunk) onChunk('Sistema', `⚠️ ${candidate} falhou (${err.message.slice(0, 100)}). Tentando ${candidates[candidates.length - 1]}...\n`);
+            if (!networkErr) break;
+        }
+    }
+    throw lastErr || new Error('Todos os providers falharam');
 }
 
 // =============================================
-//  AGENT LOOP — DISPATCHER
+//  PERMISSÕES POR TOOL (allow/deny/ask)
+// =============================================
+function summarizeToolArgs(args) {
+    const out = {};
+    for (const [k, v] of Object.entries(args || {})) {
+        if (typeof v === 'string' && v.length > 200) out[k] = v.slice(0, 200) + '...';
+        else out[k] = v;
+    }
+    return out;
+}
+
+function requestUserInteraction(kind, payload, signal) {
+    return new Promise((resolve) => {
+        const id = 'int_' + (++_interactionSeq) + '_' + crypto.randomBytes(4).toString('hex');
+        let settled = false;
+        let timer = null;
+        const cleanup = () => {
+            if (signal) signal.removeEventListener('abort', onAbort);
+            if (timer) clearTimeout(timer);
+            pendingInteractions.delete(id);
+        };
+        const onAbort = () => { if (!settled) { settled = true; cleanup(); resolve(null); } };
+        timer = setTimeout(() => { if (!settled) { settled = true; cleanup(); resolve(null); } }, 120000);
+        if (signal) signal.addEventListener('abort', onAbort, { once: true });
+        pendingInteractions.set(id, {
+            kind,
+            resolve: (v) => { if (!settled) { settled = true; cleanup(); resolve(v); } }
+        });
+        if (agentStreamCallback) {
+            agentStreamCallback('interaction', JSON.stringify({ id, kind, ...payload }));
+        } else if (!settled) {
+            settled = true;
+            cleanup();
+            resolve(null);
+        }
+    });
+}
+
+function isAskTool(name) {
+    return Array.isArray(config.toolPermissions.ask) && config.toolPermissions.ask.includes(name);
+}
+
+function setToolGrant(name, value) {
+    if (!config.toolPermissions.grants) config.toolPermissions.grants = {};
+    config.toolPermissions.grants[name] = value;
+    try { saveConfigToFile(); } catch (e) { logError('permissions-save', 'Erro ao salvar permissões', e.message); }
+}
+
+async function checkToolPermission(name, args, signal) {
+    const grants = config.toolPermissions.grants || {};
+    if (grants[name] === 'allow') return 'allow';
+    if (grants[name] === 'deny') return 'deny';
+    if (!isAskTool(name)) return 'allow';
+    const response = await requestUserInteraction('permission', {
+        tool: name,
+        label: buildToolLabel(name, args),
+        args: summarizeToolArgs(args)
+    }, signal);
+    if (!response || response.allow !== true) {
+        if (response && response.always) setToolGrant(name, 'deny');
+        return 'deny';
+    }
+    if (response.always) setToolGrant(name, 'allow');
+    return 'allow';
+}
+
+// =============================================
+//  COMPACTAÇÃO DE CONTEXTO
+// =============================================
+const COMPACT_THRESHOLD = 40;
+
+async function maybeCompactMessages(provider, messages, signal) {
+    if (messages.length <= COMPACT_THRESHOLD) return;
+    const systemMsg = messages.find(m => m.role === 'system');
+    let keepFrom = Math.max(systemMsg ? 1 : 0, messages.length - 12);
+    // A API OpenAI/DeepSeek exige que "tool" siga um "assistant" com tool_calls.
+    // Se o corte cair no meio de uma sequência de tool results, a mensagem órfã
+    // geraria HTTP 400. Avança o corte até começar em um "assistant".
+    while (keepFrom < messages.length && messages[keepFrom].role === 'tool') keepFrom++;
+    const older = messages.slice(systemMsg ? 1 : 0, keepFrom);
+    const recent = messages.slice(keepFrom);
+
+    let summary = '';
+    try {
+        const convText = older.map(m => {
+            if (m.role === 'assistant') return `Assistente: ${(m.content || '').slice(0, 300)}`;
+            if (m.role === 'tool') return `[tool ${m.name}: ${(m.content || '').slice(0, 150)}]`;
+            return `Usuário: ${(m.content || '').slice(0, 300)}`;
+        }).join('\n');
+        summary = await callAI(provider, `Resuma de forma concisa o progresso da conversa abaixo (arquivos alterados, decisões, próximos passos). Máximo 300 palavras.\n\n${convText.slice(0, 8000)}`, null, signal);
+    } catch (e) {
+        summary = '';
+    }
+
+    const rebuilt = [];
+    if (systemMsg) rebuilt.push(systemMsg);
+    rebuilt.push({ role: 'user', content: summary ? `RESUMO DA CONVERSA ANTERIOR (compactado automaticamente):\n${summary}` : 'Conversa anterior omitida para economizar contexto.' });
+    rebuilt.push(...recent);
+    messages.length = 0;
+    messages.push(...rebuilt);
+    if (agentStreamCallback) agentStreamCallback('Sistema', '🗜️ Contexto compactado para economizar tokens.\n');
+}
+
+// =============================================
+//  AGENT LOOP — UNIFICADO
+function hasRealWriteErrors(resultStr) {
+    const s = String(resultStr || '');
+    const m = s.match(/⚠️\s*(\d+)\s*erro\(s\)/);
+    if (!m || parseInt(m[1], 10) === 0) return false;
+    const errorBlock = s.split('💡')[0];
+    const scopeFalse = (errorBlock.match(/pode não estar definido neste escopo/g) || []).length;
+    return scopeFalse < parseInt(m[1], 10);
+}
+
 // =============================================
 async function runAgentLoop(task, onChunk, signal, mode, history, provider) {
-    if (provider === 'gemini') return await runAgentLoopGemini(task, onChunk, signal, mode, history, provider);
-    if (provider === 'deepseek' || provider === 'openai') return await runAgentLoopOpenAI(task, onChunk, signal, provider);
-    if (provider === 'claude') return await runAgentLoopClaude(task, onChunk, signal);
-    throw new Error(`Modo agente não suportado para ${provider}`);
+    const systemPrompt = provider === 'deepseek' ? getDeepSeekAgentPrompt(task) : getAgentSystemPrompt(task);
+    const tools = getAgentToolsForMode(mode);
+    const maxIterations = 20;
+
+    const messages = [{ role: 'system', content: systemPrompt }, { role: 'user', content: task }];
+    const prevProvider = _currentAgentProvider;
+    const prevSignal = _currentAgentSignal;
+    const prevTodos = _agentTodos;
+    _currentAgentProvider = provider;
+    _currentAgentSignal = signal;
+    _agentTodos = [];
+
+    const loopStartSnapshot = snapshotProjectFiles();
+    const activeProvider = { value: provider };
+    let noActionCount = 0;
+
+    try {
+        let iteration = 0;
+        while (iteration < maxIterations) {
+            if (signal && signal.aborted) {
+                const err = new Error('Tarefa cancelada');
+                err.name = 'AbortError';
+                throw err;
+            }
+            iteration++;
+            if (iteration >= maxIterations - 1 && onChunk) onChunk('Sistema', `⚠️ Iteração ${iteration}/${maxIterations} — finalize a tarefa.\n`);
+
+            const thoughtStart = Date.now();
+            const { text, toolCalls } = await callAgentProviderWithFallback(activeProvider.value, messages, tools, signal, onChunk, activeProvider);
+            const elapsed = ((Date.now() - thoughtStart) / 1000).toFixed(1);
+
+            if (text && onChunk) onChunk('Assistente', text);
+            if (toolCalls.length === 0) {
+                // O agente devolveu texto sem executar NENHUMA ferramenta. Isso é
+                // legítimo para perguntas/consultas, mas se a tarefa pede uma
+                // implementação e o texto parece indecisão/plano ("vou", "posso",
+                // "preciso", "poderia", "sugiro"...), NÃO desistimos — forçamos a
+                // execução por até 2 tentativas antes de concluir.
+                const looksLikeActionTask = /(faça|crie|implemente|adicione|corrija|melhore|modifique|ajuste|refatore|escreva|altere|cria|implementar|melhorar|corrigir|adicionar)/i.test(task);
+                const looksHesitant = /(^|\s)(vou|posso|poderia|preciso|devo|sugiro|planejo|vamos|pretendo|poderíamos|poderia|analisar|pensar|estudar)\b/i.test(text || '') || /(\?\s*$)|(escolha|prefere|qual opção|sugest[ãa]o)/i.test(text || '');
+                if (looksLikeActionTask && looksHesitant && noActionCount < 2) {
+                    noActionCount++;
+                    messages.push({
+                        role: 'user',
+                        content: 'NÃO responda com plano ou pergunta. A tarefa é de IMPLEMENTAÇÃO: use as ferramentas write_file / search_replace / exec_command AGORA para fazer as alterações no código. Se precisar explorar, faça NO MÁXIMO 1 leitura e depois altere.'
+                    });
+                    continue;
+                }
+                return text || 'Agente concluído';
+            }
+            if (onChunk) onChunk('Sistema', `+ Thought: ${elapsed}s\n`);
+
+            messages.push({ role: 'assistant', content: text, tool_calls: toolCalls });
+
+            // Auto-correção NÃO pode ser inserida entre tool calls: a API OpenAI/DeepSeek
+            // exige que mensagens "tool" sigam imediatamente um "assistant" com tool_calls.
+            // A instrução é acumulada e enviada como "user" DEPOIS de todos os tool results.
+            let autoCorrectPending = false;
+
+            for (const tc of toolCalls) {
+                if (onChunk) onChunk('Sistema', `🔧 ${tc.name}(${Object.values(tc.args).join(', ').slice(0, 60)})\n`);
+                const decision = await checkToolPermission(tc.name, tc.args, signal);
+                let result;
+                let toolError = false;
+                if (decision === 'deny') {
+                    result = 'Permissão negada pelo usuário.';
+                    toolError = true;
+                    if (onChunk) onChunk('Sistema', '  ⛔ negado pelo usuário\n');
+                } else {
+                    if (onChunk) onChunk('activity', JSON.stringify({
+                        ev: 'tool_start', id: tc.id, tool: tc.name,
+                        label: buildToolLabel(tc.name, tc.args), icon: getToolIcon(tc.name),
+                        file: tc.args.filePath || tc.args.path || tc.args.file || tc.args.caminho || ''
+                    }));
+                    const toolStart = Date.now();
+                    try {
+                        result = await executeAgentTool(tc.name, tc.args);
+                    } catch (toolErr) {
+                        result = `Erro: ${toolErr.message}`;
+                        toolError = true;
+                        if (onChunk) onChunk('Sistema', `  ⚠️ falhou: ${toolErr.message.slice(0, 80)}\n`);
+                    }
+                    const toolElapsed = ((Date.now() - toolStart) / 1000).toFixed(1);
+                    const resultStr = String(result);
+                    if (!toolError) {
+                        const preview = resultStr.length > 120 ? resultStr.slice(0, 120).replace(/\n/g, ' ') + '...' : resultStr.replace(/\n/g, ' ');
+                        if (tc.name === 'read_file' || tc.name === 'list_files' || tc.name === 'search_code' || tc.name === 'exec_command') {
+                            if (onChunk) onChunk('Sistema', `  → ${resultStr.length} bytes · ${toolElapsed}s\n`);
+                        } else if (onChunk && resultStr.length) {
+                            onChunk('Sistema', `  → ${preview} · ${toolElapsed}s\n`);
+                        }
+                    }
+                    if (onChunk) onChunk('activity', JSON.stringify({ ev: 'tool_end', id: tc.id, isError: toolError, error: toolError ? (resultStr || 'Erro desconhecido').slice(0, 120) : undefined }));
+                }
+                messages.push({ role: 'tool', tool_call_id: tc.id, name: tc.name, content: String(result).slice(0, 8000) });
+
+                const toolResultStr = String(result);
+                if ((tc.name === 'write_file' || tc.name === 'search_replace') && !toolError && hasRealWriteErrors(toolResultStr)) {
+                    autoCorrectPending = true;
+                    if (onChunk) onChunk('Sistema', '⚠️ Auto-correção: há erros reais no arquivo. Corrija antes de prosseguir.\n');
+                }
+            }
+
+            if (autoCorrectPending) {
+                messages.push({
+                    role: 'user',
+                    content: '⚠️ [Auto-correção] A validação do arquivo acima acusou erros REAIS (não avisos de escopo). Corrija-os AGORA no mesmo arquivo antes de prosseguir. IGNORE "pode não estar definido neste escopo" — são falsos positivos.'
+                });
+            }
+
+            await maybeCompactMessages(provider, messages, signal);
+        }
+        const loopChanges = diffSnapshots(loopStartSnapshot, snapshotProjectFiles());
+        if (loopChanges.length > 0) {
+            const fileList = loopChanges.slice(0, 8).map(c => `${c.file} (${c.action})`).join(', ');
+            return `Limite de iterações atingido — ${loopChanges.length} arquivo(s) alterado(s): ${fileList}${loopChanges.length > 8 ? '...' : ''}`;
+        }
+        return 'Limite de iterações atingido sem alterações de arquivos — o pedido pode ser amplo demais; separe em tarefas menores ou use o modo Direto.';
+    } finally {
+        _currentAgentProvider = prevProvider;
+        _currentAgentSignal = prevSignal;
+        _agentTodos = prevTodos;
+    }
 }
 
 function runQuickTest(filePath) {
@@ -2742,12 +3678,110 @@ function formatRelevantFiles(files) {
     ).join('');
 }
 
+function stripAccents(s) {
+    return (s || '').normalize('NFD').replace(/[\u0300-\u036f]/g, '');
+}
+
 function classifyIntent(message) {
-    const m = (message || '').toLowerCase().trim();
-    if (/(^|\s)(o que é|como funciona|explique|qual a diferença|defina|conceito|significado|por que|porque|what is|how does|explain|what'?s the difference|define|meaning|why|quem|who|quando|when|onde|where)\b/i.test(m)) return 'question';
-    if (m.endsWith('?') && !/(crie|criar|cria|faça|fazer|implemente|implementar|corrija|corrigir|arrume|arrumar|adicione|adicionar|mude|mudar|altere|alterar|delete|deletar|remova|remover|refatore|refatorar|escreva|escrever|build|code|código|arquivo|file|função|function|componente|component|roda|rode|execute|executar|teste|testar)/i.test(m)) return 'question';
+    const m = stripAccents((message || '').toLowerCase()).trim();
+    if (/(^|\s)(o que e|o que|como funciona|explique|qual a diferenca|defina|conceito|significado|por que|porque|what is|how does|explain|what'?s the difference|define|meaning|why|quem|who|quando|when|onde|where)\b/i.test(m)) return 'question';
+    if (/^(o que|como|qual|quais|por que|quando|onde|quem)\b/i.test(m)) return 'question';
+    if (m.endsWith('?') && !/(crie|criar|cria|faca|fazer|implemente|implementar|corrija|corrigir|arrume|arrumar|adicione|adicionar|mude|mudar|altere|alterar|delete|deletar|remova|remover|refatore|refatorar|escreva|escrever|build|code|codigo|arquivo|file|funcao|function|componente|component|roda|rode|execute|executar|teste|testar)/i.test(m)) return 'question';
     if (m.length < 15 && m.endsWith('?')) return 'question';
     return 'task';
+}
+
+let agentStreamCallback = null;
+let _pendingImages = null;
+let _activeChildProcesses = [];
+let _lastProjectSnapshot = null;
+let _lastProjectFileList = null;
+let _currentAgentProvider = 'gemini';
+let _currentAgentSignal = null;
+let _agentTodos = [];
+
+const pendingInteractions = new Map();
+let _interactionSeq = 0;
+
+function registerChildProcess(child) {
+    _activeChildProcesses.push(child);
+    child.on('close', () => {
+        const idx = _activeChildProcesses.indexOf(child);
+        if (idx >= 0) _activeChildProcesses.splice(idx, 1);
+    });
+}
+
+// No Windows, `child.kill('SIGKILL')` mata só o shell (cmd), deixando órfãos os
+// processos que ele criou (ex.: `node app.js`). `taskkill /F /T` mata a árvore
+// inteira. Sem isso, comandos longos ("servidor") ficam rodando para sempre.
+function killChildTree(child) {
+    if (!child || !child.pid) return;
+    if (process.platform === 'win32') {
+        try {
+            require('child_process').spawn('taskkill', ['/F', '/T', '/PID', String(child.pid)], { stdio: 'ignore', windowsHide: true });
+            return;
+        } catch (e) {}
+    }
+    try { child.kill('SIGKILL'); } catch (e) {}
+}
+
+function killAllChildProcesses() {
+    const procs = _activeChildProcesses.splice(0);
+    for (const child of procs) {
+        killChildTree(child);
+    }
+}
+
+function restoreProjectSnapshot() {
+    if (!_lastProjectSnapshot || !_lastProjectSnapshot.size) { _lastProjectFileList = null; return { count: 0, files: [] }; }
+    const files = [];
+    let count = 0;
+    for (const [file, content] of _lastProjectSnapshot) {
+        try {
+            const absPath = path.join(PROJECT_ROOT, ...file.split('/'));
+            if (content === null) {
+                if (fs.existsSync(absPath)) { fs.unlinkSync(absPath); count++; files.push(file); }
+            } else {
+                const dir = path.dirname(absPath);
+                if (!fs.existsSync(dir)) fs.mkdirSync(dir, { recursive: true });
+                if (!fs.existsSync(absPath) || fs.readFileSync(absPath, 'utf-8') !== content) {
+                    fs.writeFileSync(absPath, content, 'utf-8');
+                    count++;
+                    files.push(file);
+                }
+            }
+        } catch (e) {}
+    }
+    if (_lastProjectFileList) {
+        for (const file of snapshotProjectFiles().keys()) {
+            if (_lastProjectFileList.has(file)) continue;
+            const absPath = path.join(PROJECT_ROOT, ...file.split('/'));
+            try { if (fs.existsSync(absPath)) { fs.unlinkSync(absPath); count++; files.push(file); } } catch (e) {}
+        }
+    }
+    _lastProjectSnapshot = null;
+    _lastProjectFileList = null;
+    return { count, files };
+}
+
+function setAgentStreamCallback(cb) { agentStreamCallback = cb; }
+function setPendingImages(images) { _pendingImages = images; }
+function clearPendingImages() { _pendingImages = null; }
+
+function getImagePartsForOpenAI() {
+    if (!_pendingImages || !_pendingImages.length) return null;
+    return _pendingImages.map(img => ({
+        type: 'image_url',
+        image_url: { url: img.dataUrl, detail: 'auto' }
+    }));
+}
+
+function getImagePartsForClaude() {
+    if (!_pendingImages || !_pendingImages.length) return null;
+    return _pendingImages.map(img => {
+        const match = (img.dataUrl || '').match(/^data:(image\/\w+);base64,(.+)/);
+        return match ? { type: 'image', source: { type: 'base64', media_type: match[1], data: match[2] } } : null;
+    }).filter(Boolean);
 }
 
 let _projectCache = null;
@@ -2789,7 +3823,303 @@ function buildProjectCache() {
     }
 }
 
-async function analyzeTask(message, onChunk, signal, mode = 'cowork', history = [], provider = 'gemini') {
+// =============================================
+//  EXPLORAÇÃO PRÉVIA — navega arquivos antes de gerar o plano (PRIORIDADE 3)
+// =============================================
+const EXPLORATION_TOOLS = [
+    TOOL_SCHEMAS.read_file,
+    TOOL_SCHEMAS.list_files,
+    TOOL_SCHEMAS.search_code,
+    TOOL_SCHEMAS.analyzer_symbols,
+];
+
+async function runExplorationPhase(message, onChunk, signal, provider) {
+    if (provider === 'opencode') return '';
+    if (!['gemini', 'deepseek'].includes(provider)) return '';
+
+    const projectCache = getProjectCache();
+    const explorationPrompt = `Você é um agente de exploração. Seu trabalho é identificar APENAS os arquivos relevantes para a tarefa, SEM ler código desnecessário.
+
+${LANGUAGE_RULE}
+
+SOLICITAÇÃO: "${message}"
+
+DIRETÓRIO: ${PROJECT_ROOT}
+
+ESTRUTURA COMPLETA DO PROJETO (já indexada):
+${projectCache}
+
+MÉTODO (siga esta ordem):
+1. Analise a estrutura acima e identifique os 2-4 diretórios/arquivos mais relevantes
+2. Use search_code com palavras-chave da solicitação para confirmar relevância
+3. Use analyzer_symbols nos arquivos candidatos (extrai funções/classes SEM ler o arquivo todo)
+4. Use read_file APENAS nos arquivos que você tem certeza que vai modificar
+5. Máximo 2 iterações. Retorne um resumo do que encontrou e quais arquivos modificar`;
+
+    try {
+        let explorationLog = '';
+        let conversationHistory = [{ role: 'user', content: explorationPrompt }];
+
+        for (let iteration = 0; iteration < 2; iteration++) {
+            if (signal && signal.aborted) {
+                const err = new Error('Tarefa cancelada');
+                err.name = 'AbortError';
+                throw err;
+            }
+
+            let response;
+            if (provider === 'gemini') {
+                response = await callGeminiWithTools(conversationHistory, EXPLORATION_TOOLS, signal);
+            } else if (provider === 'deepseek') {
+                response = await callDeepSeekWithTools(conversationHistory, EXPLORATION_TOOLS, signal);
+            } else {
+                break;
+            }
+
+            conversationHistory.push({ role: 'assistant', content: response.text || '' });
+
+            let hasToolCall = false;
+            const toolResults = [];
+
+            if (response.toolCalls) {
+                for (const tc of response.toolCalls) {
+                    if (signal && signal.aborted) {
+                        const err = new Error('Tarefa cancelada');
+                        err.name = 'AbortError';
+                        throw err;
+                    }
+                    hasToolCall = true;
+                    const toolName = tc.name || tc.function?.name;
+                    let toolArgs = tc.args || {};
+                    if (!tc.args && tc.function?.arguments) {
+                        try { toolArgs = JSON.parse(tc.function.arguments); } catch (e) {}
+                    }
+                    if (onChunk) onChunk('Sistema', `🔍 Explorando: ${toolName}(${JSON.stringify(toolArgs).slice(0, 80)})...\n`);
+
+                    let result;
+                    try {
+                        result = await executeAgentTool(toolName, toolArgs);
+                        if (toolName === 'read_file') {
+                            explorationLog += `\n📄 ${toolArgs.caminho}:\n${result.slice(0, 2000)}\n`;
+                        } else if (toolName === 'search_code') {
+                            explorationLog += `\n🔎 Busca "${toolArgs.padrao}":\n${result.slice(0, 1500)}\n`;
+                        } else if (toolName === 'list_files') {
+                            explorationLog += `\n📂 ${toolArgs.diretorio || 'raiz'}:\n${result.slice(0, 800)}\n`;
+                        } else if (toolName === 'analyzer_symbols') {
+                            explorationLog += `\n🔣 Símbolos de ${toolArgs.caminho}:\n${result.slice(0, 2000)}\n`;
+                        }
+                    } catch (e) {
+                        result = `Erro: ${e.message}`;
+                    }
+
+                    toolResults.push({ tool_call_id: tc.id, role: 'tool', content: String(result).slice(0, 8000) });
+                }
+            }
+
+            if (!hasToolCall) break;
+
+            for (const tr of toolResults) {
+                conversationHistory.push(tr);
+            }
+        }
+
+        return explorationLog.slice(0, 12000);
+    } catch (e) {
+        return '';
+    }
+}
+
+async function callGeminiWithTools(messages, tools, signal) {
+    const apiKey = config.gemini.apiKey;
+    if (!apiKey) throw new Error('Chave Gemini não configurada');
+    const model = config.gemini.model || 'gemini-3.5';
+
+    const systemMsg = messages[0]?.role === 'user' ? messages[0].content : '';
+    const contents = messages.map((m, idx) => {
+        if (m.role === 'tool') return { role: 'tool', parts: [{ text: m.content }] };
+        if (m.role === 'assistant') return { role: 'model', parts: [{ text: m.content || '' }] };
+        const userParts = [{ text: m.content }];
+        if (idx === 0 && _pendingImages && _pendingImages.length) {
+            for (const img of _pendingImages) {
+                if (img.dataUrl) {
+                    const match = img.dataUrl.match(/^data:(image\/\w+);base64,(.+)/);
+                    if (match) userParts.unshift({ inlineData: { mimeType: match[1], data: match[2] } });
+                }
+            }
+            clearPendingImages();
+        }
+        return { role: 'user', parts: userParts };
+    });
+
+    const toolDeclarations = tools.map(t => ({
+        name: t.name,
+        description: t.description,
+        parameters: t.parameters.type === 'object' ? t.parameters : {
+            type: 'object',
+            properties: Object.fromEntries(Object.entries(t.parameters).map(([k, v]) => [k, { type: 'string', description: String(v) }])),
+            required: Object.keys(t.parameters)
+        }
+    }));
+
+    return new Promise((resolve, reject) => {
+        const url = `https://generativelanguage.googleapis.com/v1beta/models/${model}:generateContent?key=${apiKey}`;
+        const body = JSON.stringify({
+            systemInstruction: { parts: [{ text: systemMsg }] },
+            contents: contents.slice(1),
+            tools: [{ functionDeclarations: toolDeclarations }],
+            generationConfig: { temperature: 0.3, maxOutputTokens: 4096 }
+        });
+
+        const abort = new AbortController();
+        if (signal) signal.addEventListener('abort', () => abort.abort());
+
+        fetch(url, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body,
+            signal: abort.signal
+        }).then(async (res) => {
+            if (!res.ok) {
+                const err = await res.text();
+                throw new Error(`Gemini HTTP ${res.status}: ${err.slice(0, 200)}`);
+            }
+            const data = await res.json();
+            const candidate = data.candidates?.[0];
+            const text = candidate?.content?.parts?.map(p => p.text || '').join('') || '';
+
+            const toolCalls = [];
+            for (const part of (candidate?.content?.parts || [])) {
+                if (part.functionCall) {
+                    toolCalls.push({
+                        id: `call_${Date.now()}_${toolCalls.length}`,
+                        name: part.functionCall.name,
+                        args: part.functionCall.args || {}
+                    });
+                }
+            }
+
+            resolve({ text, toolCalls });
+        }).catch(reject);
+    });
+}
+
+async function callDeepSeekWithTools(messages, tools, signal) {
+    const apiKey = config.deepseek.apiKey;
+    if (!apiKey) throw new Error('Chave DeepSeek não configurada');
+    const model = config.deepseek.model || 'deepseek-v4-flash';
+
+    const toolDefs = tools.map(t => ({
+        type: 'function',
+        function: {
+            name: t.name,
+            description: t.description,
+            parameters: t.parameters.type === 'object' ? t.parameters : {
+                type: 'object',
+                properties: Object.fromEntries(Object.entries(t.parameters).map(([k, v]) => [k, { type: 'string', description: String(v) }])),
+                required: Object.keys(t.parameters)
+            }
+        }
+    }));
+
+    const formattedMessages = messages.map(m => ({
+        role: m.role === 'tool' ? 'tool' : m.role === 'assistant' ? 'assistant' : 'user',
+        content: m.content || '',
+        ...(m.role === 'tool' ? { tool_call_id: m.tool_call_id } : {})
+    }));
+
+    return new Promise((resolve, reject) => {
+        const url = new URL('https://api.deepseek.com/chat/completions');
+        const body = JSON.stringify({
+            model,
+            messages: formattedMessages,
+            tools: toolDefs,
+            temperature: 0.3,
+            max_tokens: 4096
+        });
+
+        const abort = new AbortController();
+        if (signal) signal.addEventListener('abort', () => abort.abort());
+
+        fetch(url, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json', 'Authorization': `Bearer ${apiKey}` },
+            body,
+            signal: abort.signal
+        }).then(async (res) => {
+            if (!res.ok) {
+                const err = await res.text();
+                throw new Error(`DeepSeek HTTP ${res.status}: ${err.slice(0, 200)}`);
+            }
+            const data = await res.json();
+            const msg = data.choices?.[0]?.message;
+            const toolCalls = [];
+            if (msg?.tool_calls) {
+                for (const tc of msg.tool_calls) {
+                    toolCalls.push({
+                        id: tc.id,
+                        name: tc.function?.name,
+                        args: JSON.parse(tc.function?.arguments || '{}')
+                    });
+                }
+            }
+            resolve({ text: msg?.content || '', toolCalls });
+        }).catch(reject);
+    });
+}
+
+function classifyRequest(message) {
+    const m = (message || '').trim();
+    const mLower = m.toLowerCase();
+
+    const intent = classifyIntent(message);
+
+    if (intent === 'question') return { route: 'answer', reason: 'Pergunta detectada' };
+
+    const simplePatterns = [
+        /^(corrig(a|ir)|arrum(a|ar)|consert(a|ar)|fix)\s/i,
+        /^(adicione|adicionar|acrescent(a|ar)|inclu(a|ir))\s.+\s(no|na|em|ao)\s/i,
+        /^(remova|remover|delete|deletar|apag(a|ar)|exclu(a|ir))\s/i,
+        /^(renomei(a|ar)|renomear|mova|mover|move)\s/i,
+        /^(troque|trocar|altere|alterar|mude|mudar|substitua|substituir)\s.+\s(por|para)\s/i,
+        /^(crie|criar|faça|fazer|implemente|implementar)\s.+\s(com|usando|que)\s/i,
+        /^(execute|executar|rode|rodar|teste|testar)\s/i,
+        /^(atualize|atualizar|refatore|refatorar)\s\w+\s/i,
+        /^(formate|formatar|lint|organize|organizar)\s/i,
+        /^(adicione|adicionar|coloque|colocar|ponha|pôr)\s.+\s(no|na|antes|depois|após)\s/i,
+        /^(extraia|extrair|separe|separar|divida|dividir)\s/i,
+        /^(converta|converter|transforme|transformar)\s/i,
+    ];
+
+    for (const pattern of simplePatterns) {
+        if (pattern.test(mLower)) return { route: 'direct', reason: 'Tarefa específica detectada' };
+    }
+
+    const complexSignals = [
+        /\?/g,
+        /\b(ou|ou então|alternativa|opção|opções|escolha|escolher|qual|como)\b/gi,
+        /\b(qualquer|tanto faz|decida|decidir|sugira|sugerir|recomende|recomendar)\b/gi,
+        /\b(melhorar|melhore|aprimorar|aprimore|otimizar|otimize)\b/gi,
+    ];
+    let complexityScore = 0;
+    for (const sig of complexSignals) {
+        const matches = mLower.match(sig);
+        if (matches) complexityScore += matches.length;
+    }
+
+    if (mLower.length < 30) complexityScore += 3;
+    if (mLower.includes('melhorar') && !mLower.includes('arquivo') && !mLower.includes('função')) complexityScore += 2;
+    if (mLower.split(/\s+/).length > 40) complexityScore -= 2;
+
+    if (complexityScore >= 3) return { route: 'options', reason: 'Pedido complexo/aberto — gerar opções' };
+
+    if (mLower.length > 100 || mLower.split(',').length > 3 || mLower.split(';').length > 2) {
+        return { route: 'direct', reason: 'Múltiplas tarefas específicas' };
+    }
+
+    return { route: 'direct', reason: 'Tarefa direta padrão' };
+}
+
+async function analyzeTask(message, onChunk, signal, mode = 'cowork', history = [], provider = 'gemini', explorationContext = '') {
     const intent = classifyIntent(message);
     const modeInstruction = MODE_INSTRUCTIONS[mode] || MODE_INSTRUCTIONS.cowork;
     const projectRules = loadProjectRules();
@@ -2816,8 +4146,11 @@ async function analyzeTask(message, onChunk, signal, mode = 'cowork', history = 
     const analysisPrompt = `⚠️ REGRA ABSOLUTA: Sua ÚNICA resposta deve ser um OBJETO JSON puro, começando com { e terminando com }. NADA de texto antes ou depois. NADA de markdown. NADA de explicações fora do JSON. Se você responder com texto em vez de JSON, o sistema quebrará.
 
 Você é o Aedificator Codex IDE. O código é uma arte: respeite a estrutura existente.
+${LANGUAGE_RULE}
 
 ${getQualityRules()}
+
+${explorationContext ? '📖 EXPLORAÇÃO PRÉVIA DO CÓDIGO (o agente já leu os seguintes arquivos):\n' + explorationContext + '\n' : ''}
 
 ${projectCtx}
 
@@ -2844,23 +4177,21 @@ FORMATO A — Apenas se o pedido for AMBÍGUO e você PRECISAR perguntar algo (e
 
 FORMATO B — Para pedidos CLAROS de correção, alteração ou implementação:
 {
-  "resumo": "Resumo do que será feito",
+  "resumo": "Resumo do que será feito (1-2 frases)",
   "arquivos": [
-    { "caminho": "src/index.js", "acao": "modificar", "conteudo": "conteúdo COMPLETO do arquivo", "explicacao": "uma frase" },
-    { "caminho": "src/novo.js", "acao": "criar", "conteudo": "conteúdo COMPLETO", "explicacao": "uma frase" }
+    { "caminho": "src/index.js", "acao": "modificar", "explicacao": "o que mudar neste arquivo" },
+    { "caminho": "src/novo.js", "acao": "criar", "explicacao": "o que este arquivo fará" }
   ]
 }
 
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 REGRAS:
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-- ⚠️ Se o pedido é claro: SEMPRE use FORMATO B com arquivos e conteúdo completo.
+- ⚠️ NUNCA inclua o conteúdo dos arquivos (conteudo). O agente escreverá o código depois.
+- ⚠️ Se o pedido é claro: SEMPRE use FORMATO B com caminho + acao + explicacao.
 - ⚠️ Se for CRIAÇÃO de app NOVO: primeiro crie APP_SPEC.md, depois implemente módulo por módulo.
 - ⚠️ Só use FORMATO A se realmente não souber o que fazer e precisar perguntar.
-- ⚠️ Conteúdo dos arquivos deve ser COMPLETO, pronto para salvar.
-- ⚠️ Inclua no "resumo": quantos testes gerou, se build passou, se encontrou problemas de segurança.
-- ⚠️ Após cada módulo, inclua uma pergunta no resumo tipo "Funcionou? Quer ajustar algo?"
-- "resumo": 1-2 frases curtas, conversacionais.`;
+- ⚠️ "resumo": 1-2 frases curtas, conversacionais.`;
 
     if (onChunk) onChunk('Assistente', '🔍 Analisando estrutura do projeto...\n');
 
@@ -2870,6 +4201,20 @@ REGRAS:
     if (!plan) {
         if (onChunk) onChunk('Assistente', response || '');
         return { resumo: '', arquivos: [], _rawResponse: response };
+    }
+
+    if (plan.resumo && plan.resumo.length > 300) plan.resumo = plan.resumo.slice(0, 300) + '...';
+    if (Array.isArray(plan.sugestoes)) {
+        for (const s of plan.sugestoes) {
+            if (s.titulo && s.titulo.length > 120) s.titulo = s.titulo.slice(0, 120) + '...';
+            if (s.descricao && s.descricao.length > 300) s.descricao = s.descricao.slice(0, 300) + '...';
+        }
+    }
+    if (Array.isArray(plan.arquivos)) {
+        for (const a of plan.arquivos) {
+            if (a.conteudo && a.conteudo.length > 200) a.conteudo = a.conteudo.slice(0, 200) + '... [CONTEÚDO TRUNCADO - o agente gerará o código]';
+            if (a.explicacao && a.explicacao.length > 200) a.explicacao = a.explicacao.slice(0, 200) + '...';
+        }
     }
 
     if (onChunk) {
@@ -3000,7 +4345,7 @@ app.get('/api/browser/status', (req, res) => {
 });
 
 app.get('/api/health', (req, res) => {
-    res.json({ status: 'ok', timestamp: new Date().toISOString() });
+    res.json({ status: 'ok', timestamp: new Date().toISOString(), version: BACKEND_PROTOCOL_VERSION });
 });
 
 app.post('/api/init', async (req, res) => {
@@ -3042,7 +4387,7 @@ app.post('/api/project/create', (req, res) => {
 });
 
 app.post('/api/config', (req, res) => {
-    const { geminiKey, deepseekKey, opencodeKey, openaiKey, claudeKey, openaiModel, claudeModel, autoCommit } = req.body;
+    const { geminiKey, deepseekKey, opencodeKey, openaiKey, claudeKey, openaiModel, claudeModel, deepseekModel, autoCommit } = req.body;
     if (geminiKey && geminiKey !== '********') config.gemini.apiKey = geminiKey;
     if (deepseekKey && deepseekKey !== '********') config.deepseek.apiKey = deepseekKey;
     if (opencodeKey && opencodeKey !== '********') {
@@ -3053,6 +4398,7 @@ app.post('/api/config', (req, res) => {
     if (openaiModel) config.openai.model = openaiModel;
     if (claudeKey && claudeKey !== '********') config.claude.apiKey = claudeKey;
     if (claudeModel) config.claude.model = claudeModel;
+    if (deepseekModel) config.deepseek.model = normalizeDeepseekModel(deepseekModel);
     if (autoCommit !== undefined) config.autoCommit = !!autoCommit;
 
     try {
@@ -3073,6 +4419,7 @@ app.get('/api/config/get', (req, res) => {
         claude: config.claude.apiKey ? '********' : '',
         openaiModel: config.openai.model || '',
         claudeModel: config.claude.model || '',
+        deepseekModel: config.deepseek.model || 'deepseek-v4-flash',
         autoCommit: config.autoCommit
     });
 });
@@ -3085,6 +4432,31 @@ app.get('/api/config/status', (req, res) => {
         openai: { configured: !!config.openai.apiKey },
         claude: { configured: !!config.claude.apiKey }
     });
+});
+
+app.get('/api/config/permissions', (req, res) => {
+    res.json({ success: true, ask: config.toolPermissions.ask || [], grants: config.toolPermissions.grants || {} });
+});
+
+app.post('/api/config/permissions', (req, res) => {
+    const { ask } = req.body || {};
+    if (Array.isArray(ask)) config.toolPermissions.ask = ask;
+    try {
+        saveConfigToFile();
+        res.json({ success: true, ask: config.toolPermissions.ask, grants: config.toolPermissions.grants });
+    } catch (e) {
+        res.status(500).json({ error: e.message });
+    }
+});
+
+app.post('/api/config/permissions/reset', (req, res) => {
+    config.toolPermissions.grants = {};
+    try {
+        saveConfigToFile();
+        res.json({ success: true, message: 'Permissões resetadas' });
+    } catch (e) {
+        res.status(500).json({ error: e.message });
+    }
 });
 
 app.get('/api/usage', (req, res) => {
@@ -4195,6 +5567,100 @@ app.post('/api/analyzer/completions', (req, res) => {
     res.json({ success: true, completions: items });
 });
 
+// ===== AI INLINE COMPLETION (PRIORIDADE 2) =====
+app.post('/api/ai/inline-completion', async (req, res) => {
+    const { prefix, suffix, filePath, provider, language } = req.body || {};
+    if (!PROJECT_ROOT) return res.status(400).json({ error: 'Nenhum projeto aberto' });
+    if (!prefix || prefix.length < 2) return res.json({ completion: '' });
+
+    const prefixSnip = prefix.length > 2000 ? prefix.slice(-2000) : prefix;
+    const suffixSnip = (suffix || '').slice(0, 500);
+    let fileCtx = '';
+    if (filePath) {
+        try {
+            const relFiles = getRelFilePaths(filePath);
+            fileCtx = relFiles.map(f => `// ${f}\n`).join('').slice(0, 3000);
+        } catch (e) {}
+    }
+
+    const prompt = `Complete o código a seguir. Retorne APENAS a continuação (1 a 5 linhas), sem repetir o código antes do cursor. Se for completar um bloco (if, for, function), complete o bloco inteiro. Nada de explicações, markdown ou código extra.
+
+ARQUIVO ATUAL: ${filePath || 'desconhecido'}
+LINGUAGEM: ${language || 'plaintext'}
+ARQUIVOS NO PROJETO:
+${fileCtx || '(não disponível)'}
+
+CÓDIGO ANTES DO CURSOR:
+\`\`\`${language || ''}
+${prefixSnip}
+\`\`\`
+
+CÓDIGO DEPOIS DO CURSOR:
+\`\`\`${language || ''}
+${suffixSnip}
+\`\`\`
+
+Complete o código após o cursor. Apenas a continuação:`;
+
+    try {
+        const completion = await callAI(provider || 'gemini', prompt, null, null);
+        const clean = (completion || '')
+            .replace(/```[\s\S]*?```/g, '')
+            .replace(/^\s*[\r\n]+/, '')
+            .trim();
+        const lines = clean.split('\n').slice(0, 5);
+        const multiLine = lines.join('\n');
+        res.json({ completion: multiLine.slice(0, 2000) });
+    } catch (e) {
+        res.json({ completion: '' });
+    }
+});
+
+// ===== AI INLINE EDIT (Ctrl+K) =====
+app.post('/api/ai/inline-edit', async (req, res) => {
+    const { code, prompt, filePath, language, provider } = req.body || {};
+    if (!PROJECT_ROOT) return res.status(400).json({ error: 'Nenhum projeto aberto' });
+    if (!code || !prompt) return res.status(400).json({ error: 'Código e prompt são obrigatórios' });
+
+    const aiPrompt = `Edite o seguinte código conforme solicitado. Retorne APENAS o código editado, completo. Nada de explicações, markdown ou código extra.
+
+ARQUIVO: ${filePath || 'desconhecido'}
+LINGUAGEM: ${language || 'plaintext'}
+
+SOLICITAÇÃO: ${prompt}
+
+CÓDIGO ORIGINAL:
+\`\`\`${language || ''}
+${code.slice(0, 6000)}
+\`\`\`
+
+Código editado:`;
+
+    try {
+        const response = await callAI(provider || 'gemini', aiPrompt, null, null);
+        const clean = (response || '')
+            .replace(/```[\w]*\n?/g, '')
+            .replace(/```/g, '')
+            .trim();
+        res.json({ code: clean || code });
+    } catch (e) {
+        res.json({ code: code });
+    }
+});
+
+function getRelFilePaths(currentFile) {
+    const curDir = currentFile ? path.dirname(currentFile) : '';
+    const items = [];
+    try {
+        const allFiles = getAllFiles(PROJECT_ROOT, { n: 30 });
+        for (const f of allFiles) {
+            const rel = path.relative(PROJECT_ROOT, f).replace(/\\/g, '/');
+            items.push(rel);
+        }
+    } catch (e) {}
+    return items;
+}
+
 // ===== UPLOAD DE ARQUIVO (drag & drop) =====
 app.post('/api/file/upload', (req, res) => {
     const { name, content, encoding, targetDir } = req.body || {};
@@ -4661,6 +6127,24 @@ app.post('/api/analyzer/validate-batch', (req, res) => {
 
 async function runPostExecutionDiagnostics(affectedFiles, planResumo) {
     if (!PROJECT_ROOT || !Array.isArray(affectedFiles) || !affectedFiles.length) return;
+
+    // Garantia de término: os pós-testes (npm test, git commit) não podem
+    // segurar o 'done' para sempre. Se passarem do prazo, a tarefa termina
+    // mesmo assim e a UI nunca fica presa em "Enviando.../Executando".
+    try {
+        return await Promise.race([
+            _runPostExecutionDiagnostics(affectedFiles, planResumo),
+            new Promise((resolve) => setTimeout(() => {
+                console.warn('[diagnostics] Pós-execução excedeu 150s — finalizando tarefa sem resultado');
+                resolve({ timedOut: true, rolledBack: false, errorCount: 0 });
+            }, 150000))
+        ]);
+    } catch (e) {
+        return null;
+    }
+}
+
+async function _runPostExecutionDiagnostics(affectedFiles, planResumo) {
     pushUndoState(affectedFiles);
     const allErrors = [];
     const allSmells = [];
@@ -4696,35 +6180,15 @@ async function runPostExecutionDiagnostics(affectedFiles, planResumo) {
     }
 
     const combined = [...allErrors, ...allSmells, ...allSecurity, ...allLint];
-    if (combined.length) broadcastDiagnostics(combined);
-
-    const hasErrors = allErrors.some(e => e.severity === 'error') || allSecurity.some(e => e.severity === 'error');
-
-    function doRollback(reason) {
-        broadcastAll({ type: 'rollback', message: reason });
-        for (const filePath of affectedFiles) {
-            try {
-                const backupDir = path.join(PROJECT_ROOT, '.aedificator-codex-ide-backup');
-                const relBackupDir = path.join(backupDir, filePath);
-                if (fs.existsSync(relBackupDir)) {
-                    const entries = fs.readdirSync(relBackupDir).sort().reverse();
-                    if (entries.length) {
-                        const latest = entries[0];
-                        const backupFile = path.join(relBackupDir, latest);
-                        const target = path.join(PROJECT_ROOT, filePath);
-                        fs.copyFileSync(backupFile, target);
-                    }
-                }
-            } catch (e) {}
+    if (combined.length) {
+        broadcastDiagnostics(combined);
+        const errCount = allErrors.filter(e => e.severity === 'error').length;
+        const warnCount = allSmells.length + allSecurity.length + allLint.length;
+        if (errCount > 0) {
+            broadcastAll({ type: 'diagnostics-summary', errorCount: errCount, warningCount: warnCount, message: `${errCount} erro(s), ${warnCount} aviso(s) em ${affectedFiles.length} arquivo(s)` });
         }
-        return true;
     }
-
-    if (hasErrors) {
-        const errCount = allErrors.filter(e => e.severity === 'error').length + allSecurity.filter(e => e.severity === 'error').length;
-        doRollback('Revertendo alteracoes — IA introduziu ' + errCount + ' erro(s)');
-        return { rolledBack: true, errorCount: errCount };
-    }
+    const errorCount = allErrors.filter(e => e.severity === 'error').length;
 
     try {
         const detectedFramework = detectTestFramework();
@@ -4744,24 +6208,79 @@ async function runPostExecutionDiagnostics(affectedFiles, planResumo) {
         if (testFiles.length && detectedFramework) {
             const { command, args } = detectedFramework;
             broadcastAll({ type: 'test-status', status: 'running', message: '[' + command + '] ' + testFiles.length + ' teste(s)...' });
+            // Timeout de 120s: testes que nunca terminam (ex.: Jest com watch mode ou
+            // processo pendurado) não podem travar a UI em "Enviando..." para sempre.
+            const TEST_RUN_TIMEOUT_MS = 120000;
             const result = await new Promise((resolve) => {
                 const child = require('child_process').spawn(command, args, { cwd: PROJECT_ROOT, shell: true, stdio: ['ignore', 'pipe', 'pipe'], windowsHide: true });
+                registerChildProcess(child);
                 let output = '';
+                let settled = false;
+                let spawnError = null;
+                const startTs = Date.now();
+                const finish = (r) => {
+                    if (settled) return;
+                    settled = true;
+                    if (progressTimer) clearInterval(progressTimer);
+                    resolve(r);
+                };
+                // Mantém a UI informada (e o watchdog do frontend vivo) durante testes
+                // longos: sem isso, uma suíte legítima de 60-120s pareceria "travada".
+                const progressTimer = setInterval(() => {
+                    if (settled) return;
+                    const secs = Math.round((Date.now() - startTs) / 1000);
+                    broadcastAll({ type: 'test-status', status: 'running', message: `[${command}] Executando testes... (${secs}s)` });
+                }, 20000);
                 child.stdout.on('data', d => output += d.toString());
                 child.stderr.on('data', d => output += d.toString());
                 child.on('close', code => {
                     const parsed = parseTestOutput(output);
-                    resolve({ passed: parsed.pass, failed: parsed.fail, total: parsed.total, output: output.slice(0, 3000), results: parsed });
+                    const empty = parsed.total === 0;
+                    // Comando nem chegou a rodar (ex.: "npm" não encontrado).
+                    if (spawnError) {
+                        finish({ errored: true, errorMessage: String(spawnError.message || 'Falha ao iniciar o comando de teste'), passed: 0, failed: 0, total: 0, output: output.slice(0, 3000), results: parsed });
+                        return;
+                    }
+                    // Rodou mas falhou sem executar nenhum teste (ex.: npx tentou
+                    // instalar o Jest, erro de config, "No tests found" com exit != 0).
+                    if (code !== 0 && empty) {
+                        const reason = /no tests found/i.test(output) ? 'Nenhum teste encontrado' : 'O comando de teste falhou';
+                        finish({ errored: true, errorMessage: reason, passed: 0, failed: 0, total: 0, output: output.slice(0, 3000), results: parsed });
+                        return;
+                    }
+                    finish({ passed: parsed.pass, failed: parsed.fail, total: parsed.total, output: output.slice(0, 3000), results: parsed });
                 });
-                child.on('error', () => resolve({ passed: 0, failed: 0, total: 0, output: 'Erro ao executar testes', results: { total: 0, pass: 0, fail: 0 } }));
+                child.on('error', (err) => {
+                    spawnError = err;
+                    // 'error' pode disparar sem 'close' em alguns casos — finaliza aqui.
+                    finish({ errored: true, errorMessage: String(err.message || 'Falha ao iniciar o comando de teste'), passed: 0, failed: 0, total: 0, output: '', results: { total: 0, pass: 0, fail: 0, details: [], suites: [] } });
+                });
+                const killer = setTimeout(() => {
+                    killChildTree(child);
+                    finish({ errored: true, errorMessage: 'Testes excederam o tempo limite de 120s e foram interrompidos', passed: 0, failed: 0, total: 0, output: 'Testes excederam o tempo limite de 120s', results: { total: 0, pass: 0, fail: 0, details: [], suites: [] } });
+                }, TEST_RUN_TIMEOUT_MS);
+                child.on('close', () => clearTimeout(killer));
             });
+
+            // Falha de infraestrutura (comando não rodou): reporta claramente,
+            // mas NÃO reverte as alterações — o problema é do ambiente, não do código.
+            if (result.errored) {
+                const errMsg = result.errorMessage || 'Falha ao executar testes';
+                const errOutput = result.output || errMsg;
+                broadcastAll({ type: 'test-status', status: 'failed', message: '❌ ' + errMsg, results: { total: 0, pass: 0, fail: 0, details: [], suites: [] } });
+                broadcastAll({ type: 'test-failed', message: '❌ ' + errMsg + '\n' + String(errOutput).slice(0, 2000) });
+                return { rolledBack: false, errorCount, testError: errMsg };
+            }
+
             const testMsg = '[' + command + '] Passaram: ' + result.passed + (result.failed ? ', Falharam: ' + result.failed : '') + ' (' + result.total + ' total)';
             broadcastAll({ type: 'test-status', status: result.failed ? 'failed' : 'passed', message: testMsg, results: result.results });
 
             if (result.failed > 0) {
                 broadcastAll({ type: 'test-failed', message: result.output });
-                doRollback('Revertendo alteracoes — ' + result.failed + ' teste(s) falhou(ram)');
-                return { rolledBack: true, testsFailed: true, testDetails: result };
+                const restored = restoreProjectSnapshot();
+                const restoredCount = restored.count;
+                broadcastAll({ type: 'refresh' });
+                return { rolledBack: true, testsFailed: true, testDetails: result, restoredCount };
             }
         }
     } catch (e) {}
@@ -4772,26 +6291,28 @@ async function runPostExecutionDiagnostics(affectedFiles, planResumo) {
             const filesToStage = (affectedFiles && affectedFiles.length)
                 ? affectedFiles.filter(f => typeof f === 'string').map(f => f.replace(/\\/g, '/'))
                 : [];
+            const runGit = (args) => new Promise((resolve) => {
+                // GIT_TERMINAL_PROMPT=0 impede o git de ficar esperando credenciais
+                // interativas para sempre (travaria a tarefa em "Enviando...").
+                const child = require('child_process').spawn('git', args, { cwd: PROJECT_ROOT, stdio: 'ignore', windowsHide: true, env: { ...process.env, GIT_TERMINAL_PROMPT: '0' } });
+                let settled = false;
+                let killer;
+                const finish = () => { if (settled) return; settled = true; if (killer) clearTimeout(killer); resolve(); };
+                killer = setTimeout(() => { killChildTree(child); finish(); }, 60000);
+                child.on('close', finish);
+                child.on('error', finish);
+            });
             if (filesToStage.length > 0) {
-                await new Promise((resolve) => {
-                    const addArgs = ['add', ...filesToStage];
-                    const child = require('child_process').spawn('git', addArgs, { cwd: PROJECT_ROOT, stdio: 'ignore', windowsHide: true });
-                    child.on('close', () => {
-                        require('child_process').spawn('git', ['commit', '-m', commitMsg], { cwd: PROJECT_ROOT, stdio: 'ignore', windowsHide: true })
-                            .on('close', () => resolve());
-                    });
-                });
+                await runGit(['add', ...filesToStage]);
+                await runGit(['commit', '-m', commitMsg]);
             } else {
-                await new Promise((resolve) => {
-                    require('child_process').spawn('git', ['commit', '-am', commitMsg], { cwd: PROJECT_ROOT, stdio: 'ignore', windowsHide: true })
-                        .on('close', () => resolve());
-                });
+                await runGit(['commit', '-am', commitMsg]);
             }
             broadcastAll({ type: 'auto-commit', message: 'Commit automatico: ' + commitMsg });
         }
     } catch (e) {}
 
-    return { rolledBack: false };
+    return { rolledBack: false, errorCount };
 }
 
 function broadcastDiagnostics(errors) {
@@ -4814,13 +6335,15 @@ function detectTestFramework() {
         const pkgPath = path.join(PROJECT_ROOT, 'package.json');
         if (fs.existsSync(pkgPath)) {
             const pkg = JSON.parse(fs.readFileSync(pkgPath, 'utf-8'));
+            // Prefere o script "test" do projeto: respeita a configuração real
+            // (ex.: "test": "jest") e garante que o Jest esteja instalado via npm.
+            if (pkg.scripts && pkg.scripts.test) return { command: 'npm', args: ['test'] };
             if (pkg.devDependencies || pkg.dependencies) {
                 const deps = { ...(pkg.devDependencies || {}), ...(pkg.dependencies || {}) };
                 if (deps.jest) return { command: 'npx', args: ['jest', '--passWithNoTests'] };
                 if (deps.mocha) return { command: 'npx', args: ['mocha', '**/*.test.js', '**/*.spec.js', '--exit'] };
                 if (deps.vitest) return { command: 'npx', args: ['vitest', 'run', '--passWithNoTests'] };
             }
-            if (pkg.scripts && pkg.scripts.test) return { command: 'npm', args: ['test'] };
         }
         if (fs.existsSync(path.join(PROJECT_ROOT, 'pom.xml')) || fs.existsSync(path.join(PROJECT_ROOT, 'build.gradle'))) {
             if (fs.existsSync(path.join(PROJECT_ROOT, 'mvnw'))) return { command: 'mvnw', args: ['test'] };
@@ -4928,6 +6451,9 @@ function startFileWatcher() {
             if (filename.includes('.aedificator-codex-ide-backup')) return;
             broadcastAll({ type: 'file-changed', file: filename, event: eventType });
         });
+        // unref(): o watcher continua funcionando enquanto o app roda, mas não
+        // segura o processo vivo — senão o `npm test` trava após os testes.
+        try { if (fileWatcher.unref) fileWatcher.unref(); } catch (e) {}
     } catch (e) {}
 }
 
@@ -5294,7 +6820,7 @@ function parseTestOutput(output) {
             continue;
         }
 
-        const failMatch = trimmed.match(/^([✖✘✗])\s+(.+?)(?:\s+\(([\d.]+)ms\))?$/);
+        const failMatch = trimmed.match(/^([✖✘✗✕])\s+(.+?)(?:\s+\(([\d.]+)ms\))?$/);
         if (failMatch) {
             results.fail++;
             results.total++;
@@ -5335,6 +6861,37 @@ function parseTestOutput(output) {
             const last = results.details[results.details.length - 1];
             if (last && last.status === 'fail') {
                 last.error = (last.error || '') + '\n' + trimmed;
+            }
+        }
+    }
+
+    // Fallback para formatos de resumo de frameworks comuns (Jest/Mocha/Vitest),
+    // usados quando nenhum teste individual foi detectado pelas linhas ✔/✖.
+    if (results.total === 0) {
+        const jestLine = output.split('\n').find(l => /^\s*Tests:\s/i.test(l));
+        if (jestLine) {
+            const num = (re) => { const m = jestLine.match(re); return m ? (parseInt(m[1].replace(/,/g, ''), 10) || 0) : 0; };
+            // "Tests: 32 passed, 32 total" | "Tests: 31 passed, 1 failed, 32 total"
+            // "Tests: 1 failed, 31 passed, 32 total" | "Tests: 32 total"
+            const passed = num(/([\d,]+)\s+passed/i);
+            const failed = num(/([\d,]+)\s+failed/i);
+            const total = num(/([\d,]+)\s+total/i);
+            if (passed || failed) {
+                results.pass = passed;
+                results.fail = failed;
+                results.total = total || (passed + failed);
+            } else if (total) {
+                // "Tests: 32 total" sem menção de falhas → assumimos que passaram.
+                results.pass = total;
+                results.total = total;
+            }
+        } else {
+            const passM = output.match(/([\d,]+)\s+passing/);
+            const failM = output.match(/([\d,]+)\s+failing/);
+            if (passM || failM) {
+                results.pass = passM ? (parseInt(passM[1].replace(/,/g, ''), 10) || 0) : 0;
+                results.fail = failM ? (parseInt(failM[1].replace(/,/g, ''), 10) || 0) : 0;
+                results.total = results.pass + results.fail;
             }
         }
     }
@@ -5668,6 +7225,8 @@ app.post('/api/build/cancel', (req, res) => {
 
 // ===== WEBSOCKET =====
 wss.on('connection', (ws, req) => {
+    ws.isAlive = true;
+    ws.on('pong', () => { ws.isAlive = true; });
     const origin = (req.headers && req.headers.origin) || '';
     if (origin && !isLocalOrigin(origin)) {
         ws.close(1008, 'Origin não permitida');
@@ -5676,6 +7235,27 @@ wss.on('connection', (ws, req) => {
     console.log('🔌 Cliente WebSocket conectado');
     let streamController = null;
     let pendingPlan = null;
+
+    // Watchdog de segurança: nenhuma tarefa pode ficar rodando para sempre.
+    // Se o fluxo inteiro exceder o limite, aborta o controller e o catch envia
+    // um erro ao cliente — a UI nunca fica presa em "Enviando.../Executando".
+    let taskWatchdogFired = false;
+    let taskWatchdogTimer = null;
+    const TASK_WATCHDOG_MS = 8 * 60 * 1000;
+    function armTaskWatchdog() {
+        taskWatchdogFired = false;
+        if (taskWatchdogTimer) clearTimeout(taskWatchdogTimer);
+        taskWatchdogTimer = setTimeout(() => {
+            if (streamController) {
+                taskWatchdogFired = true;
+                console.error('⏰ [watchdog] Tarefa excedeu o tempo máximo (' + (TASK_WATCHDOG_MS / 60000) + 'min) — abortando');
+                try { streamController.abort(); } catch (e) {}
+            }
+        }, TASK_WATCHDOG_MS);
+    }
+    function clearTaskWatchdog() {
+        if (taskWatchdogTimer) { clearTimeout(taskWatchdogTimer); taskWatchdogTimer = null; }
+    }
 
     ws.on('message', async (message) => {
         let data;
@@ -5686,10 +7266,28 @@ wss.on('connection', (ws, req) => {
         }
 
         if (data.type === 'cancel') {
+            clearTaskWatchdog();
+            killAllChildProcesses();
+            const restored = restoreProjectSnapshot();
+            const restoredCount = restored.count;
             if (streamController) {
                 streamController.abort();
                 streamController = null;
-                ws.send(JSON.stringify({ type: 'cancelled' }));
+                pendingPlan = null;
+                const msg = restoredCount > 0
+                    ? `⏹️ Tarefa cancelada — ${restoredCount} arquivo(s) restaurado(s)`
+                    : '⏹️ Tarefa cancelada';
+                ws.send(JSON.stringify({ type: 'cancelled', restoredCount, restoredFiles: restored.files }));
+                if (restoredCount > 0) ws.send(JSON.stringify({ type: 'refresh' }));
+            }
+            return;
+        }
+
+        if (data.type === 'interaction-response') {
+            const entry = pendingInteractions.get(data.id);
+            if (entry) {
+                pendingInteractions.delete(data.id);
+                entry.resolve(data.value);
             }
             return;
         }
@@ -5722,6 +7320,7 @@ wss.on('connection', (ws, req) => {
             }
 
             streamController = new AbortController();
+            armTaskWatchdog();
 
             const onChunk = (agent, text) => {
                 if (agent === 'file-status') {
@@ -5741,37 +7340,141 @@ wss.on('connection', (ws, req) => {
                     } catch (e) {}
                     return;
                 }
+                if (agent === 'interaction') {
+                    try {
+                        const payload = JSON.parse(text);
+                        ws.send(JSON.stringify({ type: payload.kind, ...payload }));
+                    } catch (e) {}
+                    return;
+                }
+                if (agent === 'todo') {
+                    try {
+                        ws.send(JSON.stringify({ type: 'todo', todos: JSON.parse(text) }));
+                    } catch (e) {}
+                    return;
+                }
                 ws.send(JSON.stringify({ type: 'chunk', agent: agent || 'Sistema', content: text }));
             };
 
+            setAgentStreamCallback(onChunk);
+
             try {
+                _lastProjectSnapshot = snapshotProjectContents();
+                _lastProjectFileList = new Set(snapshotProjectFiles().keys());
                 const model = data.model || 'gemini-3.5';
                 const provider = data.provider || 'gemini';
                 const mode = data.mode || 'cowork';
+                const reviewMode = data.reviewMode === true;
 
-                if (mode === 'agent') {
+                if (data.images && data.images.length) setPendingImages(data.images);
+
+                let effectiveMode = mode;
+                let effectiveReviewMode = reviewMode;
+                if (mode === 'auto' || mode === 'smart') {
+                    const classification = classifyRequest(task);
+                    console.log(`[smart] ${classification.route}: ${classification.reason} | "${task.slice(0, 80)}"`);
+                    if (onChunk) onChunk('Sistema', `🤖 Smart: ${classification.reason}\n`);
+                    if (classification.route === 'answer') {
+                        onChunk('Assistente', '');
+                        const answer = await callAI(provider, `${LANGUAGE_RULE}\n\nResponda de forma concisa e direta (máximo 3 frases): ${task}`, (agent, text) => {
+                            if (agent === 'text' || agent === 'Assistente') onChunk('Assistente', text);
+                        }, streamController.signal);
+                        ws.send(JSON.stringify({ type: 'done', summary: answer ? answer.slice(0, 200).trim() : 'Respondido ✅', command: task }));
+                        return;
+                    }
+                    // 'direct' e 'options' → execução direta do agente (estilo opencode),
+                    // sem o fluxo de opções/aprovação que travava tarefas abertas.
+                    effectiveMode = 'agent';
+                    effectiveReviewMode = false;
+                    if (onChunk) onChunk('Sistema', `📋 Modo: 🚀 Direto\n`);
+                    data.reviewMode = false;
+                }
+
+                if (effectiveMode === 'agent') {
                     const label = provider === 'opencode' ? '🟣 OpenCode' : provider === 'deepseek' ? '🔵 DeepSeek' : provider === 'gemini' ? '🟢 Gemini' : provider === 'claude' ? '🟣 Claude' : '🤖 ' + provider.toUpperCase();
                     if (onChunk) onChunk('Sistema', label + ' — executando...\n');
-                    const beforeContents = snapshotProjectContents();
-                    const before = snapshotProjectFiles();
-                    let fullResponse = '';
-                    await callOpenCode(task, (chunk) => {
-                        fullResponse += chunk;
-                        if (onChunk) onChunk('Assistente', chunk);
-                    }, streamController.signal, null, (toolEvent) => {
-                        if (onChunk) onChunk('activity', JSON.stringify(toolEvent));
-                    });
-                    const changes = diffSnapshots(before, snapshotProjectFiles());
-                    for (const change of changes) {
-                        if (change.action === 'modificar' || change.action === 'deletar') {
-                            const orig = beforeContents.get(change.file);
-                            if (orig !== undefined) backupFromContent(change.file, orig);
-                        }
-                        if (onChunk) onChunk('file-status', JSON.stringify([{ file: change.file, action: change.action, status: change.action === 'criar' ? 'created' : 'deleted' }]));
+
+                    const projectCtx = `ESTRUTURA DO PROJETO:\n${getProjectCache()}`;
+                    const agentTaskWithCtx = `${projectCtx}${LANGUAGE_RULE}\n\nTAREFA: ${task}`;
+
+                    const agentBeforeContents = snapshotProjectContents();
+                    const agentBefore = snapshotProjectFiles();
+
+                    let agentResult = '';
+                    if (provider === 'opencode') {
+                        await callOpenCode(agentTaskWithCtx, (chunk) => {
+                            agentResult += chunk;
+                            if (onChunk) onChunk('Assistente', chunk);
+                        }, streamController.signal, null, (toolEvent) => {
+                            if (onChunk) onChunk('activity', JSON.stringify(toolEvent));
+                        });
+                    } else {
+                        agentResult = await runAgentLoop(agentTaskWithCtx, onChunk, streamController.signal, mode, Array.isArray(history) ? history : [], provider);
                     }
-                    ws.send(JSON.stringify({ type: 'refresh' }));
-                    const summary = changes.length > 0 ? `${changes.length} arquivo(s) alterado(s)` : (fullResponse.slice(0, 200).trim() || 'Concluído');
-                    ws.send(JSON.stringify({ type: 'done', summary, modifiedFiles: changes.map(c => c.file), command: task }));
+
+                    const agentChanges = diffSnapshots(agentBefore, snapshotProjectFiles());
+
+                    if (agentChanges.length > 0) {
+                        if (data.reviewMode) {
+                            const agentNewContents = new Map();
+                            for (const c of agentChanges) {
+                                if (c.action === 'modificar' || c.action === 'criar') {
+                                    const absPath = path.join(PROJECT_ROOT, ...c.file.split('/'));
+                                    try { agentNewContents.set(c.file, fs.readFileSync(absPath, 'utf-8')); } catch (e) {}
+                                }
+                            }
+                            for (const c of agentChanges) {
+                                const absPath = path.join(PROJECT_ROOT, ...c.file.split('/'));
+                                if (c.action === 'modificar' || c.action === 'deletar') {
+                                    const orig = agentBeforeContents.get(c.file);
+                                    if (orig !== undefined) {
+                                        backupFromContent(c.file, orig);
+                                        try { fs.writeFileSync(absPath, orig, 'utf-8'); } catch (e) {}
+                                    }
+                                } else if (c.action === 'criar') {
+                                    try { fs.unlinkSync(absPath); } catch (e) {}
+                                }
+                            }
+                            ws.send(JSON.stringify({ type: 'refresh' }));
+                            const agentPlanId = crypto.randomBytes(8).toString('hex');
+                            const agentArquivos = agentChanges.map(c => {
+                                const entry = { caminho: c.file, acao: c.action, explicacao: '', conteudo: agentNewContents.get(c.file) || c.content || '' };
+                                if (c.action === 'modificar') {
+                                    entry.originalConteudo = agentBeforeContents.get(c.file) || '';
+                                }
+                                return entry;
+                            });
+                            pendingPlan = { id: agentPlanId, plan: { resumo: `${provider}: ${agentChanges.length} arquivo(s)`, arquivos: agentArquivos }, controller: streamController, task, provider, mode: 'agent' };
+                            ws.send(JSON.stringify({ type: 'approval', planId: agentPlanId, resumo: `${provider}: ${agentChanges.length} arquivo(s)`, total: agentChanges.length, arquivos: agentArquivos }));
+                        } else {
+                            onChunk('plan', String(agentChanges.length));
+                            for (const c of agentChanges) {
+                                if (c.action === 'modificar' || c.action === 'deletar') {
+                                    const orig = agentBeforeContents.get(c.file);
+                                    if (orig !== undefined) backupFromContent(c.file, orig);
+                                }
+                                if (onChunk) onChunk('file-status', JSON.stringify([{ file: c.file, action: c.action, status: c.action === 'criar' ? 'created' : c.action === 'deletar' ? 'deleted' : 'modified' }]));
+                                if (onChunk) onChunk('Sistema', `✅ ${c.file} (${c.action})\n`);
+                            }
+                            ws.send(JSON.stringify({ type: 'refresh' }));
+                            const agentModified = agentChanges.filter(c => c.action !== 'deletar').map(c => c.file);
+                            let agentDiag;
+                            if (agentModified.length) {
+                                try {
+                                    agentDiag = await runPostExecutionDiagnostics(agentModified, agentResult);
+                                } catch (e) {}
+                            }
+                            if (agentDiag && agentDiag.rolledBack) {
+                                ws.send(JSON.stringify({ type: 'rollback', message: 'Alteracoes revertidas devido a erros' }));
+                                ws.send(JSON.stringify({ type: 'done', summary: 'Alterações revertidas (testes falharam)', command: task }));
+                            } else {
+                                const agentSummary = agentChanges.length > 0 ? `${agentChanges.length} arquivo(s) alterado(s)` : (agentResult ? agentResult.slice(0, 200).trim() : 'Concluído');
+                                ws.send(JSON.stringify({ type: 'done', summary: agentSummary, modifiedFiles: agentChanges.map(c => c.file), command: task }));
+                            }
+                        }
+                    } else {
+                        ws.send(JSON.stringify({ type: 'done', summary: agentResult ? agentResult.slice(0, 200).trim() : 'Agente concluído ✅', command: task }));
+                    }
                     return;
                 }
 
@@ -5811,10 +7514,13 @@ wss.on('connection', (ws, req) => {
                             }
                             ws.send(JSON.stringify({ type: 'refresh' }));
                             const ocPlanId = crypto.randomBytes(8).toString('hex');
-                            const ocArquivos = changes.map(c => ({
-                                caminho: c.file, acao: c.action, explicacao: '',
-                                conteudo: ocNewContents.get(c.file) || c.content || ''
-                            }));
+                            const ocArquivos = changes.map(c => {
+                                const entry = { caminho: c.file, acao: c.action, explicacao: '', conteudo: ocNewContents.get(c.file) || c.content || '' };
+                                if (c.action === 'modificar') {
+                                    entry.originalConteudo = beforeContents.get(c.file) || '';
+                                }
+                                return entry;
+                            });
                             pendingPlan = { id: ocPlanId, plan: { resumo: `opencode: ${changes.length} arquivo(s)`, arquivos: ocArquivos }, controller: streamController, task, provider: 'opencode' };
                             ws.send(JSON.stringify({ type: 'approval', planId: ocPlanId, resumo: `opencode: ${changes.length} arquivo(s)`, total: changes.length, arquivos: ocArquivos }));
                         } else {
@@ -5877,13 +7583,11 @@ wss.on('connection', (ws, req) => {
                     return;
                 }
 
-                if ((provider === 'openai' || provider === 'claude') && mode !== 'agent') {
+                if ((provider === 'openai' || provider === 'claude') && effectiveMode !== 'agent') {
                     if (onChunk) onChunk('Sistema', `🤖 ${provider.toUpperCase()} analisando com ferramentas nativas...\n`);
                     const ntvBeforeContents = snapshotProjectContents();
                     const ntvBefore = snapshotProjectFiles();
-                    const ntvResult = provider === 'openai'
-                        ? await runAgentLoopOpenAI(task, onChunk, streamController.signal, provider)
-                        : await runAgentLoopClaude(task, onChunk, streamController.signal);
+                    const ntvResult = await runAgentLoop(task, onChunk, streamController.signal, mode, [], provider);
                     const ntvChanges = diffSnapshots(ntvBefore, snapshotProjectFiles());
 
                     if (ntvChanges.length > 0) {
@@ -5909,10 +7613,13 @@ wss.on('connection', (ws, req) => {
                             }
                             ws.send(JSON.stringify({ type: 'refresh' }));
                             const ntvPlanId = crypto.randomBytes(8).toString('hex');
-                            const ntvArquivos = ntvChanges.map(c => ({
-                                caminho: c.file, acao: c.action, explicacao: '',
-                                conteudo: ntvNewContents.get(c.file) || c.content || ''
-                            }));
+                            const ntvArquivos = ntvChanges.map(c => {
+                                const entry = { caminho: c.file, acao: c.action, explicacao: '', conteudo: ntvNewContents.get(c.file) || c.content || '' };
+                                if (c.action === 'modificar') {
+                                    entry.originalConteudo = ntvBeforeContents.get(c.file) || '';
+                                }
+                                return entry;
+                            });
                             pendingPlan = { id: ntvPlanId, plan: { resumo: `${provider}: ${ntvChanges.length} arquivo(s)`, arquivos: ntvArquivos }, controller: streamController, task, provider };
                             ws.send(JSON.stringify({ type: 'approval', planId: ntvPlanId, resumo: `${provider}: ${ntvChanges.length} arquivo(s)`, total: ntvChanges.length, arquivos: ntvArquivos }));
                         } else {
@@ -5942,7 +7649,66 @@ wss.on('connection', (ws, req) => {
                     return;
                 }
 
-                const plan = await analyzeTask(task, onChunk, streamController.signal, mode, Array.isArray(history) ? history : [], provider);
+                if (!data.reviewMode && effectiveMode !== 'clarify') {
+                    const fastBeforeContents = snapshotProjectContents();
+                    const fastBefore = snapshotProjectFiles();
+
+                    let fastExplorationCtx = '';
+                    if (task && !classifyIntent(task).includes('question')) {
+                        try {
+                            if (onChunk) onChunk('Sistema', '🔍 Explorando arquivos...\n');
+                            fastExplorationCtx = await runExplorationPhase(task, onChunk, streamController.signal, provider);
+                        } catch (e) {}
+                    }
+                    const fastTaskWithCtx = fastExplorationCtx
+                        ? `CONTEXTO DA EXPLORAÇÃO PRÉVIA:\n${fastExplorationCtx}\n\nTAREFA: ${task}`
+                        : task;
+
+                    const fastResult = provider === 'opencode'
+                        ? '' : await runAgentLoop(fastTaskWithCtx, onChunk, streamController.signal, mode, Array.isArray(history) ? history : [], provider);
+
+                    if (provider === 'opencode') {
+                        // fallback to analyzeTask for opencode non-agent
+                    } else {
+                        const fastChanges = diffSnapshots(fastBefore, snapshotProjectFiles());
+
+                        if (fastChanges.length > 0) {
+                            onChunk('plan', String(fastChanges.length));
+                            for (const c of fastChanges) {
+                                if (c.action === 'modificar' || c.action === 'deletar') {
+                                    const orig = fastBeforeContents.get(c.file);
+                                    if (orig !== undefined) backupFromContent(c.file, orig);
+                                }
+                                if (onChunk) onChunk('file-status', JSON.stringify([{ file: c.file, action: c.action, status: c.action === 'criar' ? 'created' : c.action === 'deletar' ? 'deleted' : 'modified' }]));
+                                if (onChunk) onChunk('Sistema', `✅ ${c.file} (${c.action})\n`);
+                            }
+                            ws.send(JSON.stringify({ type: 'refresh' }));
+                            const fastModified = fastChanges.filter(c => c.action !== 'deletar').map(c => c.file);
+                            if (fastModified.length) {
+                                try {
+                                    const diagResult = await runPostExecutionDiagnostics(fastModified, fastResult);
+                                    if (diagResult && diagResult.rolledBack) ws.send(JSON.stringify({ type: 'rollback', message: 'Alteracoes revertidas devido a erros' }));
+                                } catch (e) {}
+                            }
+                            const fastSummary = `${fastChanges.length} arquivo(s) alterado(s)`;
+                            ws.send(JSON.stringify({ type: 'done', summary: fastSummary, modifiedFiles: fastChanges.map(c => c.file), command: task }));
+                        } else {
+                            ws.send(JSON.stringify({ type: 'done', summary: fastResult ? fastResult.slice(0, 200).trim() : 'Concluído ✅', command: task }));
+                        }
+                        return;
+                    }
+                }
+
+                let explorationCtx = '';
+                if (effectiveMode !== 'agent' && task && !classifyIntent(task).includes('question')) {
+                    try {
+                        if (onChunk) onChunk('Sistema', '🔍 Explorando arquivos do projeto antes de gerar o plano...\n');
+                        explorationCtx = await runExplorationPhase(task, onChunk, streamController.signal, provider);
+                        if (explorationCtx && onChunk) onChunk('Sistema', '✅ Exploração concluída. Gerando plano...\n');
+                    } catch (e) {}
+                }
+
+                const plan = await analyzeTask(task, onChunk, streamController.signal, mode, Array.isArray(history) ? history : [], provider, explorationCtx);
                 console.log('[ws:plan] analyzeTask retornou', JSON.stringify({ resumo: (plan.resumo||'').slice(0,60), hasSugestoes: Array.isArray(plan.sugestoes) && plan.sugestoes.length > 0, hasArquivos: Array.isArray(plan.arquivos) && plan.arquivos.length > 0, hasRaw: !!(plan._rawResponse), rawLen: (plan._rawResponse||'').length, sugCount: (plan.sugestoes||[]).length, arqCount: (plan.arquivos||[]).length }));
 
                 let hasSugestoes = Array.isArray(plan.sugestoes) && plan.sugestoes.length > 0;
@@ -6031,21 +7797,52 @@ wss.on('connection', (ws, req) => {
                         }))
                     }));
                 } else {
-                    payload.arquivos = plan.arquivos.map(a => ({
-                        caminho: a.caminho,
-                        acao: a.acao,
-                        explicacao: a.explicacao || '',
-                        conteudo: a.conteudo || ''
-                    }));
+                    payload.arquivos = plan.arquivos.map(a => {
+                        const entry = {
+                            caminho: a.caminho,
+                            acao: a.acao,
+                            explicacao: a.explicacao || '',
+                            conteudo: a.conteudo || ''
+                        };
+                        if (a.acao === 'modificar') {
+                            try {
+                                const absPath = path.join(PROJECT_ROOT, ...a.caminho.split('/'));
+                                if (fs.existsSync(absPath)) entry.originalConteudo = fs.readFileSync(absPath, 'utf-8');
+                            } catch (e) {}
+                        }
+                        return entry;
+                    });
                 }
                 console.log('[ws] Enviando approval payload', JSON.stringify({ planId, hasSugestoes, sugestoesCount: hasSugestoes ? payload.sugestoes.length : 0, arquivosCount: payload.arquivos ? payload.arquivos.length : 0, total: payload.total, resumo: (payload.resumo||'').slice(0, 60) }));
                 ws.send(JSON.stringify(payload));
             } catch (error) {
+                clearTaskWatchdog();
+                clearPendingImages();
                 const cancelled = error && error.name === 'AbortError';
-                ws.send(JSON.stringify({
-                    type: cancelled ? 'cancelled' : 'error',
-                    content: cancelled ? '⏹️ Tarefa cancelada' : `❌ ${error.message}`
-                }));
+                let content;
+                let type;
+                if (taskWatchdogFired) {
+                    type = 'error';
+                    content = '⏰ A tarefa excedeu o tempo máximo (10 minutos) e foi interrompida. Tente novamente ou divida o pedido em etapas menores.';
+                } else if (cancelled) {
+                    type = 'cancelled';
+                    content = '⏹️ Tarefa cancelada';
+                } else {
+                    type = 'error';
+                    content = `❌ ${error.message}`;
+                    logError('agent-loop', error.message, task ? task.slice(0, 300) : '');
+                    const alternatives = [];
+                    if (config.gemini?.apiKey) alternatives.push('Gemini');
+                    if (config.deepseek?.apiKey) alternatives.push('DeepSeek');
+                    if (config.openai?.apiKey) alternatives.push('OpenAI');
+                    if (config.claude?.apiKey) alternatives.push('Claude');
+                    const currentProvider = data.provider ? data.provider.charAt(0).toUpperCase() + data.provider.slice(1) : '';
+                    const others = alternatives.filter(p => p.toLowerCase() !== (currentProvider || '').toLowerCase());
+                    if (others.length > 0) {
+                        content += `\n💡 Tente trocar para: ${others.join(', ')} nas Configurações.`;
+                    }
+                }
+                ws.send(JSON.stringify({ type, content }));
             }
             return;
         }
@@ -6063,6 +7860,7 @@ wss.on('connection', (ws, req) => {
             const { plan, controller, task, provider, mode: planMode } = pendingPlan;
             pendingPlan = null;
             streamController = controller;
+            armTaskWatchdog();
 
             if (planMode === 'agent') {
                 await runAgentAndCapture(ws, task, onChunk, streamController, [], provider);
@@ -6087,10 +7885,27 @@ wss.on('connection', (ws, req) => {
                     } catch (e) {}
                     return;
                 }
+                if (agent === 'interaction') {
+                    try {
+                        const payload = JSON.parse(text);
+                        ws.send(JSON.stringify({ type: payload.kind, ...payload }));
+                    } catch (e) {}
+                    return;
+                }
+                if (agent === 'todo') {
+                    try {
+                        ws.send(JSON.stringify({ type: 'todo', todos: JSON.parse(text) }));
+                    } catch (e) {}
+                    return;
+                }
                 ws.send(JSON.stringify({ type: 'chunk', agent: agent || 'Sistema', content: text }));
             };
 
+            setAgentStreamCallback(onChunk);
+
             try {
+                _lastProjectSnapshot = snapshotProjectContents();
+                _lastProjectFileList = new Set(snapshotProjectFiles().keys());
                 let filesToExecute;
                 if (Array.isArray(plan.sugestoes) && plan.sugestoes.length > 0) {
                     const selected = new Set(Array.isArray(data.selecionadas) ? data.selecionadas : []);
@@ -6135,33 +7950,44 @@ wss.on('connection', (ws, req) => {
                                     const result = await runPostExecutionDiagnostics(modifiedFilesOc, plan.resumo);
                                     if (result && result.rolledBack) ws.send(JSON.stringify({ type: 'rollback', message: 'Alteracoes revertidas devido a erros' }));
                                 }
-                                ws.send(JSON.stringify({ type: 'done', summary: 'opencode: ' + ocChanges.length + ' arquivo(s) alterado(s)', command: task }));
+                                ws.send(JSON.stringify({ type: 'done', summary: 'opencode: ' + ocChanges.length + ' arquivo(s) alterado(s)', modifiedFiles: ocChanges.filter(c => c.action !== 'deletar').map(c => c.file), command: task }));
                             } else {
                                 if (onChunk) onChunk('Sistema', '⚠️ opencode não gerou arquivos. Seja mais específico ou use a opção "Personalizado".\n');
                                 ws.send(JSON.stringify({ type: 'done', summary: 'Nenhum arquivo gerado. Seja mais específico.', command: task }));
                             }
                             return;
                         } else {
-                            const implPrompt = `Implemente a seguinte opção escolhida pelo usuário:\nTítulo: ${selTitles}\nDescrição: ${selDescs}\n\nSolicitação original: "${task}"\n\nGere o código completo dos arquivos necessários. Retorne APENAS JSON no Formato B:\n{"resumo":"...","arquivos":[{"caminho":"src/arquivo.js","acao":"criar","conteudo":"conteúdo COMPLETO do arquivo","explicacao":"o que este arquivo faz"}]}\n\n⚠️ O "conteudo" deve ser o código COMPLETO do arquivo, pronto para ser salvo. Sem explicações no conteúdo. Apenas JSON. Comece com { e termine com }.`;
-                            const implResponse = await callAI(provider, implPrompt, null, controller.signal);
-                            let implPlan = extractJson(implResponse);
-                            if (!implPlan || !Array.isArray(implPlan.arquivos) || implPlan.arquivos.length === 0) {
-                                if (onChunk) onChunk('Sistema', '🔄 Reforçando implementação...\n');
-                                const implRetryPrompt = `⚠️ Sua resposta anterior não estava no formato JSON correto. Sua resposta foi:\n\n"""\n${(implResponse||'').slice(0, 1500)}\n"""\n\nAgora retorne APENAS JSON com os arquivos a criar/modificar:\n{"resumo":"...","arquivos":[{"caminho":"src/arquivo.js","acao":"criar","conteudo":"conteúdo COMPLETO","explicacao":"..."}]}\n\nApenas JSON. Comece com { e termine com }.`;
-                                try {
-                                    const implRetryResponse = await callAI(provider, implRetryPrompt, null, controller.signal);
-                                    implPlan = extractJson(implRetryResponse);
-                                } catch (e) {
-                                    console.error('[ws] Retry implementação falhou:', e.message);
-                                }
+                            if (onChunk) onChunk('Sistema', '🔨 Executando com agente...\n');
+                            const buildImplPrompt = (force) => {
+                                const base = `Solicitação do usuário: "${task}"\nOpção escolhida: ${selTitles}\n${selDescs}\n\nESTRUTURA DO PROJETO:\n${getProjectCache()}`;
+                                const instr = force
+                                    ? `\n\nATENÇÃO (obrigatório): escolha UMA melhoria concreta e implemente-a AGORA usando a ferramenta write_file com o código modificado. Ler arquivos com read_file é permitido, mas você DEVE terminar chamando write_file. Responder apenas com texto, JSON ou plano NÃO é implementar e não será aceito.`
+                                    : `\n\nTAREFA: escolha UMA melhoria concreta e implemente-a escrevendo código com a ferramenta write_file (ex.: adicionar validação, tratar erros, extrair função, melhorar uma tela, adicionar um recurso pequeno). Use read_file para entender o arquivo alvo e então chame write_file com o código modificado. O resultado esperado é código salvo nos arquivos — não responda com texto, JSON ou plano.`;
+                                return base + instr;
+                            };
+                            const agentBeforeSnap = snapshotProjectFiles();
+                            const agentBeforeContents = snapshotProjectContents();
+                            let agentImplResult = await runAgentLoop(buildImplPrompt(false), onChunk, controller.signal, 'agent', [], provider);
+                            let agentImplChanges = diffSnapshots(agentBeforeSnap, snapshotProjectFiles());
+                            if (agentImplChanges.length === 0) {
+                                if (onChunk) onChunk('Sistema', '⚠️ O agente apenas analisou sem implementar. Reforçando instrução...\n');
+                                agentImplResult = await runAgentLoop(buildImplPrompt(true), onChunk, controller.signal, 'agent', [], provider);
+                                agentImplChanges = diffSnapshots(agentBeforeSnap, snapshotProjectFiles());
                             }
-                            if (implPlan && Array.isArray(implPlan.arquivos) && implPlan.arquivos.length > 0) {
-                                filesToExecute = implPlan.arquivos;
-                                plan.resumo = implPlan.resumo || plan.resumo;
-                                if (onChunk && implPlan.resumo) onChunk('Assistente', '📋 ' + implPlan.resumo + '\n');
+                            if (agentImplChanges.length > 0) {
+                                for (const c of agentImplChanges) {
+                                    if (c.action === 'modificar' || c.action === 'deletar') {
+                                        const orig = agentBeforeContents.get(c.file);
+                                        if (orig !== undefined) backupFromContent(c.file, orig);
+                                    }
+                                    if (onChunk) onChunk('file-status', JSON.stringify([{ file: c.file, action: c.action, status: 'done' }]));
+                                    if (onChunk) onChunk('Sistema', `📄 ${c.action.toUpperCase()}: ${c.file}\n`);
+                                }
+                                filesToExecute = agentImplChanges.map(c => ({ caminho: c.file, acao: c.action }));
+                                plan.resumo = agentImplResult ? agentImplResult.slice(0, 200) : 'Agente concluído';
                             } else {
-                                if (onChunk) onChunk('Sistema', '⚠️ IA não gerou arquivos. Por favor, seja mais específico no pedido ou use a opção "Personalizado" para descrever exatamente o que deseja.\n');
-                                ws.send(JSON.stringify({ type: 'done', summary: 'Nenhum arquivo gerado pela IA. Seja mais específico.', command: task }));
+                                if (onChunk) onChunk('Sistema', '⚠️ O agente analisou mas não alterou nenhum arquivo. Seja mais específico ou use a opção "Personalizado".\n');
+                                ws.send(JSON.stringify({ type: 'done', summary: 'Nenhum arquivo alterado — o agente analisou mas não implementou. Seja mais específico ou use "Personalizado".', command: task }));
                                 return;
                             }
                         }
@@ -6176,8 +8002,18 @@ wss.on('connection', (ws, req) => {
                     const result = await runPostExecutionDiagnostics(modifiedFiles, plan.resumo);
                     if (result && result.rolledBack) ws.send(JSON.stringify({ type: 'rollback', message: 'Alteracoes revertidas devido a erros' }));
                 }
-                ws.send(JSON.stringify({ type: 'done', summary: plan.resumo || 'Alterações aplicadas', command: task }));
+                ws.send(JSON.stringify({ type: 'done', summary: plan.resumo || 'Alterações aplicadas', modifiedFiles, command: task }));
+            } catch (error) {
+                clearTaskWatchdog();
+                const cancelled = error && error.name === 'AbortError';
+                if (taskWatchdogFired) {
+                    ws.send(JSON.stringify({ type: 'error', content: '⏰ A tarefa excedeu o tempo máximo (10 minutos) e foi interrompida. Tente novamente ou divida o pedido em etapas menores.' }));
+                } else if (!cancelled) {
+                    logError('plan-execute', error.message, task ? task.slice(0, 300) : '');
+                    ws.send(JSON.stringify({ type: 'error', content: '❌ ' + (error.message || 'Erro na execução') }));
+                }
             } finally {
+                clearTaskWatchdog();
                 streamController = null;
             }
         }
@@ -6185,6 +8021,8 @@ wss.on('connection', (ws, req) => {
 
     ws.on('close', () => {
         console.log('🔌 Cliente WebSocket desconectado');
+        clearTaskWatchdog();
+        killAllChildProcesses();
         if (streamController) {
             streamController.abort();
             streamController = null;
@@ -6203,13 +8041,16 @@ function loadMcpConfig() {
         if (fs.existsSync(ocPath)) {
             const oc = JSON.parse(fs.readFileSync(ocPath, 'utf-8'));
             if (oc.mcp && typeof oc.mcp === 'object') {
-                mcpConfigs = Object.entries(oc.mcp).map(([name, cfg]) => ({
-                    name,
-                    command: cfg.command?.[0] || cfg.command,
-                    args: (cfg.command || []).slice(1),
-                    env: cfg.environment || {},
-                    enabled: cfg.enabled !== false
-                }));
+                mcpConfigs = Object.entries(oc.mcp).map(([name, cfg]) => {
+                    const cmdParts = Array.isArray(cfg.command) ? cfg.command : String(cfg.command || '').split(/\s+/).filter(Boolean);
+                    return {
+                        name,
+                        command: cmdParts[0] || '',
+                        args: cmdParts.slice(1),
+                        env: cfg.environment || {},
+                        enabled: cfg.enabled !== false
+                    };
+                });
             }
         }
     } catch (e) { console.error('[mcp] Erro ao carregar config:', e.message); }
@@ -6233,6 +8074,7 @@ if (require.main === module) {
         console.log('[mcp] Inicialização concluída');
     }).catch(e => console.error('[mcp]', e.message));
     server.listen(PORT, '127.0.0.1', () => {
+        startHeartbeat();
         console.log(`✅ Aedificator Codex IDE Backend rodando na porta ${PORT}`);
         console.log(`🔗 http://localhost:${PORT}/api/health`);
         console.log(`📁 Diretório do projeto: ${PROJECT_ROOT}`);
@@ -6259,8 +8101,8 @@ if (require.main === module) {
         console.error('❌ Erro não tratado:', error);
     });
 
-    process.on('SIGINT', () => { stopOpenCodeServer(); process.exit(); });
-    process.on('SIGTERM', () => { stopOpenCodeServer(); process.exit(); });
+    process.on('SIGINT', () => { if (heartbeatInterval) clearInterval(heartbeatInterval); stopOpenCodeServer(); process.exit(); });
+    process.on('SIGTERM', () => { if (heartbeatInterval) clearInterval(heartbeatInterval); stopOpenCodeServer(); process.exit(); });
 
     console.log('🏗️ Aedificator Codex IDE Backend inicializando...');
     console.log(`📁 Diretório base: ${PROJECT_ROOT}`);

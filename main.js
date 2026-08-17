@@ -51,6 +51,12 @@ function getOrCreateBackendSecret() {
     return secret;
 }
 
+// Versão do protocolo esperada do backend (deve bater com
+// BACKEND_PROTOCOL_VERSION em backend/server.js). Um backend desatualizado
+// rodando na porta seria reutilizado pelo isBackendRunning e continuaria com
+// bugs já corrigidos no código atual.
+const BACKEND_PROTOCOL_VERSION = '3';
+
 // ===== FUNÇÃO PARA VERIFICAR SE O BACKEND ESTÁ RODANDO =====
 function isBackendRunning() {
     return new Promise((resolve) => {
@@ -69,14 +75,68 @@ function isBackendRunning() {
     });
 }
 
+// Verifica se o backend em execução é da versão atual. Se for antigo, mata
+// apenas o processo que roda server.js na porta (evita matar processo alheio).
+async function isBackendCurrent() {
+    try {
+        const res = await fetch(`http://127.0.0.1:${BACKEND_PORT}/api/health`);
+        const data = await res.json();
+        return data.version === BACKEND_PROTOCOL_VERSION;
+    } catch (e) {
+        return false;
+    }
+}
+
+function killProcessOnPort(port) {
+    return new Promise((resolve) => {
+        const { exec } = require('child_process');
+        const cmd = process.platform === 'win32'
+            ? `netstat -ano -p tcp | findstr :${port} | findstr LISTENING`
+            : `lsof -ti:${port} 2>/dev/null || true`;
+        exec(cmd, (err, stdout) => {
+            const pidLine = String(stdout || '').trim().split(/\r?\n/)[0];
+            const pidMatch = pidLine.match(/(\d+)\s*$/);
+            if (!pidMatch) return resolve(false);
+            const pid = pidMatch[1];
+            if (process.platform === 'win32') {
+                // Só mata se a linha do netstat pertencer a um node/server.js
+                const { execSync } = require('child_process');
+                try {
+                    const wmic = execSync(`wmic process where processid=${pid} get commandline /value`, { encoding: 'utf-8', windowsHide: true });
+                    if (!/server\.js/i.test(wmic)) return resolve(false);
+                    execSync(`taskkill /F /PID ${pid} /T`, { stdio: 'ignore' });
+                    return resolve(true);
+                } catch (e) { return resolve(false); }
+            } else {
+                try { process.kill(pid, 'SIGKILL'); return resolve(true); } catch (e) { return resolve(false); }
+            }
+        });
+    });
+}
+
 // ===== FUNÇÃO PARA INICIAR O BACKEND =====
 async function startBackend() {
     console.log('🚀 Iniciando backend...');
 
     const running = await isBackendRunning();
     if (running) {
-        console.log('✅ Backend já está rodando!');
-        return true;
+        const current = await isBackendCurrent();
+        if (current) {
+            console.log('✅ Backend já está rodando (versão atual)!');
+            return true;
+        }
+        console.log('⚠️ Backend antigo detectado na porta — reiniciando para aplicar correções...');
+        const killed = await killProcessOnPort(BACKEND_PORT);
+        if (killed) {
+            // aguarda a porta liberar
+            for (let i = 0; i < 10; i++) {
+                if (!(await isBackendRunning())) break;
+                await new Promise(r => setTimeout(r, 300));
+            }
+        } else {
+            console.error('❌ Não foi possível encerrar o backend antigo automaticamente. Feche-o manualmente e abra o app de novo.');
+            return false;
+        }
     }
 
     const backendPath = path.join(__dirname, 'backend', 'server.js');

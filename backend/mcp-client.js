@@ -13,21 +13,37 @@ class McpClient {
 
     async start() {
         const { command, args = [], env = {} } = this.config;
-        this.process = spawn(command, args, {
+        const safeArgs = Array.isArray(args) ? args : String(args || '').split(/\s+/).filter(Boolean);
+        if (!command) throw new Error(`MCP server '${this.config.name}' sem comando definido`);
+
+        this.process = spawn(command, safeArgs, {
             stdio: ['pipe', 'pipe', 'pipe'],
             env: { ...process.env, ...env }
+        });
+
+        const spawnErrorPromise = new Promise((_, reject) => {
+            this.process.on('error', (err) => reject(err));
+            this.process.on('exit', (code) => {
+                if (code !== 0 && code !== null) reject(new Error(`Processo MCP ${this.config.name} encerrou com código ${code}`));
+            });
         });
 
         this.process.stdout.on('data', (data) => this._onData(data.toString()));
         this.process.stderr.on('data', (d) => console.error(`[mcp:${this.config.name}] stderr:`, d.toString().slice(0, 200)));
 
-        await this._send('initialize', {
-            protocolVersion: '2024-11-05',
-            capabilities: {},
-            clientInfo: { name: 'aedificator-codex', version: '1.0.0' }
-        });
+        await Promise.race([
+            this._send('initialize', {
+                protocolVersion: '2024-11-05',
+                capabilities: {},
+                clientInfo: { name: 'aedificator-codex', version: '1.0.0' }
+            }),
+            spawnErrorPromise
+        ]);
 
-        const toolsResult = await this._send('tools/list', {});
+        const toolsResult = await Promise.race([
+            this._send('tools/list', {}),
+            spawnErrorPromise
+        ]);
         this.tools = (toolsResult.tools || []).map(t => ({
             name: `mcp_${this.config.name}_${t.name}`,
             description: t.description || `MCP tool: ${t.name}`,

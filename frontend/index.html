@@ -867,6 +867,51 @@
             font-size: 11px;
             color: #484f58;
         }
+        .task-log-list {
+            flex: 1;
+            overflow-y: auto;
+            padding: 8px;
+            display: flex;
+            flex-direction: column;
+            gap: 8px;
+        }
+        .task-log-item {
+            background: #161b22;
+            border: 1px solid #30363d;
+            border-radius: 8px;
+            padding: 8px 10px;
+            flex-shrink: 0;
+            font-size: 11px;
+        }
+        .task-log-item .tl-time {
+            font-size: 10px;
+            color: #8b949e;
+            margin-bottom: 3px;
+            display: flex;
+            align-items: center;
+            gap: 6px;
+        }
+        .task-log-item .tl-status {
+            font-size: 9px;
+            padding: 1px 6px;
+            border-radius: 8px;
+            font-weight: 600;
+            text-transform: uppercase;
+        }
+        .task-log-item .tl-status.success { background: #1f6f3f; color: #3fb950; }
+        .task-log-item .tl-status.error { background: #6e2a2f; color: #f85149; }
+        .task-log-item .tl-status.cancelled { background: #5a4a1f; color: #d29922; }
+        .task-log-item .tl-dur {
+            font-size: 10px;
+            color: #8b949e;
+            margin-left: auto;
+            white-space: nowrap;
+        }
+        .task-log-item .tl-msg {
+            color: #c9d1d9;
+            word-break: break-word;
+            line-height: 1.5;
+        }
         .act-item {
             background: #161b22;
             border: 1px solid #30363d;
@@ -959,7 +1004,7 @@
 
         /* ===== CHAT ===== */
         .chat-area {
-            width: 380px;
+            width: 500px;
             min-width: 240px;
             max-width: 900px;
             flex: 0 0 auto;
@@ -1078,11 +1123,21 @@
         /* ===== INPUT ===== */
         .input-area {
             display: flex;
+            flex-direction: column;
             gap: 8px;
             padding: 8px 16px;
             border-top: 1px solid #30363d;
             flex-shrink: 0;
             background: #0d1117;
+        }
+        .input-buttons {
+            display: flex;
+            gap: 8px;
+            justify-content: flex-end;
+        }
+        .input-row {
+            display: flex;
+            gap: 8px;
         }
         .input-area input {
             flex: 1;
@@ -1592,9 +1647,9 @@
             border: 1px solid #30363d;
             border-radius: 12px;
             padding: 24px;
-            max-width: 640px;
-            width: 92%;
-            max-height: 85vh;
+            max-width: 900px;
+            width: 90vw;
+            max-height: 88vh;
             display: flex;
             flex-direction: column;
             gap: 12px;
@@ -1750,6 +1805,41 @@
         }
         .approval-note textarea::placeholder {
             color: #484f58;
+        }
+        .approval-accept-btn {
+            transition: all 0.15s;
+        }
+        .approval-accept-btn:hover {
+            background: #2ea043 !important;
+        }
+        .approval-reject-btn {
+            transition: all 0.15s;
+        }
+        .approval-reject-btn:hover {
+            background: #f85149 !important;
+        }
+        .approval-diff-btn {
+            transition: all 0.15s;
+            flex-shrink: 0;
+        }
+        .approval-diff-btn:hover {
+            background: #30363d !important;
+            border-color: #58a6ff !important;
+            color: #e6edf3 !important;
+        }
+        .approval-file-expandable {
+            display: flex;
+            flex-direction: column;
+            gap: 0;
+            padding: 8px 12px;
+            border-bottom: 1px solid #21262d;
+            font-size: 13px;
+        }
+        .approval-file-expandable:last-child {
+            border-bottom: none;
+        }
+        .approval-diff-container {
+            background: #0d1117;
         }
 
         /* ===== EDITOR DE ARQUIVOS ===== */
@@ -1977,6 +2067,16 @@ body.theme-light .chat-area,
         body.theme-light .activity-empty .activity-empty-sub {
             color: #8c959f;
         }
+        body.theme-light .task-log-item {
+            background: #f6f8fa;
+            border-color: #d0d7de;
+        }
+        body.theme-light .task-log-item .tl-time {
+            color: #57606a;
+        }
+        body.theme-light .task-log-item .tl-msg {
+            color: #1f2328;
+        }
         body.theme-light .act-item {
             background: #f6f8fa;
             border-color: #d0d7de;
@@ -2186,6 +2286,7 @@ body.theme-light .chat-area,
         .chat-toolbar {
             display: flex;
             align-items: center;
+            flex-wrap: wrap;
             gap: 6px;
             padding: 4px 16px;
             border-bottom: 1px solid #30363d;
@@ -2888,6 +2989,45 @@ body.theme-light .chat-area,
             color: #f85149;
             background: #3a1e1e;
         }
+        .editor-tab .tab-ext {
+            color: #6e7681;
+            font-size: 10px;
+        }
+        .editor-tab.active .tab-ext {
+            color: #8b949e;
+        }
+        .editor-tab .tab-dirty-dot {
+            width: 7px; height: 7px;
+            border-radius: 50%;
+            background: transparent;
+            flex-shrink: 0;
+            transition: background 0.15s;
+        }
+        .editor-tab.dirty .tab-dirty-dot {
+            background: #e6edf3;
+        }
+        .editor-tab.dragging {
+            opacity: 0.4;
+        }
+        .editor-tab.drag-over {
+            border-left: 3px solid #58a6ff;
+        }
+        .chat-file-link {
+            color: #58a6ff;
+            cursor: pointer;
+            text-decoration: underline;
+            text-decoration-style: dotted;
+        }
+        .chat-file-link:hover {
+            color: #79c0ff;
+            text-decoration-style: solid;
+        }
+        body.theme-light .chat-file-link {
+            color: #0969da;
+        }
+        body.theme-light .chat-file-link:hover {
+            color: #0550ae;
+        }
         .editor-image-wrap {
             flex: 1;
             overflow: auto;
@@ -3235,6 +3375,7 @@ body.theme-light .chat-area,
             <div class="activitybar-icon" data-panel="debug" title="Debug (Ctrl+Shift+D)">🐛</div>
             <div class="activitybar-icon" data-panel="docker" title="Docker (Ctrl+Shift+K)">🐳</div>
             <div class="activitybar-icon" data-panel="ssh" title="SSH Remoto (Ctrl+Shift+R)">🔗</div>
+            <div class="activitybar-icon" data-panel="log" title="Histórico de mensagens">🕘</div>
         </div>
 
         <!-- ===== SIDEBAR: EXPLORADOR ===== -->
@@ -3329,6 +3470,17 @@ body.theme-light .chat-area,
             <div style="flex:1;overflow-y:auto;padding:8px;font-size:11px;font-family:Consolas,monospace;white-space:pre-wrap;color:#c9d1d9;" id="sidebarSshOutput">⚡ Painel SSH — conecte-se a um servidor remoto</div>
         </div>
 
+        <!-- ===== SIDEBAR: HISTÓRICO DE MENSAGENS ===== -->
+        <div class="sidebar-panel" data-panel="log" id="sidebarLog">
+            <div class="explorer-header">
+                <span>🕘 HISTÓRICO DE MENSAGENS</span>
+                <button class="btn-toolbar" style="font-size:10px;padding:2px 6px;" onclick="clearTaskLog()" title="Limpar histórico">🗑️ Limpar</button>
+            </div>
+            <div class="task-log-list" id="taskLogList">
+                <div class="activity-empty">Nenhuma mensagem registrada ainda.<br><span class="activity-empty-sub">As conclusões/erros das tarefas aparecem aqui</span></div>
+            </div>
+        </div>
+
         <!-- ===== DIVISOR ESQUERDO ===== -->
         <div class="resizer" id="resizerLeft" data-target="sidebarPanel"></div>
 
@@ -3387,11 +3539,15 @@ body.theme-light .chat-area,
             </div>
 
             <div class="input-area">
-                <input type="text" id="chatInput" placeholder="Digite seu comando... (@ para referenciar arquivos)">
-                <div class="autocomplete-dropdown" id="autocompleteDropdown"></div>
-                <button id="fixErrorsBtn" style="display:none;background:#d29922;border:none;color:#fff;padding:6px 12px;border-radius:6px;cursor:pointer;font-size:12px;white-space:nowrap;" onclick="fixErrorsWithAI()" title="Corrigir erros automaticamente">🔧 Corrigir erros</button>
-                <button id="cancelButton" style="display:none;" onclick="cancelTask()">⏹️ Cancelar</button>
-                <button id="sendButton" onclick="sendMessage()">Enviar</button>
+                <div class="input-row">
+                    <input type="text" id="chatInput" placeholder="Digite seu comando... (@ para referenciar arquivos)">
+                    <div class="autocomplete-dropdown" id="autocompleteDropdown"></div>
+                    <button id="sendButton" onclick="sendMessage()">Enviar</button>
+                </div>
+                <div class="input-buttons">
+                    <button id="fixErrorsBtn" style="display:none;background:#d29922;border:none;color:#fff;padding:6px 12px;border-radius:6px;cursor:pointer;font-size:12px;white-space:nowrap;" onclick="fixErrorsWithAI()" title="Corrigir erros automaticamente">🔧 Corrigir erros</button>
+                    <button id="cancelButton" style="display:none;" onclick="cancelTask()">⏹️ Cancelar</button>
+                </div>
             </div>
             <div class="drop-overlay" id="dropOverlay">
                 <div class="drop-overlay-content">
@@ -3440,6 +3596,7 @@ body.theme-light .chat-area,
         <span id="statusEncoding">UTF-8</span>
         <span id="statusLang">Plaintext</span>
         <span class="status-clickable" onclick="toggleBottomPanel('terminal')" title="Terminal (Ctrl+B)">▱</span>
+        <span class="status-clickable" onclick="switchActivityBar('log')" title="Histórico de mensagens">🕘</span>
         <span id="statusBackend" style="color:#f85149;">🔴</span>
     </div>
 
@@ -3527,6 +3684,13 @@ body.theme-light .chat-area,
             </div>
             <div class="field-group">
                 <label><input type="checkbox" id="configAutoCommit" checked style="margin-right:6px;"> Auto-commit após alterações da IA</label>
+            </div>
+            <div class="field-group">
+                <label>Ferramentas que pedem confirmação (separadas por vírgula)</label>
+                <textarea id="configAskTools" rows="3" style="width:100%;background:#0d1117;border:1px solid #30363d;border-radius:6px;color:#e6edf3;font-size:12px;padding:6px 8px;font-family:Consolas,monospace;box-sizing:border-box;resize:vertical;"></textarea>
+            </div>
+            <div class="field-group">
+                <button id="resetPermissionsBtn" type="button" style="padding:6px 12px;background:#30363d;border:1px solid #30363d;border-radius:6px;color:#e6edf3;cursor:pointer;font-size:12px;">🔓 Resetar decisões "sempre permitir/negar"</button>
             </div>
             </div>
 

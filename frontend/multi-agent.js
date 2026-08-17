@@ -50,17 +50,8 @@
         if (!s.ws || s.ws.readyState !== WebSocket.OPEN) {
             s.ws = new WebSocket(WS_URL);
             s.ws.onopen = function() { s.ws.send(JSON.stringify(msg)); };
-            s.ws.onmessage = function(e) {
-                try {
-                    if (activeId !== s.id) saveState();
-                    var prev = activeId;
-                    activeId = s.id; syncState();
-                    handleWsMessage(JSON.parse(e.data));
-                    activeId = prev; syncState();
-                    if (activeId === s.id) restoreGlobals();
-                } catch (err) {}
-            };
-            s.ws.onclose = function() { if (s.streaming) { s.streaming = false; } s.ws = null; };
+            s.ws.onmessage = function(e) { handleSessionMessage(s, e); };
+            s.ws.onclose = function() { handleSessionClose(s); };
             return;
         }
         s.ws.send(JSON.stringify(msg));
@@ -70,6 +61,33 @@
         if (_endTaskFn) _endTaskFn(toastMsg);
         saveState();
     };
+
+    // Handler único de mensagens de uma sessão: troca para o contexto da sessão,
+    // processa a mensagem e restaura o contexto anterior com segurança.
+    function handleSessionMessage(s, e) {
+        try {
+            if (activeId !== s.id) saveState();
+            var prev = activeId;
+            activeId = s.id; syncState();
+            handleWsMessage(JSON.parse(e.data));
+            activeId = prev; syncState();
+            if (activeId === s.id) restoreGlobals();
+        } catch (err) {
+            if (activeId === s.id) restoreGlobals();
+        }
+    }
+
+    // Se a conexão cai no meio de uma tarefa, a UI não pode ficar presa em
+    // "Enviando.../Executando" esperando um 'done' que nunca chegará.
+    function handleSessionClose(s) {
+        var wasTaskActive = s.taskActive || s.streaming;
+        if (s.streaming) s.streaming = false;
+        s.taskActive = false;
+        s.ws = null;
+        if (wasTaskActive && activeId === s.id && _endTaskFn) {
+            _endTaskFn('⏹️ Conexão perdida — tarefa cancelada');
+        }
+    }
 
     function saveState() {
         var s = sessions[activeId];
@@ -114,17 +132,8 @@
         addTab(nextId, 'Agente ' + (parseInt(nextId) + 1));
         s.ws = new WebSocket(WS_URL);
         s.ws.onopen = function() {};
-        s.ws.onmessage = function(e) {
-            try {
-                if (activeId !== s.id) saveState();
-                var prev = activeId;
-                activeId = s.id; syncState();
-                handleWsMessage(JSON.parse(e.data));
-                activeId = prev; syncState();
-                if (activeId === s.id) restoreGlobals();
-            } catch (err) {}
-        };
-        s.ws.onclose = function() {};
+        s.ws.onmessage = function(e) { handleSessionMessage(s, e); };
+        s.ws.onclose = function() { handleSessionClose(s); };
         switchAgent(nextId);
     }
 

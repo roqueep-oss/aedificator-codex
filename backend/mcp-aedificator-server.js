@@ -57,6 +57,40 @@ function latestVersionTag() {
     return runGit(['tag', '--sort=-v:refname']).split('\n')[0] || '';
 }
 
+function stripBOM(text) {
+    return typeof text === 'string' ? text.replace(/^\uFEFF+/, '') : text;
+}
+
+function replaceInContent(content, pattern, replacement) {
+    if (content.includes(pattern)) {
+        return { content: content.split(pattern).join(replacement), matched: true };
+    }
+    let matched = false;
+    try {
+        const regex = new RegExp(pattern, 'g');
+        const replaced = content.replace(regex, replacement);
+        if (replaced !== content) { content = replaced; matched = true; }
+    } catch (e) {}
+    if (!matched) {
+        const pLines = pattern.split('\n').map(l => l.trim()).filter(l => l.length > 0);
+        const cLines = content.split('\n');
+        for (let i = 0; i <= cLines.length - pLines.length && !matched; i++) {
+            let ok = true;
+            for (let j = 0; j < pLines.length; j++) {
+                if (cLines[i + j].trim() !== pLines[j]) { ok = false; break; }
+            }
+            if (ok) {
+                const indent = (cLines[i].match(/^\s*/) || [''])[0];
+                const rLines = replacement.split('\n').map((l, idx) => idx === 0 ? indent + l.trim() : l);
+                cLines.splice(i, pLines.length, ...rLines);
+                content = cLines.join('\n');
+                matched = true;
+            }
+        }
+    }
+    return { content, matched };
+}
+
 const TOOLS = [
     { name: 'read_file', description: 'Lê conteúdo de um arquivo', inputSchema: { type: 'object', properties: { caminho: { type: 'string' } }, required: ['caminho'] } },
     { name: 'write_file', description: 'Cria ou sobrescreve um arquivo', inputSchema: { type: 'object', properties: { caminho: { type: 'string' }, conteudo: { type: 'string' } }, required: ['caminho', 'conteudo'] } },
@@ -85,14 +119,15 @@ async function executeTool(name, args) {
             case 'read_file': {
                 const f = resolveSafe(args.caminho);
                 if (!f || !fs.existsSync(f)) return 'Erro: arquivo não encontrado';
-                return fs.readFileSync(f, 'utf-8').slice(0, 50000);
+                return fs.readFileSync(f, 'utf-8').replace(/^\uFEFF+/, '').slice(0, 50000);
             }
             case 'write_file': {
                 const f = resolveSafe(args.caminho);
                 if (!f) return 'Erro: caminho inválido';
                 fs.mkdirSync(path.dirname(f), { recursive: true });
-                fs.writeFileSync(f, args.conteudo || '', 'utf-8');
-                return `Arquivo ${args.caminho} salvo (${(args.conteudo || '').length} bytes)`;
+                const cleanContent = String(args.conteudo || '').replace(/^\uFEFF+/, '');
+                fs.writeFileSync(f, cleanContent, 'utf-8');
+                return `Arquivo ${args.caminho} salvo (${cleanContent.length} bytes)`;
             }
             case 'delete_file': {
                 const f = resolveSafe(args.caminho);
@@ -178,10 +213,10 @@ async function executeTool(name, args) {
                 let count = 0;
                 for (const f of files) {
                     try {
-                        let content = fs.readFileSync(f, 'utf-8');
+                        const content = stripBOM(fs.readFileSync(f, 'utf-8'));
                         const before = content;
-                        content = content.split(args.padrao).join(args.substituto);
-                        if (content !== before) { fs.writeFileSync(f, content, 'utf-8'); count++; }
+                        const { content: newContent, matched } = replaceInContent(content, String(args.padrao || ''), String(args.substituto || ''));
+                        if (matched && newContent !== before) { fs.writeFileSync(f, newContent, 'utf-8'); count++; }
                     } catch (_) {}
                 }
                 return count > 0 ? `${count} arquivo(s) alterado(s)` : 'Nenhum arquivo alterado';
