@@ -397,14 +397,22 @@ Atualize os valores com os preços REAIS atuais de cada provedor. Retorne SOMENT
         { name: 'Gemini', hasKey: !!config.gemini?.apiKey, call: (p) => callGemini(p, null, null) },
         { name: 'DeepSeek', hasKey: !!config.deepseek?.apiKey, call: (p) => callDeepSeek(p, null, null) },
         { name: 'OpenAI', hasKey: !!config.openai?.apiKey, call: (p) => callOpenAI(p, null, null) },
-        { name: 'Claude', hasKey: !!config.claude?.apiKey, call: (p) => callClaude(p, null, null) },
-        { name: 'OpenCode', hasKey: true, call: (p) => callOpenCode(p, null, null) }
+        { name: 'Claude', hasKey: !!config.claude?.apiKey, call: (p) => callClaude(p, null, null) }
     ];
 
-    for (const provider of providers) {
-        if (!provider.hasKey) continue;
+    // Qualquer provider habilitado pode fornecer os preços — o primeiro que
+    // responder com JSON válido é usado. Os providers não listados aqui (ex.:
+    // opencode) usam os mesmos modelos base, então não precisam ser consultados.
+    const enabled = providers.filter(p => p.hasKey);
+
+    for (const provider of enabled) {
         try {
-            const response = await provider.call(prompt);
+            // Preços é uma consulta simples — se o provider não responder em 30s,
+            // pula para o próximo. O botão nunca fica "Buscando..." para sempre.
+            const response = await Promise.race([
+                provider.call(prompt),
+                new Promise((_, rej) => setTimeout(() => rej(new Error('timeout após 30s')), 30000))
+            ]);
             // Usa o extractJson robusto (trata markdown ```json, thinking blocks
             // e texto extra ao redor) em vez do regex simples — modelos costumam
             // embrulhar o JSON e o regex {…} quebrava com comas/vírgulas extras.
@@ -1716,7 +1724,7 @@ async function callDeepSeek(prompt, onChunk, signal) {
             { role: 'system', content: safeSystem },
             { role: 'user', content: safePrompt }
         ],
-        stream: true
+        stream: !!onChunk
     };
     if (model === 'deepseek-v4-pro') {
         bodyObj.reasoning_effort = config.deepseek.reasoningEffort || 'medium';
@@ -1738,6 +1746,16 @@ async function callDeepSeek(prompt, onChunk, signal) {
         let errorMsg = hint || `Erro na API DeepSeek: ${statusCode}${error ? ' - ' + error.slice(0, 200) : ''}`;
         logError('deepseek-api', errorMsg, `status=${statusCode} body=${error.slice(0, 300)}`);
         throw new Error(errorMsg);
+    }
+
+    // Modo não-streaming (ex.: consulta de preços): a resposta é JSON único,
+    // não SSE — basta ler e extrair a mensagem.
+    if (!onChunk) {
+        const data = await response.json().catch(() => null);
+        if (!data) return '';
+        const content = data.choices?.[0]?.message?.content || '';
+        if (data.usage) trackTokens('deepseek', data.usage.prompt_tokens || 0, data.usage.completion_tokens || 0, !!(data.usage.prompt_cache_hit_tokens || data.usage.prompt_tokens_details?.cached_tokens), config.deepseek.model);
+        return content;
     }
 
     const reader = response.body.getReader();
@@ -1834,12 +1852,12 @@ async function callOpenAI(prompt, onChunk, signal) {
         const abort = new AbortController();
         if (signal) signal.addEventListener('abort', () => abort.abort());
 
-        fetch(url, {
+        fetchWithTimeout(url, {
             method: 'POST',
             headers: { 'Content-Type': 'application/json', 'Authorization': `Bearer ${apiKey}` },
             body,
             signal: abort.signal
-        }).then(async (res) => {
+        }, 60000, abort.signal).then(async (res) => {
             if (!res.ok) {
                 const err = await res.text();
                 const hint = getProviderErrorHint(res.status, err, 'openai');
@@ -1885,7 +1903,7 @@ async function callClaude(prompt, onChunk, signal, forcedModel) {
         const abort = new AbortController();
         if (signal) signal.addEventListener('abort', () => abort.abort());
 
-        fetch(url, {
+        fetchWithTimeout(url, {
             method: 'POST',
             headers: {
                 'Content-Type': 'application/json',
@@ -1894,7 +1912,7 @@ async function callClaude(prompt, onChunk, signal, forcedModel) {
             },
             body,
             signal: abort.signal
-        }).then(async (res) => {
+        }, 60000, abort.signal).then(async (res) => {
             if (!res.ok) {
                 const err = await res.text();
                 const hint = getProviderErrorHint(res.status, err, 'claude');
