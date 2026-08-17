@@ -1150,7 +1150,7 @@ function armNoProgressTimer() {
     }, 60000);
 }
 
-let handleWsMessage = function(data) {
+function handleWsMessage(data) {
     // Qualquer mensagem vinda do backend enquanto uma tarefa está ativa é sinal
     // de que o agente ainda está trabalhando — renova o watchdog de stream.
     if (isStreaming) resetStreamTimeout();
@@ -2246,7 +2246,7 @@ async function deleteFilePrompt(filePath, name) {
 // =============================================
 //  SALVAR ABA ATIVA (EDITOR)
 // =============================================
-let saveFileEditor = async function() {
+async function saveFileEditor() {
     const tab = editorTabs.find(t => t.path === activeTabPath);
     if (!tab || tab.isImage) return;
     let content = getEditorContent();
@@ -2574,7 +2574,7 @@ function renderSearchResults(results, query) {
 // =============================================
 //  EXECUTAR COMANDOS (TERMINAL)
 // =============================================
-let openTerminal = function() {
+function openTerminal() {
     if (!currentProjectPath) {
         showToast('📁 Selecione uma pasta primeiro!');
         return;
@@ -4228,7 +4228,7 @@ function renderAgentTodos(todos) {
     addMessage('system', '📋 Plano de tarefas:\n' + lines);
 }
 
-let showApprovalModal = function(data) {
+function showApprovalModal(data) {
     const hasSugestoes = data.sugestoes && Array.isArray(data.sugestoes) && data.sugestoes.length > 0;
     const hasArquivos = data.arquivos && data.arquivos.length > 0;
 
@@ -8221,7 +8221,7 @@ function bottomTerminalSend() {
     }).catch(function(e) { out.textContent += e.message + '\n'; out.scrollTop = out.scrollHeight; });
 }
 
-let updateBottomProblems = function(errorsList) {
+function updateBottomProblems(errorsList) {
     var content = document.getElementById('bottomProblemsContent');
     var countEl = document.getElementById('statusErrors');
     if (!content) return;
