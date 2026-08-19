@@ -407,7 +407,10 @@ test('snapshot/diff detecta criar, modificar e deletar', () => {
         const before = snapshotProjectFiles();
         assert.ok(before.has('a.txt'), 'snapshot deve conter a.txt');
 
-        fs.writeFileSync(path.join(projectRoot, 'a.txt'), 'v2');
+        // Conteúdo de tamanho diferente: a detecção usa size:mtimeMs e, no
+        // Windows, duas escritas rápidas podem cair no mesmo mtimeMs — com o
+        // mesmo tamanho o diff não detectaria a mudança (teste ficava flaky).
+        fs.writeFileSync(path.join(projectRoot, 'a.txt'), 'v2 (modificado)');
         fs.writeFileSync(path.join(projectRoot, 'b.txt'), 'novo');
         const after = snapshotProjectFiles();
 

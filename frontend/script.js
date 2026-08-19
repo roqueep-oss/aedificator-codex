@@ -5114,7 +5114,7 @@ function endTask(toastMsg) {
     agentStatusFinalized = true;
     try {
         updateAgentStatus(finalStatus === 'success' ? 'done' : 'error');
-        armAgentStatusHide(5000);
+        armAgentStatusHide(2500);
     } catch (e) {}
 
     var taskDurMs = null;
@@ -5801,8 +5801,8 @@ function updateAgentStatus(status, detail) {
     }
     textEl.textContent = (who ? who + ' — ' : '') + m[1] + (detail ? ' · ' + detail : '');
     // Rede de segurança para estados ao vivo: se o backend parar de atualizar
-    // (ou o 'done' nunca chegar), o chip some sozinho em 60s.
-    if (status !== 'done' && status !== 'error') armAgentStatusHide(60000);
+    // (ou o 'done' nunca chegar), o chip some sozinho.
+    if (status !== 'done' && status !== 'error') armAgentStatusHide(25000);
 }
 
 // Watchdog do chip: se o chip mostrar estado "ao vivo" (pensando/construindo/
@@ -5813,12 +5813,20 @@ setInterval(function() {
     var chip = document.getElementById('agentStatusChip');
     if (!chip || chip.style.display === 'none') return;
     if (!/thinking|building|testing/.test(chip.className)) return;
-    if (isStreaming) return;
+    // 1) Tarefa já encerrou (endTask rodou) → finaliza e esconde de imediato,
+    //    mesmo que o isStreaming global esteja preso (sessões multi-agente).
+    // 2) Backend mudo há 20s E nenhuma fase ativa → provável conclusão perdida.
+    var silent = Date.now() - lastBackendActivity > 20000;
+    var hasRunning = false;
+    for (var i = 0; i < activityItems.length; i++) {
+        if (activityItems[i].status === 'running' && !activityItems[i].end) { hasRunning = true; break; }
+    }
+    if (!agentStatusFinalized && isStreaming && !(silent && !hasRunning)) return;
     try {
         updateAgentStatus('done');
-        armAgentStatusHide(3000);
+        armAgentStatusHide(2000);
     } catch (e) {}
-}, 2000);
+}, 1500);
 
 // Base da Atividade da IA: mostra o arquivo e as linhas de código em edição.
 function setActivityDetail(file, code) {
