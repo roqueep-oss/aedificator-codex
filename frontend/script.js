@@ -6413,7 +6413,10 @@ var PROVIDER_MODELS = {
     ],
     deepseek: [
         { value: 'deepseek-v4-flash', label: 'DeepSeek V4 Flash' },
-        { value: 'deepseek-v4-pro', label: 'DeepSeek V4 Pro' }
+        { value: 'deepseek-v4-pro', label: 'DeepSeek V4 Pro' },
+        { value: 'deepseek-coder', label: 'DeepSeek Coder' },
+        { value: 'deepseek-chat', label: 'DeepSeek Chat' },
+        { value: 'deepseek-reasoner', label: 'DeepSeek Reasoner' }
     ],
     openai: [
         { value: 'gpt-4o', label: 'GPT-4o' },

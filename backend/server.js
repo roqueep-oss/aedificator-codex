@@ -300,7 +300,8 @@ const TOKEN_PRICES = {
             'deepseek-chat': { input: 0.27, output: 1.10, cache: 0.07 },
             'deepseek-reasoner': { input: 0.55, output: 2.19, cache: 0.14 },
             'deepseek-v4-flash': { input: 0.14, output: 0.28, cache: 0.0028 },
-            'deepseek-v4-pro': { input: 0.435, output: 0.87, cache: 0.0036 }
+            'deepseek-v4-pro': { input: 0.435, output: 0.87, cache: 0.0036 },
+            'deepseek-coder': { input: 0.14, output: 0.28, cache: 0.0028 }
         }
     },
     gemini: {
@@ -3567,6 +3568,15 @@ async function runAgentLoop(task, onChunk, signal, mode, history, provider) {
     const loopStartSnapshot = snapshotProjectFiles();
     const activeProvider = { value: provider };
     let noActionCount = 0;
+    // Ferramentas que efetivamente alteram o projeto. Tool calls de leitura/
+    // busca/browser/execução não contam como ação — se o agente fizer muitas
+    // delas sem nunca escrever, entramos num loop de exploração infinito.
+    const WRITE_TOOLS = new Set(['write_file', 'search_replace', 'delete_file', 'file_rename', 'file_mkdir', 'undo', 'redo', 'git_commit', 'git_push', 'git_publish', 'git_stash', 'snapshot_create', 'docker_run', 'ssh_exec']);
+    const MAX_NO_WRITE_TOOLCALLS = 8;
+    let noWriteCount = 0;
+    // Rastreia quantas vezes cada arquivo foi lido: reler o mesmo arquivo várias
+    // vezes é sinal de que a causa não está nele, mas no que ele chama.
+    const arquivosLidos = new Map();
 
     try {
         let iteration = 0;
@@ -3652,11 +3662,45 @@ async function runAgentLoop(task, onChunk, signal, mode, history, provider) {
                 }
                 messages.push({ role: 'tool', tool_call_id: tc.id, name: tc.name, content: truncateToolResult(tc.name, result) });
 
+                // Conta tool calls sem efeito de escrita. Ferramentas de leitura/
+                // busca/browser/execução não alteram o projeto — se acumularem sem
+                // nenhuma escrita, forçamos o agente a agir (ver check abaixo).
+                if (WRITE_TOOLS.has(tc.name) && !toolError) {
+                    noWriteCount = 0;
+                } else if (tc.name !== 'question' && tc.name !== 'todo') {
+                    noWriteCount++;
+                }
+
+                // Marca releitura do mesmo arquivo (sinal de causa em outro lugar).
+                if (tc.name === 'read_file' && tc.args && tc.args.caminho) {
+                    arquivosLidos.set(tc.args.caminho, (arquivosLidos.get(tc.args.caminho) || 0) + 1);
+                }
+
                 const toolResultStr = String(result);
                 if ((tc.name === 'write_file' || tc.name === 'search_replace') && !toolError && hasRealWriteErrors(toolResultStr)) {
                     autoCorrectPending = true;
                     if (onChunk) onChunk('Sistema', '⚠️ Auto-correção: há erros reais no arquivo. Corrija antes de prosseguir.\n');
                 }
+            }
+
+            // Quebra o loop de exploração: após N tool calls sem NENHUMA escrita,
+            // injeta uma ordem clara para aplicar a correção agora. O agente
+            // tende a ler/buscar sem nunca escrever — isso o força a convergir.
+            if (noWriteCount >= MAX_NO_WRITE_TOOLCALLS) {
+                const feitas = noWriteCount;
+                noWriteCount = 0;
+                const relidos = Array.from(arquivosLidos.entries()).filter(([, n]) => n >= 2).map(([f]) => f);
+                if (onChunk) onChunk('Sistema', `⚠️ ${feitas} chamadas de leitura/busca sem alterar arquivos. Forçando ação...\n`);
+                const dicaReleitura = relidos.length
+                    ? `Você já leu ${relidos.join(', ')} mais de uma vez. Se a causa não está aí, ela provavelmente está em um arquivo que esse código CHAMA (ex.: uma função de sanitização, validação ou filtro de HTML/dados). Siga a cadeia: leia UMA vez o arquivo da função chamada e aplique a correção nele.`
+                    : '';
+                messages.push({
+                    role: 'user',
+                    content: `⚠️ [AÇÃO OBRIGATÓRIA] Você fez ${feitas} chamadas de leitura/busca sem alterar nenhum arquivo.
+1. Se você JÁ identificou a causa raiz, aplique a correção AGORA com search_replace (mudança pontual) ou write_file (arquivo novo/reescrita).
+2. ${dicaReleitura ? dicaReleitura : 'Se ainda não tem certeza da causa, faça NO MÁXIMO 1 leitura adicional FOCADA no arquivo mais provável e aplique a correção imediatamente depois.'}
+NÃO é permitido continuar lendo/buscando/reproduzindo no browser até você alterar ao menos um arquivo.`
+                });
             }
 
             if (autoCorrectPending) {
