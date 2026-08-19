@@ -619,7 +619,9 @@ test('search_code com regex global encontra todas as ocorrências (não pula)', 
         fs.writeFileSync(path.join(projectRoot, 'app.js'), linhas.join('\n'));
         const res = await executeAgentTool('search_code', { padrao: 'mostrarAba', diretorio: '' });
         assert.ok(typeof res === 'string', 'deve retornar string');
-        const ocorrencias = (res.match(/mostrarAba/g) || []).length;
+        // O resultado inclui contexto de linhas vizinhas; conta apenas os matches
+        // reais (linhas marcadas com ">>>").
+        const ocorrencias = res.split('\n').filter(l => l.includes('>>>') && l.includes('mostrarAba')).length;
         assert.strictEqual(ocorrencias, 2, 'regex global não pode pular ocorrências: ' + res);
     } finally {
         fs.rmSync(projectRoot, { recursive: true, force: true });

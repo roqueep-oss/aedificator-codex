@@ -2681,7 +2681,18 @@ async function executeAgentTool(name, args) {
                         for (let i = 0; i < lines.length; i++) {
                             re.lastIndex = 0;
                             if (re.test(lines[i])) {
-                                results.push(`${path.relative(PROJECT_ROOT, abs)}:${i + 1}: ${lines[i].trim().slice(0, 200)}`);
+                                // Contexto de 2 linhas antes/depois (estilo rg -C 2):
+                                // sem isso o modelo via só a linha do match e perdia a
+                                // cadeia de chamadas (ex.: via "innerHTML" mas não o
+                                // "Seguranca.sanitizarHtml" na linha de cima).
+                                const ctxLines = [];
+                                const start = Math.max(0, i - 2);
+                                const end = Math.min(lines.length, i + 3);
+                                for (let j = start; j < end; j++) {
+                                    const marker = j === i ? ' >>>' : '    ';
+                                    ctxLines.push(String(j + 1).padStart(4) + marker + ' ' + lines[j].slice(0, 140));
+                                }
+                                results.push(`${path.relative(PROJECT_ROOT, abs)}:${i + 1}:\n${ctxLines.join('\n')}`);
                                 if (results.length >= 30) break;
                             }
                         }
@@ -3062,6 +3073,13 @@ ${fileTree ? 'ESTRUTURA:\n' + fileTree : '(pasta vazia)'}
 - Depois de editar, releia o arquivo (read_file) para confirmar que a mudança ficou correta.
 - 1 arquivo por vez. Escreva, veja os erros, corrija. Depois faça o próximo.
 - Ao finalizar, responda em 1-2 linhas o que foi alterado.
+
+4. COMO ACHAR A CAUSA RAIZ (leia isto antes de explorar):
+- A causa quase nunca está no primeiro arquivo que você lê. Está no que o código CHAMA.
+- Se uma função/objeto chamado não for nativo do browser (ex.: Seguranca, Utils, Store, State, Modal, Toast), USE search_code para achar a DEFINIÇÃO e leia esse arquivo UMA vez. Ex.: se o render monta HTML e você vê "conteudo.innerHTML = html", procure quem SANITIZA/transforma esse html antes (ex.: "sanitizar", "escape", "filtrar").
+- Para bugs de UI (botão/clique/modal não funciona), use search_code com o nome da função chamada no onclick (ex.: "abrirModal") para ver onde o handler é definido e o que ele faz, incluindo o que pode remover/transformar o HTML.
+- Se houver reprodução possível no browser (browser_navigate/evaluate/console), use-a para ver o estado real do DOM (ex.: um atributo onclick ausente) — é a prova mais rápida da causa.
+- Só aplique a correção quando você tiver uma explicação concreta do porquê (linha + mecanismo). Nunca corrija "no chute".
 ${AGENT_BEHAVIOR_RULES}`;
 }
 
