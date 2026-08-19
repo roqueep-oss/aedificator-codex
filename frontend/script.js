@@ -30,6 +30,10 @@ let totalFilesToProcess = 0;
 let agentCounter = 0;
 let agentDivIds = {};
 let agentMessages = {};
+let lastActiveAgent = 'Assistente';
+let currentTaskInfo = null;
+let agentStatusHideTimer = null;
+let agentStatusFinalized = false;
 let chatSaveTimer = null;
 let pickerCurrentPath = '';
 let pickerRoots = [];
@@ -611,15 +615,22 @@ document.addEventListener('DOMContentLoaded', () => {
     }
 
     if (window.electronAPI) {
-        window.electronAPI.getBackendUrl().then((url) => {
+        Promise.all([
+            window.electronAPI.getBackendUrl(),
+            window.electronAPI.getBackendToken()
+        ]).then(([url, token]) => {
             BACKEND_URL = url;
             WS_URL = url.replace('http', 'ws');
+            BACKEND_TOKEN = token || '';
             initBackend();
         });
-        window.electronAPI.getBackendToken().then((token) => {
-            BACKEND_TOKEN = token || '';
-        });
     } else {
+        if (window.__BACKEND_TOKEN__) {
+            BACKEND_TOKEN = window.__BACKEND_TOKEN__;
+            const origin = window.location.origin || 'http://localhost:3001';
+            BACKEND_URL = origin;
+            WS_URL = origin.replace('http', 'ws');
+        }
         initBackend();
     }
 
@@ -640,10 +651,11 @@ document.addEventListener('DOMContentLoaded', () => {
         showToast('Modelo: ' + e.target.options[e.target.selectedIndex].text);
     });
 
-    // Inicializa com Gemini
-    updateModelOptions('gemini');
+    // Inicializa com DeepSeek (padrão)
+    providerSelect.value = 'deepseek';
+    updateModelOptions('deepseek');
     currentModel = modelSelect.value;
-    updateProviderIndicator('gemini');
+    updateProviderIndicator('deepseek');
 
     document.getElementById('modeSelect').addEventListener('change', (e) => {
         currentMode = e.target.value;
@@ -800,6 +812,9 @@ document.addEventListener('DOMContentLoaded', () => {
 async function initBackend() {
     try {
         const res = await apiFetch('/api/health');
+        if (res.status === 401) {
+            throw new Error('Não autorizado (401)');
+        }
         if (res.ok) {
             backendReady = true;
             const statusEl = document.getElementById('backendStatus');
@@ -816,7 +831,12 @@ async function initBackend() {
         const statusEl = document.getElementById('backendStatus');
         if (statusEl) { statusEl.textContent = '🔴 Desconectado'; statusEl.className = 'status-offline'; }
         console.log('❌ Backend offline:', e.message);
-        showToast('❌ Backend offline');
+        if (e.message && e.message.includes('401')) {
+            showToast('❌ Não autorizado — recarregue a página com Ctrl+F5 (token desatualizado)');
+            setTimeout(initBackend, 10000);
+            return;
+        }
+        showToast('❌ Backend offline — rode "node backend/server.js" ou o iniciar-app.bat');
         setTimeout(initBackend, 5000);
     }
 }
@@ -1131,6 +1151,7 @@ function clearStreamTimeout() {
 }
 
 function sendStreamingMessage(msg) {
+    if (msg && typeof msg === 'object' && !msg.token) msg.token = BACKEND_TOKEN;
     if (ws && ws.readyState === WebSocket.OPEN) {
         ws.send(JSON.stringify(msg));
         return;
@@ -1156,6 +1177,10 @@ function handleWsMessage(data) {
     if (isStreaming) resetStreamTimeout();
     // Renova também o timer de "sem progresso": qualquer mensagem é progresso.
     if (isStreaming && !taskConcluded) armNoProgressTimer();
+    // Renova o tempo máximo TOTAL da tarefa a cada atividade real do backend.
+    // Sem isso, um limite fixo de 2 min cortava o DeepSeek no meio de um
+    // tool-calling demorado com "This operation was aborted".
+    if (isStreaming && !taskConcluded) armMaxTaskTimer();
     // Marca atividade real do backend: é o sinal mais confiável de que o agente
     // está vivo, independente de flags (isStreaming/taskConcluded podem ficar
     // inconsistentes entre sessões do multi-agente ou no fechamento da conexão).
@@ -1165,12 +1190,14 @@ function handleWsMessage(data) {
         setProgress(data.total);
         finishAnalysisActivity(true);
         updatePipeline('plan', 'done', (data.total || 0) + ' arquivo(s)');
+        updateAgentStatus('building', 'aplicando plano');
         if (data.total > 0) taskActivityProgress(`📋 Plano com ${data.total} alteração(ões)`)
         return;
     }
 
     if (data.type === 'file-status') {
         updatePipeline('execute', 'active', '')
+        updateAgentStatus('building', 'aplicando alterações');
         // O agente começou a aplicar as alterações: a fase de análise/planejamento
         // terminou. Em modo agente direto não há mensagem 'plan', então sem isso o
         // item "Analisando" ficaria "Executando" até o fim da tarefa.
@@ -1211,8 +1238,12 @@ function handleWsMessage(data) {
             // Primeira ferramenta rodando: a análise terminou e a execução começou.
             finishAnalysisActivity(true);
             terminalAdd('tool', data.label || data.tool, { icon: data.icon, id: data.id });
+            updateAgentStatus('building', data.label || data.tool || '');
+            appendAgentChat('> Tool Call: ' + (data.label || data.tool || 'ferramenta') + '\n');
+            setActivityDetail(data.file || '', data.code || '');
         } else if (data.ev === 'tool_end') {
             terminalFinishTool(data.id, data.isError ? 'error' : 'success', data.error || '');
+            appendAgentChat((data.isError ? '> Tool Result: ❌ ' + (data.error || 'erro') : '> Tool Result: ✓ concluído') + '\n');
         }
         return;
     }
@@ -1233,7 +1264,16 @@ function handleWsMessage(data) {
                 /^⚠️\s*falhou/.test(trimmed) ||
                 /^⛔/.test(trimmed);
             terminalAdd('thought', trimmed);
+            // No estilo opencode, só entram no chat os raciocínios e avisos —
+            // as ferramentas entram via activity-event (ev: tool_start/end),
+            // evitando duplicar a mesma ferramenta duas vezes.
+            if (isToolMeta && (/^\+\s*Thought/.test(trimmed) || /Iteração\s+\d+\/\d+/.test(trimmed) || /^⚠️\s*falhou/.test(trimmed) || /^⛔/.test(trimmed))) {
+                appendAgentChat('> ' + trimmed + '\n');
+                return;
+            }
             if (isToolMeta) return;
+        } else {
+            lastActiveAgent = agent;
         }
 
         if (!agentMessages[agent]) {
@@ -1396,6 +1436,7 @@ function handleWsMessage(data) {
 
         // Atividade da IA: painel mostra a fase de testes com o status atual.
         if (data.status === 'running') {
+            updateAgentStatus('testing', 'executando testes');
             upsertActivity('test', { kind: 'process', icon: '\uD83E\uDDEA', label: 'Executando testes', status: 'running', error: '' });
         } else {
             setActivityStatus('test', (data.status === 'failed' || (data.results && data.results.fail > 0)) ? 'error' : 'success');
@@ -1545,7 +1586,7 @@ function forceFreeChat() {
     try {
         // Interrompe o backend para parar o agente/loop em execução.
         var sock = getStreamingSocket();
-        if (sock) sock.send(JSON.stringify({ type: 'cancel' }));
+        if (sock) sock.send(JSON.stringify({ type: 'cancel', token: BACKEND_TOKEN }));
     } catch (e) {}
     endTask('⏰ Tempo máximo de execução atingido (3 min) — chat liberado. Reenvie a mensagem se o trabalho foi interrompido.');
     var sb = document.getElementById('sendButton');
@@ -1560,10 +1601,15 @@ function forceFreeChat() {
 // iniciam trabalho no backend (chat, execução de sugestão do plano, etc.).
 function armMaxTaskTimer() {
     if (maxTaskTimer) { clearTimeout(maxTaskTimer); maxTaskTimer = null; }
+    // Tempo máximo TOTAL da tarefa, resetado a cada atividade real do backend
+    // (ver handleWsMessage). O tool-calling de debug com muitos passos facilmente
+    // ultrapassa 2 min; um limite fixo de 2 min cortava o DeepSeek no meio com
+    // "This operation was aborted". 5 min + reset por atividade dá margem sem
+    // deixar a UI presa para sempre.
     maxTaskTimer = setTimeout(function() {
         maxTaskTimer = null;
         if (isStreaming && !taskConcluded) forceFreeChat();
-    }, 120000);
+    }, 300000);
 }
 
 // Cria/atualiza a bolha "🧪 Testes" no chat com o progresso e o resultado
@@ -2808,8 +2854,8 @@ async function shareChat() {
     try {
         const resp = await fetch(BACKEND_URL + '/api/share', {
             method: 'POST',
-            headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({ messages, token: BACKEND_TOKEN })
+            headers: { 'Content-Type': 'application/json', 'Authorization': BACKEND_TOKEN ? `Bearer ${BACKEND_TOKEN}` : '' },
+            body: JSON.stringify({ messages })
         });
         const data = await resp.json();
         if (data.url) {
@@ -2822,7 +2868,7 @@ async function shareChat() {
 
 async function undoLastChange() {
     try {
-        const resp = await fetch(BACKEND_URL + '/api/undo', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ token: BACKEND_TOKEN }) });
+        const resp = await fetch(BACKEND_URL + '/api/undo', { method: 'POST', headers: { 'Content-Type': 'application/json', 'Authorization': BACKEND_TOKEN ? `Bearer ${BACKEND_TOKEN}` : '' }, body: JSON.stringify({}) });
         const data = await resp.json();
         showToast(data.message || (data.success ? '↩ Desfeito' : 'Nada para desfazer'));
         updateUndoRedoButtons();
@@ -2831,7 +2877,7 @@ async function undoLastChange() {
 
 async function redoLastChange() {
     try {
-        const resp = await fetch(BACKEND_URL + '/api/redo', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ token: BACKEND_TOKEN }) });
+        const resp = await fetch(BACKEND_URL + '/api/redo', { method: 'POST', headers: { 'Content-Type': 'application/json', 'Authorization': BACKEND_TOKEN ? `Bearer ${BACKEND_TOKEN}` : '' }, body: JSON.stringify({}) });
         const data = await resp.json();
         showToast(data.message || (data.success ? '↪ Refeito' : 'Nada para refazer'));
         updateUndoRedoButtons();
@@ -2840,7 +2886,7 @@ async function redoLastChange() {
 
 async function updateUndoRedoButtons() {
     try {
-        const resp = await fetch(BACKEND_URL + '/api/undo/status', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: '{}' });
+        const resp = await fetch(BACKEND_URL + '/api/undo/status', { method: 'POST', headers: { 'Content-Type': 'application/json', 'Authorization': BACKEND_TOKEN ? `Bearer ${BACKEND_TOKEN}` : '' }, body: '{}' });
         const data = await resp.json();
         const undoBtn = document.getElementById('undoBtn');
         const redoBtn = document.getElementById('redoBtn');
@@ -4308,6 +4354,7 @@ function showApprovalModal(data) {
             closeApprovalModal();
             isStreaming = true;
             taskConcluded = false;
+            agentStatusFinalized = false;
             if (concludeTimer) { clearTimeout(concludeTimer); concludeTimer = null; }
             if (noProgressTimer) { clearTimeout(noProgressTimer); noProgressTimer = null; }
             armMaxTaskTimer();
@@ -4661,6 +4708,11 @@ function sendMessage() {
 
     var provider = document.getElementById('providerSelect').value;
     var modelName = (currentModel || '').replace(/^(opencode|opencode-go)\//, '');
+    const providerLabels = { gemini: 'Gemini', deepseek: 'DeepSeek', openai: 'OpenAI', claude: 'Claude', opencode: 'OpenCode' };
+    currentTaskInfo = { provider, providerLabel: (providerLabels[provider] || provider), model: modelName || '' };
+    lastActiveAgent = 'Assistente';
+    agentStatusFinalized = false;
+    updateAgentStatus('thinking', 'analisando...');
     startTaskActivity((modelName || provider) + ' · ' + (message.length > 48 ? message.slice(0, 48) + '…' : message));
     startAnalysisActivity();
 
@@ -4767,6 +4819,15 @@ function endTask(toastMsg) {
         }
     }
 
+    // Chip de status da IA: SEMPRE finaliza (done/error) e se esconde depois de
+    // alguns segundos — mesmo que um passo acima lance exceção, o chip não pode
+    // ficar preso em "Testando/Construindo" após o fim da tarefa.
+    agentStatusFinalized = true;
+    try {
+        updateAgentStatus(finalStatus === 'success' ? 'done' : 'error');
+        armAgentStatusHide(5000);
+    } catch (e) {}
+
     var taskDurMs = null;
     if (terminalBlockStart > 0) {
         try {
@@ -4799,7 +4860,7 @@ function cancelTask() {
     }
     var sock = getStreamingSocket();
     if (sock) {
-        try { sock.send(JSON.stringify({ type: 'cancel' })); } catch (e) {}
+        try { sock.send(JSON.stringify({ type: 'cancel', token: BACKEND_TOKEN })); } catch (e) {}
         document.getElementById('cancelButton').style.display = 'none';
         showToast('⏹️ Cancelando...');
         setTimeout(() => {
@@ -5216,6 +5277,8 @@ function startTaskActivity(label) {
     initPipeline();
     updatePipeline('analyze', 'active');
     clearTerminal();
+    var detailPanel = document.getElementById('activityDetail');
+    if (detailPanel) detailPanel.classList.remove('open');
     terminalAdd('block-start', label);
     upsertActivity('task', { kind: 'task', icon: '🧠', label: 'Processando: ' + (label || ''), status: 'running', error: '' });
     actTaskId = 'task';
@@ -5259,6 +5322,98 @@ function taskActivityProgress(text) {
     if (!clean) return;
     item.label = clean.slice(0, 70);
     renderActivity();
+}
+
+// ===== CHAT NO ESTILO OPENCODE =====
+
+// Anexa uma linha (ex.: "> Tool Call: ...") à mensagem do agente que está
+// transmitindo, re-renderizando no formato opencode.
+function appendAgentChat(line) {
+    var agent = lastActiveAgent || 'Assistente';
+    if (agentMessages[agent] === undefined) {
+        agentMessages[agent] = '';
+        addMessage('agent', '', agent);
+    }
+    agentMessages[agent] += line;
+    updateAgentMessage(agent, agentMessages[agent]);
+}
+
+// Agenda o auto-esconder do chip. Estados ao vivo (pensando/construindo/
+// testando) o re-armam, então o chip some sozinho mesmo que o 'done' se perca.
+function armAgentStatusHide(delay) {
+    var ms = delay || 5000;
+    if (agentStatusHideTimer) clearTimeout(agentStatusHideTimer);
+    agentStatusHideTimer = setTimeout(function() {
+        var chip = document.getElementById('agentStatusChip');
+        if (chip) chip.style.display = 'none';
+        agentStatusHideTimer = null;
+    }, ms);
+}
+
+// Chip no toolbar do chat: mostra qual IA está ativa e em qual fase.
+function updateAgentStatus(status, detail) {
+    // Depois que a tarefa finalizou (endTask), eventos ao vivo atrasados (testes,
+    // arquivos, ferramentas) não podem re-exibir o chip como "em andamento".
+    if (agentStatusFinalized && (status === 'thinking' || status === 'building' || status === 'testing')) {
+        armAgentStatusHide(5000);
+        return;
+    }
+    var chip = document.getElementById('agentStatusChip');
+    if (!chip) return;
+    var textEl = document.getElementById('agentStatusChipText');
+    if (!textEl) return;
+    var phases = {
+        thinking: ['thinking', '💭 Pensando'],
+        building: ['building', '🔧 Construindo'],
+        testing: ['testing', '🧪 Testando'],
+        done: ['done', '✅ Concluído'],
+        error: ['error', '❌ Falhou']
+    };
+    var m = phases[status] || ['', '🤖 IA trabalhando'];
+    chip.className = 'agent-status-chip' + (m[0] ? ' ' + m[0] : '');
+    chip.style.display = 'inline-flex';
+    var who = '';
+    if (currentTaskInfo) {
+        who = (currentTaskInfo.providerLabel || '') + (currentTaskInfo.model ? ' · ' + currentTaskInfo.model : '');
+    }
+    textEl.textContent = (who ? who + ' — ' : '') + m[1] + (detail ? ' · ' + detail : '');
+    // Rede de segurança para estados ao vivo: se o backend parar de atualizar
+    // (ou o 'done' nunca chegar), o chip some sozinho em 60s.
+    if (status !== 'done' && status !== 'error') armAgentStatusHide(60000);
+}
+
+// Watchdog do chip: se o chip mostrar estado "ao vivo" (pensando/construindo/
+// testando) sem nenhuma tarefa ativa, não pode ficar preso — finaliza como
+// concluído e esconde. Cobre eventos atrasados/vazados de testes ou de sessões
+// paralelas que ainda chegam depois que a tarefa já terminou.
+setInterval(function() {
+    var chip = document.getElementById('agentStatusChip');
+    if (!chip || chip.style.display === 'none') return;
+    if (!/thinking|building|testing/.test(chip.className)) return;
+    if (isStreaming) return;
+    try {
+        updateAgentStatus('done');
+        armAgentStatusHide(3000);
+    } catch (e) {}
+}, 2000);
+
+// Base da Atividade da IA: mostra o arquivo e as linhas de código em edição.
+function setActivityDetail(file, code) {
+    var panel = document.getElementById('activityDetail');
+    if (!panel || !code) return;
+    document.getElementById('activityDetailTitle').textContent = '📄 ' + (file || 'arquivo');
+    var pre = document.getElementById('activityDetailCode');
+    pre.innerHTML = '<code class="language-javascript" data-lang="javascript">' + escapeHtml(code) + '</code>';
+    panel.classList.add('open');
+    colorizeActivityCode(pre);
+}
+
+function colorizeActivityCode(container) {
+    if (!monacoReady || !container) return;
+    try {
+        var block = container.querySelector('code[data-lang]');
+        if (block) monaco.editor.colorizeElement(block, { theme: document.body.classList.contains('theme-light') ? 'vs' : 'vs-dark', mimeType: 'text/javascript' });
+    } catch (e) {}
 }
 
 // =============================================
@@ -6009,31 +6164,96 @@ async function showGitBlame() {
 // =============================================
 function renderChatContent(text) {
     if (!text) return '';
-    if (!text.includes('```') && !text.includes('**') && !text.includes('#') && !text.includes('- '))
+    // Caminho rápido: texto simples sem markdown/estrutura opencode.
+    if (!text.includes('```') && !text.includes('**') && !text.includes('#') && !text.includes('- ') &&
+        !text.includes('>') && !text.includes('|') && !text.includes('Thought') && !text.includes('+ '))
         return linkifyFilePaths(escapeHtml(text).replace(/\n/g, '<br>'));
+
+    const lines = text.split('\n');
     let html = '';
-    const parts = text.split(/(```[\s\S]*?```)/g);
-    for (const part of parts) {
-        if (part.startsWith('```')) {
-            const langMatch = part.match(/```(\w+)?\n?/);
-            const lang = langMatch ? (langMatch[1] || 'plaintext') : 'plaintext';
-            let code = part.replace(/```\w*\n?/, '').replace(/```$/, '');
-            html += '<pre><code class="language-' + escapeHtml(lang) + '" data-lang="' + escapeHtml(lang) + '">' + highlightCode(code, lang) + '</code></pre>';
-        } else {
-            let p = escapeHtml(part);
-            p = p.replace(/\*\*(.+?)\*\*/g, '<strong>$1</strong>');
-            p = p.replace(/\*(.+?)\*/g, '<em>$1</em>');
-            p = p.replace(/`([^`]+)`/g, '<code>$1</code>');
-            p = p.replace(/^### (.+)$/gm, '<h4>$1</h4>');
-            p = p.replace(/^## (.+)$/gm, '<h3>$1</h3>');
-            p = p.replace(/^# (.+)$/gm, '<h2>$1</h2>');
-            p = p.replace(/^- (.+)$/gm, '<li>$1</li>');
-            p = p.replace(/\n/g, '<br>');
-            p = linkifyFilePaths(p);
-            html += p;
+    let codeBuf = null, codeLang = '';
+    let listStack = [];
+    let inTable = false;
+
+    const inline = (escaped) => {
+        escaped = escaped.replace(/\*\*(.+?)\*\*/g, '<strong>$1</strong>');
+        escaped = escaped.replace(/`([^`]+)`/g, '<code>$1</code>');
+        escaped = escaped.replace(/\*([^*]+)\*/g, '<em>$1</em>');
+        return escaped;
+    };
+    const closeList = () => { if (listStack.length) html += '</' + listStack.pop() + '>'; };
+    const closeTable = () => { if (inTable) { html += '</table>'; inTable = false; } };
+    const flushCode = () => {
+        if (codeBuf !== null) {
+            html += '<pre><code class="language-' + escapeHtml(codeLang) + '" data-lang="' + escapeHtml(codeLang) + '">' + escapeHtml(codeBuf.join('\n')) + '</code></pre>';
+            codeBuf = null;
         }
+    };
+
+    for (let i = 0; i < lines.length; i++) {
+        const line = lines[i];
+        if (codeBuf !== null) {
+            if (/^\s*```/.test(line)) { flushCode(); continue; }
+            codeBuf.push(line);
+            continue;
+        }
+        const fence = line.match(/^\s*```(\w*)/);
+        if (fence) { closeTable(); closeList(); codeBuf = []; codeLang = fence[1] || 'plaintext'; continue; }
+        const trimmed = line.trim();
+        if (!trimmed) { closeTable(); html += '<br>'; continue; }
+
+        if (trimmed.startsWith('> ')) {
+            closeTable(); closeList();
+            const q = trimmed.slice(2);
+            const cls = q.startsWith('Tool Call') ? ' tool-call'
+                : q.startsWith('Tool Result') ? ' tool-result'
+                : /Error|falhou|❌|⛔/.test(q) ? ' tool-error' : '';
+            html += '<div class="chat-quote' + cls + '">' + escapeHtml(q) + '</div>';
+            continue;
+        }
+        if (/^\+?\s*Thought[:：]/i.test(trimmed)) {
+            closeTable(); closeList();
+            html += '<div class="chat-thought">' + escapeHtml(trimmed.replace(/^\+?\s*/, '')) + '</div>';
+            continue;
+        }
+        if (/^\[🤔 raciocínio/i.test(trimmed)) {
+            closeTable(); closeList();
+            html += '<div class="chat-thought">' + escapeHtml(trimmed) + '</div>';
+            continue;
+        }
+        const h = trimmed.match(/^(#{1,4})\s+(.+)$/);
+        if (h) {
+            closeTable(); closeList();
+            html += '<h' + (h[1].length + 1) + '>' + inline(escapeHtml(h[2])) + '</h' + (h[1].length + 1) + '>';
+            continue;
+        }
+        if (/^[-*]\s+/.test(trimmed)) {
+            closeTable();
+            if (listStack[listStack.length - 1] !== 'ul') { closeList(); html += '<ul>'; listStack.push('ul'); }
+            html += '<li>' + inline(escapeHtml(trimmed.replace(/^[-*]\s+/, ''))) + '</li>';
+            continue;
+        }
+        if (/^\d+\.\s+/.test(trimmed)) {
+            closeTable();
+            if (listStack[listStack.length - 1] !== 'ol') { closeList(); html += '<ol>'; listStack.push('ol'); }
+            html += '<li>' + inline(escapeHtml(trimmed.replace(/^\d+\.\s+/, ''))) + '</li>';
+            continue;
+        }
+        if (trimmed.startsWith('|') && trimmed.endsWith('|')) {
+            closeList();
+            const cells = trimmed.split('|').slice(1, -1).map(c => c.trim());
+            if (/^[-: ]+$/.test(cells[0] || '')) continue;
+            if (!inTable) { html += '<table>'; inTable = true; }
+            html += '<tr>' + cells.map(c => '<td>' + inline(escapeHtml(c)) + '</td>').join('') + '</tr>';
+            continue;
+        }
+        closeTable(); closeList();
+        html += '<div>' + inline(escapeHtml(trimmed)) + '</div>';
     }
-    return html;
+    flushCode();
+    closeList();
+    closeTable();
+    return linkifyFilePaths(html);
 }
 
 function linkifyFilePaths(html) {
@@ -8762,10 +8982,15 @@ var _logEntries = [];
 async function refreshLogs() {
     try {
         var res = await apiFetch('/api/logs?limit=100');
+        if (!res.ok) throw new Error('HTTP ' + res.status);
         var data = await res.json();
         _logEntries = data.logs || [];
         renderLogs();
-    } catch (e) {}
+        showToast('🔄 Logs atualizados (' + _logEntries.length + ' entradas)');
+    } catch (e) {
+        console.error('❌ Erro ao atualizar logs:', e);
+        showToast('⚠️ Falha ao atualizar logs: ' + e.message);
+    }
 }
 
 function renderLogs() {

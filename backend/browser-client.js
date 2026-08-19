@@ -1,6 +1,37 @@
+const { pathToFileURL } = require('url');
+const fs = require('fs');
+
+// O opencode usa browser real (Playwright) para ver o console e os erros de
+// runtime — é assim que ele "sabe" o que corrigir. O Aedificator tenta usar
+// Playwright; se não estiver instalado, cai para puppeteer-core com o
+// Chrome/Edge já presente no Windows, mantendo a IA com acesso ao browser.
 let chromium = null;
-try { chromium = require('playwright').chromium; } catch (e) {
-    console.log('🌐 Playwright não instalado. Execute: npm install playwright');
+let engine = null;
+try {
+    chromium = require('playwright').chromium;
+    engine = 'playwright';
+} catch (e) {
+    try {
+        const puppeteer = require('puppeteer-core');
+        chromium = puppeteer;
+        engine = 'puppeteer';
+    } catch (e2) {
+        console.log('⚠️ Browser não disponível: instale playwright ou puppeteer-core');
+    }
+}
+
+// Localiza um executável de Chrome/Edge no Windows para o puppeteer-core.
+function findBrowserExecutable() {
+    const candidates = [
+        process.env.PROGRAMFILES + '\\Google\\Chrome\\Application\\chrome.exe',
+        process.env['PROGRAMFILES(X86)'] + '\\Google\\Chrome\\Application\\chrome.exe',
+        process.env.LOCALAPPDATA + '\\Google\\Chrome\\Application\\chrome.exe',
+        process.env.PROGRAMFILES + '\\Microsoft\\Edge\\Application\\msedge.exe',
+        process.env['PROGRAMFILES(X86)'] + '\\Microsoft\\Edge\\Application\\msedge.exe',
+        process.env.LOCALAPPDATA + '\\Microsoft\\Edge\\Application\\msedge.exe'
+    ];
+    for (const c of candidates) { if (c && fs.existsSync(c)) return c; }
+    return null;
 }
 
 class BrowserClient {
@@ -12,11 +43,21 @@ class BrowserClient {
     }
 
     async ensureBrowser() {
-        if (!chromium) throw new Error('Playwright não instalado');
-        if (this.browser && this.browser.isConnected()) return;
+        if (!chromium) throw new Error('Browser não instalado (playwright/puppeteer-core)');
+        // puppeteer-core não expõe isConnected() como o Playwright
+        const isAlive = this.browser && (typeof this.browser.isConnected === 'function' ? this.browser.isConnected() : true);
+        if (isAlive && this.page) return;
+        if (this.browser) { try { await this.browser.close(); } catch (e) {} }
         try {
-            this.browser = await chromium.launch({ headless: true });
-            this.page = await this.browser.newPage();
+            if (engine === 'puppeteer') {
+                const exe = findBrowserExecutable();
+                if (!exe) throw new Error('Nenhum Chrome/Edge encontrado no sistema');
+                this.browser = await chromium.launch({ executablePath: exe, headless: true, args: ['--no-sandbox'] });
+                this.page = await this.browser.newPage();
+            } else {
+                this.browser = await chromium.launch({ headless: true });
+                this.page = await this.browser.newPage();
+            }
             this.consoleLogs = [];
             this.page.on('console', (msg) => {
                 this.consoleLogs.push(`[${msg.type()}] ${msg.text()}`);
@@ -26,7 +67,7 @@ class BrowserClient {
                 this.consoleLogs.push(`[error] ${err.message}`);
             });
             this.connected = true;
-            console.log('🌐 Browser Playwright conectado');
+            console.log('🌐 Browser conectado (' + engine + ')');
         } catch (e) {
             console.error('🌐 Browser não disponível:', e.message);
             this.connected = false;
@@ -61,7 +102,12 @@ class BrowserClient {
         await this.ensureBrowser();
         if (!this.page) throw new Error('Browser não disponível');
         await this.page.waitForSelector(selector, { timeout: 5000 });
-        await this.page.fill(selector, text);
+        if (engine === 'puppeteer') {
+            await this.page.click(selector, { clickCount: 3 });
+            await this.page.type(selector, text);
+        } else {
+            await this.page.fill(selector, text);
+        }
         return 'Digitado em ' + selector;
     }
 

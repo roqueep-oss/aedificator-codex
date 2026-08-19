@@ -135,12 +135,11 @@ async function downloadFile(remotePath, localPath) {
     });
 }
 
-async function deployProject(remoteDir) {
+async function deployProject(remoteDir, localDir) {
     if (!activeConnection) throw new Error('Nenhuma conexão remota ativa');
-    if (!process.env.PROJECT_ROOT) throw new Error('Nenhum projeto local aberto');
+    if (!localDir) throw new Error('Nenhum projeto local aberto');
     // Use rsync or scp -r
     const { host, user } = activeConnection;
-    const localDir = process.env.PROJECT_ROOT || process.cwd();
     const args = [...buildSshArgs(activeConnection), '-r', localDir + '/', `${user}@${host}:${remoteDir}/`];
     return new Promise((resolve, reject) => {
         const child = spawn('scp', args, { windowsHide: true, stdio: ['ignore', 'pipe', 'pipe'] });

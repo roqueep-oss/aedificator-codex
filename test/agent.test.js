@@ -152,3 +152,23 @@ test('exec_command: executa no diretório correto do projeto', async () => {
     const result = await executeAgentTool('exec_command', { comando: `echo ${marker}` });
     assert.ok(result.includes(marker), 'Deve executar e retornar a saída');
 });
+
+test('exec_command: bloqueia encadeamento de comandos', async () => {
+    const result = await executeAgentTool('exec_command', { comando: 'echo a && whoami' });
+    assert.ok(result.includes('Erro'), 'Deve bloquear encadeamento com &&');
+});
+
+test('exec_command: bloqueia separador de comandos', async () => {
+    const result = await executeAgentTool('exec_command', { comando: 'echo a; whoami' });
+    assert.ok(result.includes('Erro'), 'Deve bloquear separador ;');
+});
+
+test('exec_command: bloqueia redirecionamento', async () => {
+    const result = await executeAgentTool('exec_command', { comando: 'echo a > out.txt' });
+    assert.ok(result.includes('Erro'), 'Deve bloquear redirecionamento');
+});
+
+test('list_files: bloqueia caminho fora do projeto', async () => {
+    const result = await executeAgentTool('list_files', { diretorio: '../../../etc/passwd' });
+    assert.ok(result.includes('Erro'), 'Deve bloquear listagem fora do projeto');
+});

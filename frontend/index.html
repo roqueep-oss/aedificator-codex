@@ -495,6 +495,48 @@
             font-size: 12px;
         }
 
+        /* ===== DETALHE DA ATIVIDADE (BASE DO PAINEL) ===== */
+        .activity-detail {
+            display: none;
+            flex-direction: column;
+            flex-shrink: 0;
+            max-height: 220px;
+            border-top: 1px solid #30363d;
+            background: #0d1117;
+        }
+        .activity-detail.open { display: flex; }
+        .activity-detail-header {
+            display: flex;
+            align-items: center;
+            justify-content: space-between;
+            padding: 4px 10px;
+            font-size: 11px;
+            font-weight: 600;
+            color: #8b949e;
+            background: #161b22;
+            border-bottom: 1px solid #21262d;
+        }
+        .activity-detail-header .btn-theme {
+            background: transparent;
+            border: none;
+            color: #8b949e;
+            font-size: 12px;
+            cursor: pointer;
+            padding: 0 4px;
+        }
+        #activityDetailCode {
+            flex: 1;
+            margin: 0;
+            padding: 8px 10px;
+            overflow-y: auto;
+            font-family: 'Consolas', 'Courier New', monospace;
+            font-size: 11px;
+            line-height: 1.5;
+            color: #c9d1d9;
+            white-space: pre;
+            background: #0d1117;
+        }
+
         .wf-pipeline {
             display: flex;
             flex-direction: column;
@@ -1092,6 +1134,70 @@
             padding: 2px 8px;
         }
         .msg-copy-btn:hover { color: #e6edf3; background: #30363d; border-color: #58a6ff; }
+
+        /* ===== Estilo opencode no chat ===== */
+        .msg-content .chat-quote {
+            background: rgba(22, 27, 34, 0.6);
+            border-left: 3px solid #30363d;
+            padding: 4px 8px;
+            margin: 3px 0;
+            border-radius: 0 4px 4px 0;
+            font-family: 'Consolas', 'Courier New', monospace;
+            font-size: 11px;
+            color: #8b949e;
+            white-space: pre-wrap;
+            word-break: break-word;
+        }
+        .msg-content .chat-quote.tool-call { border-left-color: #58a6ff; color: #c9d1d9; }
+        .msg-content .chat-quote.tool-result { border-left-color: #3fb950; }
+        .msg-content .chat-quote.tool-error { border-left-color: #f85149; color: #f85149; }
+        .msg-content .chat-thought {
+            color: #6e7681;
+            font-size: 11px;
+            font-style: italic;
+            margin: 3px 0;
+            padding: 2px 0 2px 20px;
+            position: relative;
+        }
+        .msg-content .chat-thought::before { content: '💭'; position: absolute; left: 0; }
+        .msg-content table {
+            border-collapse: collapse;
+            margin: 6px 0;
+            font-size: 12px;
+            width: 100%;
+        }
+        .msg-content table td {
+            border: 1px solid #30363d;
+            padding: 3px 8px;
+        }
+        .msg-content ul, .msg-content ol { margin: 4px 0 4px 18px; }
+        .msg-content h2, .msg-content h3, .msg-content h4 { margin: 8px 0 4px; color: #e6edf3; }
+        .msg-content pre { margin: 6px 0; }
+
+        .agent-status-chip {
+            display: inline-flex;
+            align-items: center;
+            gap: 5px;
+            background: rgba(31, 111, 235, 0.12);
+            border: 1px solid #30363d;
+            color: #8b949e;
+            padding: 2px 10px;
+            border-radius: 12px;
+            font-size: 10px;
+            margin-left: auto;
+            white-space: nowrap;
+        }
+        .agent-status-chip.thinking { color: #58a6ff; border-color: #58a6ff; }
+        .agent-status-chip.building { color: #f0883e; border-color: #f0883e; }
+        .agent-status-chip.testing { color: #d29922; border-color: #d29922; }
+        .agent-status-chip.done { color: #3fb950; border-color: #3fb950; }
+        .agent-status-chip.error { color: #f85149; border-color: #f85149; }
+        .agent-status-chip .chip-dot {
+            width: 7px; height: 7px; border-radius: 50%;
+            background: currentColor;
+            animation: chip-pulse 1.2s ease-in-out infinite;
+        }
+        @keyframes chip-pulse { 0%, 100% { opacity: 1; } 50% { opacity: 0.3; } }
 
         .sugestao-btn:hover { background: #30363d !important; border-color: #58a6ff !important; }
 
@@ -3230,6 +3336,34 @@ body.theme-light .chat-area,
         }
     </style>
     <script>
+    // O app deve ser servido pelo backend (http://localhost:3001). Se alguém
+    // abrir o index.html direto pelo arquivo (file://), tenta redirecionar
+    // automaticamente para o endereço correto. Se o backend não estiver no ar,
+    // mostra uma mensagem explicando como abrir.
+    if (window.location.protocol === 'file:') {
+        var _showFileHint = function() {
+            document.addEventListener('DOMContentLoaded', function() {
+                document.body.innerHTML =
+                    '<div style="display:flex;align-items:center;justify-content:center;height:100vh;background:#0d1117;color:#e6edf3;font-family:Segoe UI,sans-serif;flex-direction:column;gap:16px;text-align:center;padding:20px;">' +
+                    '<h2 style="margin:0;">⚠️ Abra o app pelo endereço correto</h2>' +
+                    '<p style="max-width:480px;font-size:14px;color:#8b949e;">Este arquivo precisa ser servido pelo backend do Aedificator. Rode o <code>iniciar-app.bat</code> ou abra o endereço abaixo:</p>' +
+                    '<a href="http://localhost:3001/" style="color:#58a6ff;font-size:20px;font-weight:bold;">http://localhost:3001/</a>' +
+                    '<p style="font-size:12px;color:#8b949e;">O backend inicia com o comando: <code>node backend/server.js</code></p>' +
+                    '</div>';
+            });
+        };
+        try {
+            var xhr = new XMLHttpRequest();
+            xhr.open('GET', 'http://localhost:3001/api/health', true);
+            xhr.timeout = 3000;
+            xhr.onload = function() { window.location.replace('http://localhost:3001/'); };
+            xhr.onerror = _showFileHint;
+            xhr.ontimeout = _showFileHint;
+            xhr.send();
+        } catch (e) { _showFileHint(); }
+        throw new Error('App aberto via file:// — tentando redirecionar para http://localhost:3001');
+    }
+
     // STUBS GARANTIDOS — executam antes do script.js carregar
     window._API = 'http://localhost:3001';
 
@@ -3505,6 +3639,13 @@ body.theme-light .chat-area,
             <div id="terminalView">
                 <div class="term-output" id="terminalOutput"></div>
             </div>
+            <div id="activityDetail" class="activity-detail">
+                <div class="activity-detail-header">
+                    <span id="activityDetailTitle">📄 Detalhes do arquivo</span>
+                    <button class="btn-theme" title="Fechar" onclick="document.getElementById('activityDetail').classList.remove('open')">✕</button>
+                </div>
+                <pre id="activityDetailCode">—</pre>
+            </div>
         </div>
 
         <!-- ===== DIVISOR DIREITO ===== -->
@@ -3539,6 +3680,7 @@ body.theme-light .chat-area,
             </div>
 
             <div class="input-area">
+                <span class="agent-status-chip" id="agentStatusChip" style="display:none;margin:0 0 4px;"><span class="chip-dot"></span><span id="agentStatusChipText">🤖 IA trabalhando</span></span>
                 <div class="input-row">
                     <input type="text" id="chatInput" placeholder="Digite seu comando... (@ para referenciar arquivos)">
                     <div class="autocomplete-dropdown" id="autocompleteDropdown"></div>

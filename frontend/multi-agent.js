@@ -1,7 +1,7 @@
 // =============================================
 //  MULTI-AGENTE — agentes paralelos com estado isolado
 // =============================================
-/* global sendStreamingMessage, endTask, WS_URL, handleWsMessage, isStreaming, agentMessages, agentDivIds, agentCounter, pendingApproval, BACKEND_URL */
+/* global sendStreamingMessage, endTask, WS_URL, handleWsMessage, isStreaming, agentMessages, agentDivIds, agentCounter, pendingApproval, BACKEND_URL, BACKEND_TOKEN */
 (function() {
     function AgentSession(id, label) {
         this.id = id;
@@ -47,6 +47,7 @@
         var s = sessions[activeId];
         if (!s) return;
         if (msg.type === 'execute' || msg.type === 'stream') s.taskActive = true;
+        if (msg && typeof msg === 'object' && !msg.token && typeof BACKEND_TOKEN !== 'undefined') msg.token = BACKEND_TOKEN;
         if (!s.ws || s.ws.readyState !== WebSocket.OPEN) {
             s.ws = new WebSocket(WS_URL);
             s.ws.onopen = function() { s.ws.send(JSON.stringify(msg)); };
@@ -195,7 +196,9 @@
 (function() {
     setTimeout(function() {
         if (typeof BACKEND_URL === 'undefined') return;
-        fetch(BACKEND_URL + '/api/browser/status')
+        var h = { 'Content-Type': 'application/json' };
+        if (typeof BACKEND_TOKEN !== 'undefined' && BACKEND_TOKEN) h['Authorization'] = 'Bearer ' + BACKEND_TOKEN;
+        fetch(BACKEND_URL + '/api/browser/status', { headers: h })
             .then(function(r) { return r.json(); })
             .then(function(d) { console.log('\uD83C\uDF10 Browser:', d.connected ? 'Playwright OK' : 'n\u00E3o dispon\u00EDvel'); })
             .catch(function() {});

@@ -6,6 +6,7 @@ param(
 $ErrorActionPreference = 'Stop'
 $repoRoot = (Resolve-Path (Join-Path $PSScriptRoot '..')).Path
 $base = "http://127.0.0.1:$Port"
+$token = 'e2e-test-token'
 
 $work = Join-Path $env:TEMP ("aedificator-e2e-" + (Get-Date -Format 'yyyyMMdd-HHmmss'))
 New-Item -ItemType Directory -Force -Path $work | Out-Null
@@ -13,7 +14,7 @@ New-Item -ItemType Directory -Force -Path $work | Out-Null
 function Test-Request {
     param([string]$Method, [string]$Url, [object]$Body = $null)
     try {
-        $params = @{ Method = $Method; Uri = $Url; TimeoutSec = 15 }
+        $params = @{ Method = $Method; Uri = $Url; TimeoutSec = 15; Headers = @{ Authorization = "Bearer $token" } }
         if ($null -ne $Body) {
             $params.ContentType = 'application/json'
             $params.Body = ($Body | ConvertTo-Json -Depth 8 -Compress)
@@ -49,7 +50,7 @@ try {
     Write-Host "==> Subindo servidor (cwd=$copy, PROJECT_ROOT=$testRepo)" -ForegroundColor Cyan
     $env:PORT = "$Port"
     $env:PROJECT_ROOT = $testRepo
-    $env:BACKEND_TOKEN = ''
+    $env:BACKEND_TOKEN = $token
     $server = Start-Process -FilePath 'node' -ArgumentList 'backend/server.js' -WorkingDirectory $copy `
         -RedirectStandardOutput (Join-Path $work 'srv.log') `
         -RedirectStandardError (Join-Path $work 'srv.err.log') -PassThru -WindowStyle Hidden
@@ -58,7 +59,7 @@ try {
     for ($i = 0; $i -lt 50; $i++) {
         Start-Sleep -Milliseconds 200
         if ($server.HasExited) { break }
-        try { $null = Invoke-RestMethod -Uri "$base/api/health" -TimeoutSec 2; $ready = $true; break } catch { }
+        try { $null = Invoke-RestMethod -Uri "$base/api/health" -Headers @{ Authorization = "Bearer $token" } -TimeoutSec 2; $ready = $true; break } catch { }
     }
     if (-not $ready) {
         Write-Host "FALHA: servidor nao subiu. Erro:" -ForegroundColor Red

@@ -55,7 +55,7 @@ function getOrCreateBackendSecret() {
 // BACKEND_PROTOCOL_VERSION em backend/server.js). Um backend desatualizado
 // rodando na porta seria reutilizado pelo isBackendRunning e continuaria com
 // bugs já corrigidos no código atual.
-const BACKEND_PROTOCOL_VERSION = '3';
+const BACKEND_PROTOCOL_VERSION = '4';
 
 // ===== FUNÇÃO PARA VERIFICAR SE O BACKEND ESTÁ RODANDO =====
 function isBackendRunning() {
@@ -79,12 +79,28 @@ function isBackendRunning() {
 // apenas o processo que roda server.js na porta (evita matar processo alheio).
 async function isBackendCurrent() {
     try {
-        const res = await fetch(`http://127.0.0.1:${BACKEND_PORT}/api/health`);
+        const res = await fetch(`http://127.0.0.1:${BACKEND_PORT}/api/health`, {
+            headers: { 'Authorization': `Bearer ${BACKEND_TOKEN}` }
+        });
         const data = await res.json();
         return data.version === BACKEND_PROTOCOL_VERSION;
     } catch (e) {
         return false;
     }
+}
+
+function getProcessCommandLine(pid) {
+    return new Promise((resolve) => {
+        try {
+            const wmic = require('child_process').execSync(`wmic process where processid=${pid} get commandline /value`, { encoding: 'utf-8', windowsHide: true });
+            if (wmic) return resolve(String(wmic));
+        } catch (e) {}
+        // Fallback para Windows 11 24H2+ onde o WMIC foi removido
+        try {
+            const ps = require('child_process').execSync(`powershell -NoProfile -Command "Get-CimInstance Win32_Process -Filter 'ProcessId=${pid}' | Select-Object -ExpandProperty CommandLine"`, { encoding: 'utf-8', windowsHide: true });
+            return resolve(String(ps));
+        } catch (e) { resolve(''); }
+    });
 }
 
 function killProcessOnPort(port) {
@@ -101,12 +117,13 @@ function killProcessOnPort(port) {
             if (process.platform === 'win32') {
                 // Só mata se a linha do netstat pertencer a um node/server.js
                 const { execSync } = require('child_process');
-                try {
-                    const wmic = execSync(`wmic process where processid=${pid} get commandline /value`, { encoding: 'utf-8', windowsHide: true });
-                    if (!/server\.js/i.test(wmic)) return resolve(false);
-                    execSync(`taskkill /F /PID ${pid} /T`, { stdio: 'ignore' });
-                    return resolve(true);
-                } catch (e) { return resolve(false); }
+                getProcessCommandLine(pid).then((cmdline) => {
+                    if (!/server\.js/i.test(cmdline)) return resolve(false);
+                    try {
+                        execSync(`taskkill /F /PID ${pid} /T`, { stdio: 'ignore' });
+                        resolve(true);
+                    } catch (e) { resolve(false); }
+                });
             } else {
                 try { process.kill(pid, 'SIGKILL'); return resolve(true); } catch (e) { return resolve(false); }
             }
@@ -482,6 +499,10 @@ app.on('activate', () => {
 
 process.on('uncaughtException', (error) => {
     console.error('❌ Erro não tratado:', error);
+});
+
+process.on('unhandledRejection', (reason) => {
+    console.error('❌ Rejeição não tratada:', reason);
 });
 
 console.log('🏗️ Aedificator Codex IDE aguardando eventos...');

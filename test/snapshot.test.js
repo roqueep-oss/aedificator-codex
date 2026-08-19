@@ -7,6 +7,7 @@ const os = require('os');
 const net = require('net');
 
 const PORT = 3998;
+const TOKEN = 'snapshot-test-token';
 const BASE = `http://127.0.0.1:${PORT}`;
 const SERVER_PATH = path.join(__dirname, '..', 'backend', 'server.js');
 
@@ -16,7 +17,7 @@ function startServer() {
     fs.mkdirSync(path.join(projectRoot, 'sub'));
     fs.writeFileSync(path.join(projectRoot, 'sub', 'b.txt'), 'conteudo B');
     const child = spawn(process.execPath, [SERVER_PATH], {
-        env: { ...process.env, PORT: String(PORT), BACKEND_TOKEN: '', PROJECT_ROOT: projectRoot },
+        env: { ...process.env, PORT: String(PORT), BACKEND_TOKEN: TOKEN, PROJECT_ROOT: projectRoot },
         stdio: ['ignore', 'pipe', 'pipe']
     });
     child.stderr.on('data', () => {});
@@ -51,7 +52,7 @@ function waitForPort(t = 10000) {
         tryc();
     });
 }
-function post(url, body) { return fetch(BASE + url, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body) }); }
+function post(url, body) { return fetch(BASE + url, { method: 'POST', headers: { 'Content-Type': 'application/json', 'Authorization': `Bearer ${TOKEN}` }, body: JSON.stringify(body) }); }
 
 test('snapshot: criar, listar, diff e restaurar', async (t) => {
     const { child, projectRoot } = startServer();
