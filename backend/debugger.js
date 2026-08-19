@@ -165,6 +165,7 @@ function startDebug({ file, breakpoints, onEvent }) {
 
         let wsUrl = null;
         let stderrBuf = '';
+        let connected = false;
         let settled = false;
         const finish = (err, result) => {
             if (settled) return;
@@ -184,7 +185,7 @@ function startDebug({ file, breakpoints, onEvent }) {
         child.stderr.on('data', (d) => {
             stderrBuf += d.toString('utf8');
             const m = /ws:\/\/127\.0\.0\.1:\d+\/[a-zA-Z0-9-]+/.exec(stderrBuf);
-            if (m) {
+            if (m && !connected) {
                 wsUrl = m[0];
                 connect();
             }
@@ -205,9 +206,16 @@ function startDebug({ file, breakpoints, onEvent }) {
                 session = null;
                 broadcast(onEvent, 'debug-ended', { code: code === null ? -1 : code });
             }
+            // Se o processo encerrou sem conectar no WebSocket do depurador, a
+            // Promise ficaria pendente para sempre — resolve com erro em vez disso.
+            if (!settled) {
+                finish(new Error('Node encerrou antes de conectar no depurador (código ' + (code === null ? -1 : code) + ')'));
+            }
         });
 
         function connect() {
+            if (connected) return;
+            connected = true;
             let sock;
             try {
                 sock = new WebSocket(wsUrl);

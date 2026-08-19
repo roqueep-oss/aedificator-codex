@@ -4152,8 +4152,8 @@ MÉTODO (siga esta ordem):
 4. Use read_file APENAS nos arquivos que você tem certeza que vai modificar
 5. Máximo 2 iterações. Retorne um resumo do que encontrou e quais arquivos modificar`;
 
+    let explorationLog = '';
     try {
-        let explorationLog = '';
         let conversationHistory = [{ role: 'user', content: explorationPrompt }];
 
         for (let iteration = 0; iteration < 2; iteration++) {  
@@ -4208,7 +4208,7 @@ MÉTODO (siga esta ordem):
                         result = `Erro: ${e.message}`;
                     }
 
-                    toolResults.push({ tool_call_id: tc.id, role: 'tool', content: truncateToolResult(toolName, result) });
+                    toolResults.push({ tool_call_id: tc.id, role: 'tool', name: toolName, content: truncateToolResult(toolName, result) });
                 }
             }
 
@@ -4221,7 +4221,8 @@ MÉTODO (siga esta ordem):
 
         return explorationLog.slice(0, 12000);
     } catch (e) {
-        return '';
+        // Mantém o que já foi explorado (o catch anterior descartava tudo).
+        return explorationLog.slice(0, 12000);
     }
 }
 
@@ -4232,7 +4233,7 @@ async function callGeminiWithTools(messages, tools, signal) {
 
     const systemMsg = messages[0]?.role === 'user' ? messages[0].content : '';
     const contents = messages.map((m, idx) => {
-        if (m.role === 'tool') return { role: 'tool', parts: [{ text: m.content }] };
+        if (m.role === 'tool') return { role: 'user', parts: [{ functionResponse: { name: m.name || 'tool', response: { result: String(m.content || '') } } }] };
         if (m.role === 'assistant') return { role: 'model', parts: [{ text: m.content || '' }] };
         const userParts = [{ text: m.content }];
         if (idx === 0 && _pendingImages && _pendingImages.length) {
@@ -6183,7 +6184,9 @@ app.post('/api/search', (req, res) => {
         if (useRegex) {
             const flags = caseSensitive ? 'g' : 'gi';
             const re = new RegExp(q, flags);
-            testFn = (str) => re.test(str);
+            // Regex global é stateful (guarda lastIndex entre test()): resetar
+            // a cada chamada, senão ocorrências alternadas são puladas.
+            testFn = (str) => { re.lastIndex = 0; return re.test(str); };
         } else if (caseSensitive) {
             testFn = (str) => str.includes(q);
         } else {
@@ -6275,11 +6278,11 @@ app.post('/api/replace', (req, res) => {
             }
             const relPath = rel ? `${rel}/${entry.name}` : entry.name;
             count.n++;
-            if (isBinaryExtension(entry.name)) return;
+            if (isBinaryExtension(entry.name)) continue;
             
             const full = path.join(dir, entry.name);
             try {
-                if (fs.statSync(full).size > 2 * 1024 * 1024) return;
+                if (fs.statSync(full).size > 2 * 1024 * 1024) continue;
                 const content = fs.readFileSync(full, 'utf-8');
                 if (content.includes('\u0000')) return;
                 
@@ -6374,11 +6377,11 @@ app.post('/api/replace/preview', (req, res) => {
             }
             const relPath = rel ? `${rel}/${entry.name}` : entry.name;
             count.n++;
-            if (isBinaryExtension(entry.name)) return;
+            if (isBinaryExtension(entry.name)) continue;
 
             const full = path.join(dir, entry.name);
             try {
-                if (fs.statSync(full).size > 2 * 1024 * 1024) return;
+                if (fs.statSync(full).size > 2 * 1024 * 1024) continue;
                 const content = fs.readFileSync(full, 'utf-8');
                 if (content.includes('\u0000')) return;
 
@@ -6774,7 +6777,10 @@ app.post('/api/project/build', async (req, res) => {
     const { command, args } = req.body || {};
     if (!command) return res.status(400).json({ error: 'Comando não especificado' });
     try {
-        const result = await runner.runCommand({ command, args: args || [], cwd: PROJECT_ROOT, timeoutMs: 120000 });
+        // runner.runCommand não aceita "args" separado — monta o comando completo,
+        // cotando argumentos com espaço para preservar a semântica de shell.
+        const fullCmd = [command, ...(args || []).map(a => /\s/.test(String(a)) ? `"${a}"` : String(a))].join(' ');
+        const result = await runner.runCommand({ command: fullCmd, cwd: PROJECT_ROOT, timeoutMs: 120000 });
         res.json({ success: true, output: result.stdout || result.stderr, code: result.code });
     } catch (e) { res.status(500).json({ error: e.message }); }
 });
@@ -7138,10 +7144,17 @@ function parseTestOutput(output) {
             continue;
         }
 
-        const suiteEnd = trimmed.match(/^✔\s+.+\s+\(([\d.]+)ms\)$/);
+        // Fim de suite: "✔ <nome> (ms)". Só é fim de suite se o nome corresponder
+        // a uma suite realmente aberta — senão a linha é um teste passando (que
+        // deve cair no passMatch abaixo, e não ser descartado/popado indevidamente).
+        const suiteEnd = trimmed.match(/^✔\s+(.+?)\s+\(([\d.]+)ms\)$/);
         if (suiteEnd && suiteStack.length > 1) {
-            suiteStack.pop();
-            continue;
+            const endName = suiteEnd[1].trim();
+            if (suiteStack.some(s => s.name === endName)) {
+                while (suiteStack.length > 1 && suiteStack[suiteStack.length - 1].name !== endName) suiteStack.pop();
+                if (suiteStack.length > 1) suiteStack.pop();
+                continue;
+            }
         }
 
         const passMatch = trimmed.match(/^([✔✓])\s+(.+?)(?:\s+\(([\d.]+)ms\))?$/);
@@ -7728,7 +7741,16 @@ wss.on('connection', (ws, req) => {
         if (data.type === 'cancel') {
             clearTaskWatchdog();
             killAllChildProcesses();
-            const restored = restoreProjectSnapshot();
+            let restored = { count: 0, files: [] };
+            // Só restaura o snapshot se houver uma tarefa ativa DESTA conexão.
+            // Sem isso, um 'cancel' enviado após a tarefa concluída (ou de outra
+            // aba) reverteria o projeto inteiro, apagando trabalho já confirmado.
+            if (ws._taskActive) {
+                restored = restoreProjectSnapshot();
+            } else {
+                _lastProjectSnapshot = null;
+                _lastProjectFileList = null;
+            }
             const restoredCount = restored.count;
             if (streamController) {
                 streamController.abort();
@@ -7779,6 +7801,7 @@ wss.on('connection', (ws, req) => {
             const onChunk = buildWsOnChunk(ws);
 
             setAgentStreamCallback(onChunk);
+            ws._taskActive = true;
 
             try {
                 _lastProjectSnapshot = snapshotProjectContents();
@@ -7829,9 +7852,14 @@ wss.on('connection', (ws, req) => {
 
                     let agentResult = '';
                     if (provider === 'opencode') {
-                        await callOpenCode(agentTaskWithCtx, (chunk) => {
-                            agentResult += chunk;
-                            if (onChunk) onChunk('Assistente', chunk);
+                        await callOpenCode(agentTaskWithCtx, (agent, text) => {
+                            const chunk = (text !== undefined && text !== null) ? text : (agent || '');
+                            if (agent === 'Sistema' || agent === 'error') {
+                                if (onChunk) onChunk('Sistema', chunk);
+                            } else {
+                                agentResult += chunk;
+                                if (onChunk) onChunk('Assistente', chunk);
+                            }
                         }, streamController.signal, null, (toolEvent) => {
                             if (onChunk) onChunk('activity', JSON.stringify(toolEvent));
                         });
@@ -7873,9 +7901,14 @@ wss.on('connection', (ws, req) => {
                     const beforeContents = snapshotProjectContents();
                     const before = snapshotProjectFiles();
                     let ocFullResponse = '';
-                    await callOpenCode(openPrompt, (chunk) => {
-                        ocFullResponse += chunk;
-                        if (onChunk) onChunk('Assistente', chunk);
+                    await callOpenCode(openPrompt, (agent, text) => {
+                        const chunk = (text !== undefined && text !== null) ? text : (agent || '');
+                        if (agent === 'Sistema' || agent === 'error') {
+                            if (onChunk) onChunk('Sistema', chunk);
+                        } else {
+                            ocFullResponse += chunk;
+                            if (onChunk) onChunk('Assistente', chunk);
+                        }
                     }, streamController.signal, null, (toolEvent) => {
                         if (onChunk) onChunk('activity', JSON.stringify(toolEvent));
                     });
@@ -8162,6 +8195,14 @@ wss.on('connection', (ws, req) => {
                     }
                 }
                 ws.send(JSON.stringify({ type, content }));
+            } finally {
+                // A tarefa terminou (com sucesso, erro ou cancelamento). Libera a
+                // atividade da conexão e descarta o snapshot de rollback, para que
+                // um 'cancel' posterior (ou de outra aba) não reverta trabalho já
+                // confirmado.
+                ws._taskActive = false;
+                _lastProjectSnapshot = null;
+                _lastProjectFileList = null;
             }
             return;
         }
@@ -8191,6 +8232,7 @@ wss.on('connection', (ws, req) => {
             }
 
             setAgentStreamCallback(onChunk);
+            ws._taskActive = true;
 
             try {
                 _lastProjectSnapshot = snapshotProjectContents();
@@ -8217,8 +8259,13 @@ wss.on('connection', (ws, req) => {
                             const implPrompt = hasCustom
                                 ? `Solicitação do usuário: "${data.customRequest}"\n\nSolicitação original: "${task}"\n\nImplemente diretamente nos arquivos do projeto.`
                                 : `Solicitação original: "${task}"\n\nOpção escolhida: ${selTitles}\nDescrição: ${selDescs}\n\nImplemente esta opção diretamente nos arquivos do projeto.`;
-                            await callOpenCode(implPrompt, (chunk) => {
-                                if (onChunk) onChunk('Assistente', chunk);
+                            await callOpenCode(implPrompt, (agent, text) => {
+                                const chunk = (text !== undefined && text !== null) ? text : (agent || '');
+                                if (agent === 'Sistema' || agent === 'error') {
+                                    if (onChunk) onChunk('Sistema', chunk);
+                                } else {
+                                    if (onChunk) onChunk('Assistente', chunk);
+                                }
                             }, controller.signal, null, (toolEvent) => {
                                 if (onChunk) onChunk('activity', JSON.stringify(toolEvent));
                             });
@@ -8274,6 +8321,17 @@ wss.on('connection', (ws, req) => {
                                 }
                                 filesToExecute = agentImplChanges.map(c => ({ caminho: c.file, acao: c.action }));
                                 plan.resumo = agentImplResult ? agentImplResult.slice(0, 200) : 'Agente concluído';
+                                // O agente já aplicou as alterações em disco. Envia o
+                                // resultado e encerra AQUI — não cai no executePlan, que
+                                // re-escreveria os arquivos com conteudo undefined e
+                                // exibiria status "❌ normal" falsos.
+                                const modFilesAgent = agentImplChanges.filter(c => c.action !== 'deletar').map(c => c.file);
+                                if (modFilesAgent.length) {
+                                    const diagResult = await runPostExecutionDiagnostics(modFilesAgent, plan.resumo);
+                                    if (diagResult && diagResult.rolledBack) ws.send(JSON.stringify({ type: 'rollback', message: 'Alteracoes revertidas devido a erros' }));
+                                }
+                                ws.send(JSON.stringify({ type: 'done', summary: plan.resumo, modifiedFiles: modFilesAgent, command: task }));
+                                return;
                             } else {
                                 if (onChunk) onChunk('Sistema', '⚠️ O agente analisou mas não alterou nenhum arquivo. Seja mais específico ou use a opção "Personalizado".\n');
                                 ws.send(JSON.stringify({ type: 'done', summary: 'Nenhum arquivo alterado — o agente analisou mas não implementou. Seja mais específico ou use "Personalizado".', command: task }));
@@ -8304,6 +8362,9 @@ wss.on('connection', (ws, req) => {
             } finally {
                 clearTaskWatchdog();
                 streamController = null;
+                ws._taskActive = false;
+                _lastProjectSnapshot = null;
+                _lastProjectFileList = null;
             }
         }
     });
@@ -8317,6 +8378,9 @@ wss.on('connection', (ws, req) => {
             streamController = null;
         }
         pendingPlan = null;
+        ws._taskActive = false;
+        _lastProjectSnapshot = null;
+        _lastProjectFileList = null;
     });
 });
 

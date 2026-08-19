@@ -1306,6 +1306,10 @@ function handleWsMessage(data) {
     }
 
     if (data.type === 'approval') {
+        // Prompt interativo: o backend está aguardando o usuário, não "mudo".
+        // Renova a atividade para o watchdog de silêncio não concluir a tarefa
+        // enquanto o usuário decide.
+        lastBackendActivity = Date.now();
         updatePipeline('plan', 'done', (data.total || 0) + ' item(ns)');
         if (showApprovalModal(data)) {
             finishAnalysisActivity(true);
@@ -1318,12 +1322,14 @@ function handleWsMessage(data) {
 
     if (data.type === 'permission') {
         clearStreamTimeout();
+        lastBackendActivity = Date.now();
         showPermissionPrompt(data);
         return;
     }
 
     if (data.type === 'question') {
         clearStreamTimeout();
+        lastBackendActivity = Date.now();
         showQuestionPrompt(data);
         return;
     }
@@ -2301,7 +2307,7 @@ async function deleteFilePrompt(filePath, name) {
 // =============================================
 async function saveFileEditor() {
     const tab = editorTabs.find(t => t.path === activeTabPath);
-    if (!tab || tab.isImage) return;
+    if (!tab || tab.isImage) return false;
     let content = getEditorContent();
     const statusEl = document.getElementById('fileEditorStatus');
 
@@ -2325,13 +2331,16 @@ async function saveFileEditor() {
             setFileStatus(tab.path, 'modified');
             showToast('✅ Arquivo salvo: ' + tab.path);
             reactToSavedFile(tab.path);
+            return true;
         } else {
             statusEl.textContent = '❌ ' + (data.error || 'Falha ao salvar');
             statusEl.className = 'error';
+            return false;
         }
     } catch (e) {
         statusEl.textContent = '❌ ' + e.message;
         statusEl.className = 'error';
+        return false;
     }
 }
 
@@ -3281,6 +3290,10 @@ function executeSlashCommand(commandLine) {
     const arg = firstSpace === -1 ? '' : trimmed.substring(firstSpace + 1).trim();
 
     switch (cmd) {
+        case '/run':
+            // /run sem argumentos: avisa em vez de perder a mensagem em silêncio.
+            showToast('⚠️ Uso: /run <comando>');
+            return true;
         case '/clear':
             clearChat();
             return true;
@@ -4491,6 +4504,7 @@ function showPermissionPrompt(data) {
     document.body.appendChild(overlay);
     const respond = function(allow, always) {
         overlay.remove();
+        lastBackendActivity = Date.now();
         sendStreamingMessage({ type: 'interaction-response', id: data.id, value: { allow, always } });
         resetStreamTimeout();
     };
@@ -4517,6 +4531,7 @@ function showQuestionPrompt(data) {
     const input = box.querySelector('#questionAnswerInput');
     const respond = function(value) {
         overlay.remove();
+        lastBackendActivity = Date.now();
         sendStreamingMessage({ type: 'interaction-response', id: data.id, value });
         resetStreamTimeout();
     };
@@ -4964,6 +4979,7 @@ function sendMessage() {
     closeApprovalModal();
     taskConcluded = false;
     concludedTaskFiles = [];
+    window._lastDiagnosticsErrors = [];
     if (concludeTimer) { clearTimeout(concludeTimer); concludeTimer = null; }
     if (noProgressTimer) { clearTimeout(noProgressTimer); noProgressTimer = null; }
     armMaxTaskTimer();
@@ -6632,7 +6648,8 @@ function renderChatContent(text) {
         const h = trimmed.match(/^(#{1,4})\s+(.+)$/);
         if (h) {
             closeTable(); closeList();
-            html += '<h' + (h[1].length + 1) + '>' + inline(escapeHtml(h[2])) + '</h' + (h[1].length + 1) + '>';
+            const level = h[1].length;
+            html += '<h' + level + '>' + inline(escapeHtml(h[2])) + '</h' + level + '>';
             continue;
         }
         if (/^[-*]\s+/.test(trimmed)) {

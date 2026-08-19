@@ -353,7 +353,10 @@ ipcMain.handle('build-app', async (event, options = {}) => {
     } else {
         args.push('electron-builder');
     }
-    args.push(`--${platform}`, arch);
+    args.push(`--${platform}`);
+    // electron-builder espera flags booleanas (--x64/--ia32/--arm64), não o
+    // valor cru "x64". Sem o prefixo, o valor vira argumento posicional inválido.
+    if (['x64', 'ia32', 'arm64'].includes(arch)) args.push(`--${arch}`);
     if (format !== 'nsis') {
         args.push(`-c.${platform}.target=${format}`);
     }
