@@ -1545,6 +1545,55 @@ function diffSnapshots(before, after) {
     return changes;
 }
 
+// Computa um diff linha a linha (LCS) entre dois textos e devolve uma lista de
+// hunkes no formato: { type: 'add'|'del'|'ctx', line, oldLine, newLine }.
+// Usado para exibir as edições do agente como diffs inline no chat, no estilo
+// opencode/Antigravity.
+function computeDiff(before, after) {
+    const a = (before || '').replace(/\r\n/g, '\n').split('\n');
+    const b = (after || '').replace(/\r\n/g, '\n').split('\n');
+    if (a.length === 1 && a[0] === '') a.pop();
+    if (b.length === 1 && b[0] === '') b.pop();
+
+    const n = a.length, m = b.length;
+    const dp = [];
+    for (let i = 0; i <= n; i++) { dp.push(new Array(m + 1).fill(0)); }
+    for (let i = n - 1; i >= 0; i--) {
+        for (let j = m - 1; j >= 0; j--) {
+            if (a[i] === b[j]) dp[i][j] = dp[i + 1][j + 1] + 1;
+            else dp[i][j] = Math.max(dp[i + 1][j], dp[i][j + 1]);
+        }
+    }
+    const out = [];
+    let i = 0, j = 0;
+    while (i < n && j < m) {
+        if (a[i] === b[j]) {
+            out.push({ type: 'ctx', line: a[i], oldLine: i + 1, newLine: j + 1 });
+            i++; j++;
+        } else if (dp[i + 1][j] >= dp[i][j + 1]) {
+            out.push({ type: 'del', line: a[i], oldLine: i + 1 });
+            i++;
+        } else {
+            out.push({ type: 'add', line: b[j], newLine: j + 1 });
+            j++;
+        }
+    }
+    while (i < n) { out.push({ type: 'del', line: a[i], oldLine: i + 1 }); i++; }
+    while (j < m) { out.push({ type: 'add', line: b[j], newLine: j + 1 }); j++; }
+    return out;
+}
+
+// Lê o conteúdo atual de um arquivo do projeto (string vazia se não existir).
+function readProjectFileContent(relativePath) {
+    try {
+        const full = resolveSafePath(relativePath);
+        if (!full || !fs.existsSync(full)) return '';
+        const st = fs.statSync(full);
+        if (st.size > 3 * 1024 * 1024) return '';
+        return fs.readFileSync(full, 'utf-8');
+    } catch (e) { return ''; }
+}
+
 function getToolIcon(toolName) {
     const t = (toolName || '').toLowerCase();
     const icons = {
@@ -3739,6 +3788,17 @@ async function runAgentAndCapture(ws, task, onChunk, streamController, history, 
             const orig = beforeContents.get(change.file);
             if (orig !== undefined) backupFromContent(change.file, orig);
         }
+        // Anexa o conteúdo antes/depois para o frontend montar o diff inline.
+        if (change.action === 'modificar') {
+            change.before = beforeContents.get(change.file) || '';
+            change.after = readProjectFileContent(change.file);
+        } else if (change.action === 'criar') {
+            change.before = '';
+            change.after = readProjectFileContent(change.file);
+        } else if (change.action === 'deletar') {
+            change.before = beforeContents.get(change.file) || '';
+            change.after = '';
+        }
         if (onChunk) onChunk('file-status', JSON.stringify([change]));
         const icon = change.action === 'criar' ? '🆕' : change.action === 'deletar' ? '🗑️' : '✏️';
         reviewMsg += `${icon} ${change.file}\n`;
@@ -4523,18 +4583,18 @@ async function executePlan(plan, onChunk, signal) {
         backupRelativePath(a.caminho);
         if (onChunk) onChunk('Sistema', `🗑️ ${a.caminho}\n`);
         if (onChunk) onChunk('file-status', JSON.stringify([{ file: a.caminho, action: 'deletar', status: 'editing' }]));
-        modifications.push({ file: a.caminho, action: 'deletar', status: 'pending' });
+        modifications.push({ file: a.caminho, action: 'deletar', status: 'pending', before: readProjectFileContent(a.caminho), after: '' });
     }
 
     if (!cancelled) {
         for (const a of phases.modificar) {
             backupRelativePath(a.caminho);
             if (onChunk) onChunk('file-status', JSON.stringify([{ file: a.caminho, action: 'modificar', status: 'editing' }]));
-            modifications.push({ file: a.caminho, action: 'modificar', status: 'pending' });
+            modifications.push({ file: a.caminho, action: 'modificar', status: 'pending', before: readProjectFileContent(a.caminho), after: a.conteudo });
         }
         for (const a of phases.criar) {
             if (onChunk) onChunk('file-status', JSON.stringify([{ file: a.caminho, action: 'criar', status: 'editing' }]));
-            modifications.push({ file: a.caminho, action: 'criar', status: 'pending' });
+            modifications.push({ file: a.caminho, action: 'criar', status: 'pending', before: '', after: a.conteudo });
         }
     }
 
@@ -4563,7 +4623,16 @@ async function executePlan(plan, onChunk, signal) {
     for (const mod of modifications) {
         const icon = mod.status === 'created' ? '🆕' : mod.status === 'deleted' ? '🗑️' : mod.status === 'modified' ? '✏️' : '❌';
         if (onChunk) onChunk('Sistema', `${icon} ${mod.file} (${mod.status})\n`);
-        if (onChunk) onChunk('file-status', JSON.stringify([{ file: mod.file, action: mod.action, status: mod.status }]));
+        const payload = { file: mod.file, action: mod.action, status: mod.status };
+        // Para arquivos criados/modificados, atualiza o "after" real do disco.
+        if (mod.action === 'criar' || mod.action === 'modificar') {
+            payload.before = mod.before;
+            payload.after = mod.status === 'normal' ? mod.after : readProjectFileContent(mod.file);
+        } else {
+            payload.before = mod.before;
+            payload.after = '';
+        }
+        if (onChunk) onChunk('file-status', JSON.stringify([payload]));
     }
 
     if (cancelled) {
@@ -7580,7 +7649,18 @@ async function applyAgentChanges({ beforeContents, changes, agentResult, provide
             const orig = beforeContents.get(c.file);
             if (orig !== undefined) backupFromContent(c.file, orig);
         }
-        if (onChunk) onChunk('file-status', JSON.stringify([{ file: c.file, action: c.action, status: c.action === 'criar' ? 'created' : c.action === 'deletar' ? 'deleted' : 'modified' }]));
+        const payload = { file: c.file, action: c.action, status: c.action === 'criar' ? 'created' : c.action === 'deletar' ? 'deleted' : 'modified' };
+        if (c.action === 'criar') {
+            payload.before = '';
+            payload.after = readProjectFileContent(c.file);
+        } else if (c.action === 'deletar') {
+            payload.before = beforeContents.get(c.file) || '';
+            payload.after = '';
+        } else {
+            payload.before = beforeContents.get(c.file) || '';
+            payload.after = readProjectFileContent(c.file);
+        }
+        if (onChunk) onChunk('file-status', JSON.stringify([payload]));
         if (onChunk) onChunk('Sistema', `✅ ${c.file} (${c.action})\n`);
     }
     ws.send(JSON.stringify({ type: 'refresh' }));
@@ -8149,7 +8229,7 @@ wss.on('connection', (ws, req) => {
                                         const orig = beforeContents.get(change.file);
                                         if (orig !== undefined) backupFromContent(change.file, orig);
                                     }
-                                    if (onChunk) onChunk('file-status', JSON.stringify([{ file: change.file, action: change.action, status: 'done' }]));
+                                    if (onChunk) onChunk('file-status', JSON.stringify([{ file: change.file, action: change.action, status: 'done', before: change.action === 'deletar' ? (beforeContents.get(change.file) || '') : '', after: change.action === 'deletar' ? '' : readProjectFileContent(change.file) }]));
                                     if (onChunk) onChunk('Sistema', `📄 ${change.action.toUpperCase()}: ${change.file}\n`);
                                 }
                                 filesToExecute = ocChanges.map(c => ({ caminho: c.file, acao: c.action }));
@@ -8189,7 +8269,7 @@ wss.on('connection', (ws, req) => {
                                         const orig = agentBeforeContents.get(c.file);
                                         if (orig !== undefined) backupFromContent(c.file, orig);
                                     }
-                                    if (onChunk) onChunk('file-status', JSON.stringify([{ file: c.file, action: c.action, status: 'done' }]));
+                                    if (onChunk) onChunk('file-status', JSON.stringify([{ file: c.file, action: c.action, status: 'done', before: c.action === 'deletar' ? (agentBeforeContents.get(c.file) || '') : '', after: c.action === 'deletar' ? '' : readProjectFileContent(c.file) }]));
                                     if (onChunk) onChunk('Sistema', `📄 ${c.action.toUpperCase()}: ${c.file}\n`);
                                 }
                                 filesToExecute = agentImplChanges.map(c => ({ caminho: c.file, acao: c.action }));
@@ -8240,7 +8320,11 @@ wss.on('connection', (ws, req) => {
     });
 });
 
-module.exports = { app, server, resolveSafePath, extractJson, setProjectRoot, writeFileContent, readFileContent, listBackups, analyzeTask, executePlan, executeAgentTool, parseJsonC, buildOpenCodePrompt, snapshotProjectFiles, diffSnapshots, parseRemoteUrl, nextVersion, detectRepo, latestVersionTag, runner, formatCode, pushUndoState, undoStack, redoStack, trackTokens, calcCost, getModelPrice, getUsageReport, tokenUsage, listDirectory, getAllFiles };
+module.exports = { app, server, resolveSafePath, extractJson, setProjectRoot, writeFileContent, 
+readFileContent, listBackups, analyzeTask, executePlan, executeAgentTool, parseJsonC, buildOpenCodePrompt, 
+snapshotProjectFiles, diffSnapshots, computeDiff, parseRemoteUrl, nextVersion, detectRepo, latestVersionTag, runner, formatCode, 
+pushUndoState, undoStack, redoStack, trackTokens, calcCost, getModelPrice, getUsageReport, tokenUsage, listDirectory, 
+getAllFiles };
 
 // =============================================
 let mcpConfigs = [];

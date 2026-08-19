@@ -426,6 +426,24 @@ test('snapshot/diff detecta criar, modificar e deletar', () => {
     }
 });
 
+test('computeDiff gera hunks de adição/remoção/contexto', () => {
+    const { computeDiff } = require(SERVER_PATH);
+    const hunks = computeDiff('a\nb\nc', 'a\nb\nX\nc');
+    const adds = hunks.filter(h => h.type === 'add');
+    assert.strictEqual(adds.length, 1, 'deve haver uma linha adicionada');
+    assert.strictEqual(adds[0].line, 'X');
+    const ctxs = hunks.filter(h => h.type === 'ctx');
+    assert.ok(ctxs.length >= 3, 'linhas de contexto devem permanecer');
+    assert.strictEqual(hunks.some(h => h.type === 'del'), false, 'nenhuma linha removida');
+
+    const removed = computeDiff('a\nb\nc', 'a\nc');
+    assert.strictEqual(removed.filter(h => h.type === 'del').length, 1, 'uma linha removida');
+    assert.strictEqual(removed.find(h => h.type === 'del').line, 'b');
+
+    const none = computeDiff('igual', 'igual');
+    assert.strictEqual(none.filter(h => h.type !== 'ctx').length, 0, 'sem alterações');
+});
+
 test('runner.validateBuildTarget aceita alvos válidos e rejeita inválidos', () => {
     const { runner } = require(SERVER_PATH);
     assert.strictEqual(runner.validateBuildTarget({ platform: 'win', arch: 'x64', format: 'nsis' }).length, 0);

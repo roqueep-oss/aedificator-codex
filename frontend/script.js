@@ -21,6 +21,8 @@ let maxTaskTimer = null;
 let noProgressTimer = null;
 let hideProgressTimer = null;
 let pendingStream = null;
+let autoContinueEnabled = false;
+let autoContinueTimer = null;
 let backendReady = false;
 let currentProjectPath = '';
 let fileStatusMap = {};
@@ -1211,6 +1213,11 @@ function handleWsMessage(data) {
             if (data.files.length === 1) taskActivityProgress(`${file.action} ${file.file}`);
             fileActivity(file.file, file.status);
             if (file.file && concludedTaskFiles.indexOf(file.file) === -1) concludedTaskFiles.push(file.file);
+            // Renderiza o diff inline no chat (estilo opencode/Antigravity) quando
+            // o backend envia o conteúdo antes/depois da edição.
+            if (file.before !== undefined && file.after !== undefined && file.action !== 'deletar') {
+                renderInlineDiff(file);
+            }
         }
         updateProgressUI();
         if (needsRefresh) {
@@ -2317,6 +2324,7 @@ async function saveFileEditor() {
             statusEl.className = 'success';
             setFileStatus(tab.path, 'modified');
             showToast('✅ Arquivo salvo: ' + tab.path);
+            reactToSavedFile(tab.path);
         } else {
             statusEl.textContent = '❌ ' + (data.error || 'Falha ao salvar');
             statusEl.className = 'error';
@@ -2337,6 +2345,40 @@ function maybeAutoSave() {
             saveFileEditor();
         }
     }, 1500);
+}
+
+// =============================================
+//  REATIVIDADE AO SALVAR ARQUIVO (estilo Antigravity)
+// =============================================
+let lastReactFile = '';
+let reactFileTimer = null;
+let fileWatchReactEnabled = false;
+
+// Ao salvar um arquivo no editor, oferece (ou dispara) uma análise da IA.
+function reactToSavedFile(filePath) {
+    if (!filePath || !currentProjectPath) return;
+    try { fileWatchReactEnabled = localStorage.getItem('aedificator_watch_react') === '1'; } catch (e) {}
+    lastReactFile = filePath;
+    const btn = document.getElementById('reactFileBtn');
+    if (btn) {
+        btn.style.display = 'inline-block';
+        btn.title = 'Analisar alteração salva: ' + filePath;
+    }
+    // Se a reação automática estiver ativada e nenhuma tarefa rodando, dispara.
+    if (fileWatchReactEnabled && !isStreaming && !isRunning) {
+        if (reactFileTimer) clearTimeout(reactFileTimer);
+        reactFileTimer = setTimeout(() => analyzeSavedFile(filePath), 1200);
+    }
+}
+
+// Envia uma mensagem pedindo ao agente para revisar o arquivo recém-salvo.
+function analyzeSavedFile(filePath) {
+    const input = document.getElementById('chatInput');
+    if (!input) return;
+    const btn = document.getElementById('reactFileBtn');
+    if (btn) btn.style.display = 'none';
+    input.value = 'Analise a alteração que acabei de fazer em ' + filePath + ' e, se houver erros ou melhorias necessárias, corrija e valide.';
+    sendMessage();
 }
 
 // =============================================
@@ -3143,6 +3185,170 @@ function fuzzyScore(query, text) {
 }
 
 // =============================================
+//  COMANDOS SLASH (/ ) NO CHAT (estilo opencode)
+// =============================================
+const SLASH_COMMANDS = [
+    { cmd: '/run', desc: 'Executa um comando no terminal', usage: '/run <comando>' },
+    { cmd: '/model', desc: 'Mostra ou troca o provider/modelo', usage: '/model <provider> <modelo>' },
+    { cmd: '/clear', desc: 'Limpa o histórico do chat', usage: '/clear' },
+    { cmd: '/plan', desc: 'Alterna entre modo Planejar e Construir', usage: '/plan' },
+    { cmd: '/review', desc: 'Alterna entre modo Revisar e direto', usage: '/review' },
+    { cmd: '/continuar', desc: 'Continua a última tarefa automaticamente', usage: '/continuar' },
+    { cmd: '/watch', desc: 'Alterna o agente reagir automaticamente a arquivos salvos', usage: '/watch' },
+    { cmd: '/help', desc: 'Lista os comandos disponíveis', usage: '/help' }
+];
+let slashSelectedIndex = -1;
+
+function initSlashCommands() {
+    const input = document.getElementById('chatInput');
+    const dropdown = document.getElementById('slashDropdown');
+    if (!input || !dropdown) return;
+
+    input.addEventListener('input', function() {
+        const text = input.value;
+        const caret = input.selectionStart || 0;
+        const lineStart = text.lastIndexOf('\n', caret - 1) + 1;
+        const beforeCaret = text.substring(lineStart, caret);
+        if (beforeCaret.startsWith('/') && !beforeCaret.includes(' ')) {
+            showSlashMenu(beforeCaret);
+        } else {
+            dropdown.classList.remove('active');
+            slashSelectedIndex = -1;
+        }
+    });
+
+    input.addEventListener('keydown', function(e) {
+        if (!dropdown.classList.contains('active')) return;
+        const items = dropdown.querySelectorAll('.autocomplete-item');
+        if (e.key === 'ArrowDown') { e.preventDefault(); slashSelectedIndex = Math.min(slashSelectedIndex + 1, items.length - 1); updateAcSelection(items); }
+        else if (e.key === 'ArrowUp') { e.preventDefault(); slashSelectedIndex = Math.max(slashSelectedIndex - 1, 0); updateAcSelection(items); }
+        else if (e.key === 'Enter' && slashSelectedIndex >= 0) { e.preventDefault(); selectSlashCommand(items[slashSelectedIndex]); }
+        else if (e.key === 'Escape') { dropdown.classList.remove('active'); slashSelectedIndex = -1; }
+        else if (e.key === 'Tab' && slashSelectedIndex >= 0) { e.preventDefault(); selectSlashCommand(items[slashSelectedIndex]); }
+    });
+
+    document.addEventListener('click', function(e) {
+        if (!dropdown.contains(e.target) && e.target !== input) {
+            dropdown.classList.remove('active');
+            slashSelectedIndex = -1;
+        }
+    });
+}
+
+function showSlashMenu(prefix) {
+    const dropdown = document.getElementById('slashDropdown');
+    if (!dropdown) return;
+    const q = prefix.substring(1).toLowerCase();
+    let matches = SLASH_COMMANDS;
+    if (q) matches = SLASH_COMMANDS.filter(c => c.cmd.substring(1).includes(q));
+    if (!matches.length) { dropdown.classList.remove('active'); slashSelectedIndex = -1; return; }
+    dropdown.innerHTML = '';
+    for (const c of matches) {
+        const item = document.createElement('div');
+        item.className = 'autocomplete-item';
+        item.dataset.cmd = c.cmd;
+        item.dataset.usage = c.usage || '';
+        item.innerHTML = `<span class="ac-icon">⌘</span><b>${c.cmd}</b><span class="ac-path">${escapeHtml(c.desc)}</span>`;
+        item.addEventListener('click', () => selectSlashCommand(item));
+        dropdown.appendChild(item);
+    }
+    dropdown.classList.add('active');
+    slashSelectedIndex = 0;
+    updateAcSelection(dropdown.querySelectorAll('.autocomplete-item'));
+}
+
+function selectSlashCommand(item) {
+    const input = document.getElementById('chatInput');
+    const dropdown = document.getElementById('slashDropdown');
+    if (!input) return;
+    const cmd = item.dataset.cmd;
+    const usage = item.dataset.usage || cmd;
+    const text = input.value;
+    const caret = input.selectionStart || 0;
+    const lineStart = text.lastIndexOf('\n', caret - 1) + 1;
+    input.value = text.substring(0, lineStart) + usage + ' ' + text.substring(caret);
+    input.focus();
+    input.selectionStart = input.selectionEnd = lineStart + usage.length + 1;
+    dropdown.classList.remove('active');
+    slashSelectedIndex = -1;
+}
+
+function executeSlashCommand(commandLine) {
+    // commandLine é a linha do chat começando com "/"
+    const trimmed = commandLine.trim();
+    const firstSpace = trimmed.indexOf(' ');
+    const cmd = firstSpace === -1 ? trimmed.toLowerCase() : trimmed.substring(0, firstSpace).toLowerCase();
+    const arg = firstSpace === -1 ? '' : trimmed.substring(firstSpace + 1).trim();
+
+    switch (cmd) {
+        case '/clear':
+            clearChat();
+            return true;
+        case '/plan':
+            togglePlanMode();
+            return true;
+        case '/review':
+            toggleReviewMode();
+            return true;
+        case '/help': {
+            let msg = '**Comandos disponíveis:**\n';
+            for (const c of SLASH_COMMANDS) msg += `- \`${c.usage}\` — ${c.desc}\n`;
+            addMessage('system', msg);
+            return true;
+        }
+        case '/model': {
+            const parts = arg.split(/\s+/);
+            if (!arg || parts.length === 1) {
+                const provider = document.getElementById('providerSelect');
+                const model = document.getElementById('modelSelect');
+                addMessage('system', `Modelo atual: **${provider ? provider.value : ''} / ${model ? model.value : ''}**\nUse \`/model <provider> <modelo>\` para trocar.`);
+            } else {
+                const provider = parts[0].toLowerCase();
+                const modelName = parts.slice(1).join(' ');
+                const providerSelect = document.getElementById('providerSelect');
+                const modelSelect = document.getElementById('modelSelect');
+                if (providerSelect) {
+                    const provOpts = Array.from(providerSelect.options);
+                    const provMatch = provOpts.find(o => o.value.toLowerCase() === provider);
+                    if (provMatch) {
+                        providerSelect.value = provMatch.value;
+                        providerSelect.dispatchEvent(new Event('change'));
+                        updateModelOptions(provMatch.value);
+                        if (modelSelect && modelName) {
+                            const modOpts = Array.from(modelSelect.options);
+                            const modMatch = modOpts.find(o => o.value.toLowerCase().includes(modelName.toLowerCase()) || o.text.toLowerCase().includes(modelName.toLowerCase()));
+                            if (modMatch) modelSelect.value = modMatch.value;
+                        }
+                        currentModel = modelSelect ? modelSelect.value : currentModel;
+                        showToast(`🔄 Modelo: ${providerSelect.value} / ${currentModel}`);
+                    } else {
+                        addMessage('system', `Provider "${provider}" não encontrado. Disponíveis: ${provOpts.map(o => o.value).join(', ')}`);
+                    }
+                }
+            }
+            return true;
+        }
+        case '/continuar':
+            continueLastTask();
+            return true;
+        case '/watch':
+            fileWatchReactEnabled = !fileWatchReactEnabled;
+            try { localStorage.setItem('aedificator_watch_react', fileWatchReactEnabled ? '1' : '0'); } catch (e) {}
+            showToast(fileWatchReactEnabled ? '👁️ Reagir a alterações ATIVADO' : 'Reagir a alterações desativado');
+            return true;
+        default:
+            return false;
+    }
+}
+
+function continueLastTask() {
+    const input = document.getElementById('chatInput');
+    if (!input) return;
+    input.value = 'Continue a tarefa anterior e finalize-a, rodando os testes e corrigindo o que for preciso até ficar tudo OK.';
+    sendMessage();
+}
+
+// =============================================
 //  DRAG & DROP IMAGES / FILES
 // =============================================
 let attachedFiles = [];
@@ -3295,8 +3501,13 @@ function showReportCard(data) {
     html += '<div class="report-actions">';
     html += '<button class="report-btn accept" onclick="this.closest(\'.message\').querySelector(\'.report-actions\').innerHTML=\'✔ Concluído\';document.getElementById(\'cancelButton\').style.display=\'none\';">✔ OK</button>';
     html += '<button class="report-btn refine" data-command="' + escapeHtml(data.command || '') + '" data-files="' + escapeHtml(JSON.stringify(files)) + '">🔄 Refinar</button>';
+    html += '<button class="report-btn continue" data-command="' + escapeHtml(data.command || '') + '" data-files="' + escapeHtml(JSON.stringify(files)) + '">⚡ Continuar</button>';
     html += '<button class="report-btn undo" onclick="undoLastChange();this.closest(\'.message\').querySelector(\'.report-actions\').innerHTML=\'↩ Desfeito\'">↩ Desfazer</button>';
-    html += '</div></div>';
+    html += '</div>';
+    if (errCount) {
+        html += '<div class="report-auto"><label class="auto-continue-toggle" title="Ao terminar com erros, dispara a continuação automaticamente"><input type="checkbox" id="autoContinueToggle" ' + (autoContinueEnabled ? 'checked' : '') + '> ⚡ Auto-continuar até concluir</label></div>';
+    }
+    html += '</div>';
 
     div.innerHTML = html;
     container.appendChild(div);
@@ -3318,6 +3529,48 @@ function showReportCard(data) {
         if (isPlanMode && !command) togglePlanMode();
     });
 
+    // Continuar: envia automaticamente a continuação (o agente segue iterando
+    // até concluir), em vez de só preencher o input como o Refinar.
+    div.querySelector('.report-btn.continue').addEventListener('click', function() {
+        const command = this.dataset.command || '';
+        const fileList = JSON.parse(this.dataset.files || '[]');
+        const input = document.getElementById('chatInput');
+        input.value = 'Continue a tarefa anterior e finalize-a:\n' +
+            'Tarefa: ' + (command || 'última alteração') + '\n' +
+            (fileList.length ? 'Arquivos já afetados: ' + fileList.join(', ') + '\n' : '') +
+            (errCount ? errCount + ' erro(s) de diagnóstico ainda presentes\n' : '') +
+            'Rode os testes e corrija o que for preciso até ficar tudo OK.';
+        this.closest('.message').querySelector('.report-actions').innerHTML = '<span class="diff-result diff-kept">⚡ Continuando...</span>';
+        sendMessage();
+    });
+
+    // Alterna o modo de auto-continuação persistente.
+    const autoToggle = div.querySelector('#autoContinueToggle');
+    if (autoToggle) {
+        autoToggle.addEventListener('change', function() {
+            autoContinueEnabled = this.checked;
+            try { localStorage.setItem('aedificator_auto_continue', autoContinueEnabled ? '1' : '0'); } catch (e) {}
+            showToast(autoContinueEnabled ? '⚡ Auto-continuar ATIVADO' : 'Auto-continuar desativado');
+        });
+    }
+
+    // Auto-continuação opcional: se ativada, quando houver erros de diagnóstico
+    // a tarefa seguinte dispara sozinha após um pequeno intervalo.
+    if (errCount && autoContinueEnabled) {
+        const input = document.getElementById('chatInput');
+        const command = data.command || '';
+        const fileList = files;
+        input.value = 'Continue a tarefa anterior e finalize-a:\n' +
+            'Tarefa: ' + command + '\n' +
+            (fileList.length ? 'Arquivos já afetados: ' + fileList.join(', ') + '\n' : '') +
+            errCount + ' erro(s) de diagnóstico ainda presentes\n' +
+            'Rode os testes e corrija o que for preciso até ficar tudo OK.';
+        const reportActions = div.querySelector('.report-actions');
+        if (reportActions) reportActions.innerHTML = '<span class="diff-result diff-kept">⚡ Auto-continuando...</span>';
+        if (autoContinueTimer) clearTimeout(autoContinueTimer);
+        autoContinueTimer = setTimeout(sendMessage, 1500);
+    }
+
     scheduleSaveChatHistory();
 }
 
@@ -3325,7 +3578,16 @@ function showReportCard(data) {
 //  INIT ALL NEW FEATURES
 // =============================================
 function initNewFeatures() {
+    try { autoContinueEnabled = localStorage.getItem('aedificator_auto_continue') === '1'; } catch (e) {}
     initAutocomplete();
+    initSlashCommands();
+    const reactBtn = document.getElementById('reactFileBtn');
+    if (reactBtn) {
+        reactBtn.addEventListener('click', function() {
+            if (lastReactFile) analyzeSavedFile(lastReactFile);
+            else reactBtn.style.display = 'none';
+        });
+    }
     initDragDrop();
     initExplorerDragDrop();
     restorePlanModeState();
@@ -4632,6 +4894,7 @@ function closeApprovalModal() {
 //  ENVIO DE MENSAGEM
 // =============================================
 function sendMessage() {
+    if (autoContinueTimer) { clearTimeout(autoContinueTimer); autoContinueTimer = null; }
     const input = document.getElementById('chatInput');
     let message = input.value.trim();
 
@@ -4669,6 +4932,14 @@ function sendMessage() {
         return;
     }
 
+    // Comandos slash (estilo opencode). Detecta se a PRIMEIRA linha é um comando.
+    const firstLine = message.split('\n')[0].trim();
+    if (firstLine.startsWith('/') && SLASH_COMMANDS.some(c => firstLine.toLowerCase().startsWith(c.cmd))) {
+        input.value = '';
+        executeSlashCommand(firstLine);
+        return;
+    }
+
     if (!currentProjectPath) {
         showToast('📁 Selecione uma pasta primeiro!');
         return;
@@ -4676,6 +4947,8 @@ function sendMessage() {
 
     input.value = '';
     addMessage('user', message);
+    const reactBtnNow = document.getElementById('reactFileBtn');
+    if (reactBtnNow) reactBtnNow.style.display = 'none';
     isStreaming = true;
     resetStreamTimeout();
     const sendBtn = document.getElementById('sendButton');
@@ -5328,6 +5601,140 @@ function taskActivityProgress(text) {
 
 // Anexa uma linha (ex.: "> Tool Call: ...") à mensagem do agente que está
 // transmitindo, re-renderizando no formato opencode.
+// =============================================
+//  DIFF INLINE NO CHAT (ESTILO OPENCODE/ANTIGRAVITY)
+// =============================================
+
+// Computa o diff linha a linha (LCS) entre dois textos no frontend.
+function computeDiffFrontend(before, after) {
+    const a = (before || '').replace(/\r\n/g, '\n').split('\n');
+    const b = (after || '').replace(/\r\n/g, '\n').split('\n');
+    if (a.length === 1 && a[0] === '') a.pop();
+    if (b.length === 1 && b[0] === '') b.pop();
+    const n = a.length, m = b.length;
+    const dp = [];
+    for (let i = 0; i <= n; i++) dp.push(new Array(m + 1).fill(0));
+    for (let i = n - 1; i >= 0; i--) {
+        for (let j = m - 1; j >= 0; j--) {
+            if (a[i] === b[j]) dp[i][j] = dp[i + 1][j + 1] + 1;
+            else dp[i][j] = Math.max(dp[i + 1][j], dp[i][j + 1]);
+        }
+    }
+    const out = [];
+    let i = 0, j = 0;
+    while (i < n && j < m) {
+        if (a[i] === b[j]) {
+            out.push({ type: 'ctx', line: a[i], oldLine: i + 1, newLine: j + 1 });
+            i++; j++;
+        } else if (dp[i + 1][j] >= dp[i][j + 1]) {
+            out.push({ type: 'del', line: a[i], oldLine: i + 1 });
+            i++;
+        } else {
+            out.push({ type: 'add', line: b[j], newLine: j + 1 });
+            j++;
+        }
+    }
+    while (i < n) { out.push({ type: 'del', line: a[i], oldLine: i + 1 }); i++; }
+    while (j < m) { out.push({ type: 'add', line: b[j], newLine: j + 1 }); j++; }
+    return out;
+}
+
+// Constrói o HTML do corpo de um diff (linhas com +/-) a partir dos hunks.
+function buildDiffLinesHtml(hunks) {
+    let html = '';
+    for (const h of hunks) {
+        if (h.type === 'add') {
+            html += '<div class="diff-line diff-add"><span class="diff-mark">+</span><code>' + escapeHtml(h.line) + '</code></div>';
+        } else if (h.type === 'del') {
+            html += '<div class="diff-line diff-del"><span class="diff-mark">−</span><code>' + escapeHtml(h.line) + '</code></div>';
+        } else {
+            html += '<div class="diff-line diff-ctx"><span class="diff-mark">&nbsp;</span><code>' + escapeHtml(h.line) + '</code></div>';
+        }
+    }
+    return html;
+}
+
+// Renderiza um bloco de diff inline no chat com botões Aplicar/Rejeitar.
+function renderInlineDiff(file) {
+    const container = document.getElementById('messages');
+    if (!container) return;
+
+    // Se o arquivo ainda não tinha conteúdo e agora tem → criação.
+    const created = file.action === 'criar' || (file.before === '' && file.after !== '');
+    const deleted = file.action === 'deletar' || (file.before !== '' && file.after === '');
+    if (!created && !deleted && file.before === file.after) return;
+
+    const hunks = computeDiffFrontend(file.before, file.after);
+    const isLight = document.body.classList.contains('theme-light');
+
+    const div = document.createElement('div');
+    div.className = 'message system inline-diff';
+    div.dataset.inlineDiff = '1';
+    div.dataset.file = file.file;
+    div.dataset.before = file.before || '';
+    div.dataset.after = file.after || '';
+    div.innerHTML = `
+        <div class="inline-diff-header">
+            <span class="inline-diff-title">${created ? '🆕 Novo arquivo' : deleted ? '🗑️ Arquivo removido' : '✏️ Alteração'}: <b>${escapeHtml(file.file)}</b></span>
+            <span class="inline-diff-status">${file.status === 'done' ? '✅ aplicado' : 'aplicado'}</span>
+        </div>
+        <div class="inline-diff-body ${isLight ? 'light' : ''}">
+            ${buildDiffLinesHtml(hunks)}
+        </div>
+        <div class="inline-diff-actions">
+            <button class="diff-btn diff-btn-keep" onclick="applyInlineDiff(this)">${created ? '✔ Manter' : '✔ Aplicar'}</button>
+            ${!created ? '<button class="diff-btn diff-btn-reject" onclick="rejectInlineDiff(this)">✖ Rejeitar</button>' : ''}
+        </div>
+    `;
+    container.appendChild(div);
+    container.scrollTop = container.scrollHeight;
+    scheduleSaveChatHistory();
+}
+
+// Mantém a alteração (aplica). Marca o bloco como aceito.
+function applyInlineDiff(btn) {
+    const box = btn.closest('.inline-diff');
+    if (!box) return;
+    box.dataset.accepted = '1';
+    const actions = box.querySelector('.inline-diff-actions');
+    if (actions) {
+        actions.innerHTML = '<span class="diff-result diff-kept">✔ Alteração mantida</span>';
+    }
+    showToast('✅ Alteração mantida: ' + box.dataset.file);
+    scheduleSaveChatHistory();
+}
+
+// Rejeita a alteração: escreve de volta o conteúdo original do arquivo.
+async function rejectInlineDiff(btn) {
+    const box = btn.closest('.inline-diff');
+    if (!box) return;
+    const file = box.dataset.file;
+    const before = box.dataset.before || '';
+    try {
+        const res = await apiFetch('/api/file/write', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ path: file, content: before })
+        });
+        const data = await res.json();
+        if (data.success) {
+            box.dataset.rejected = '1';
+            const actions = box.querySelector('.inline-diff-actions');
+            if (actions) {
+                actions.innerHTML = '<span class="diff-result diff-rejected">✖ Alteração revertida</span>';
+            }
+            setFileStatus(file, 'modified');
+            refreshTabIfOpen(file);
+            showToast('✖ Alteração revertida: ' + file);
+        } else {
+            showToast('❌ Falha ao reverter: ' + (data.error || 'erro'));
+        }
+    } catch (e) {
+        showToast('❌ Falha ao reverter: ' + e.message);
+    }
+    scheduleSaveChatHistory();
+}
+
 function appendAgentChat(line) {
     var agent = lastActiveAgent || 'Assistente';
     if (agentMessages[agent] === undefined) {
@@ -5538,6 +5945,7 @@ function saveChatHistory() {
     const container = document.getElementById('messages');
     const items = [];
     for (const div of container.children) {
+        if (div.dataset && div.dataset.inlineDiff) continue;
         const role = div.classList.contains('user') ? 'user' : div.classList.contains('agent') ? 'agent' : 'system';
         const contentDiv = div.querySelector('.msg-content') || div.querySelector('.cmd-output');
         const content = contentDiv ? contentDiv.textContent : '';

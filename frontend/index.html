@@ -1135,6 +1135,81 @@
         }
         .msg-copy-btn:hover { color: #e6edf3; background: #30363d; border-color: #58a6ff; }
 
+        /* ===== DIFF INLINE NO CHAT (estilo opencode/Antigravity) ===== */
+        .message.inline-diff {
+            background: #0d1117;
+            border: 1px solid #30363d;
+            border-left: 3px solid #58a6ff;
+            color: #c9d1d9;
+            font-style: normal;
+            text-align: left;
+            max-width: 100%;
+            padding: 0;
+            overflow: hidden;
+        }
+        .inline-diff-header {
+            display: flex;
+            align-items: center;
+            justify-content: space-between;
+            padding: 6px 10px;
+            background: #161b22;
+            border-bottom: 1px solid #21262d;
+            font-size: 11px;
+            font-weight: 600;
+            color: #8b949e;
+        }
+        .inline-diff-title b { color: #e6edf3; font-weight: 600; }
+        .inline-diff-status { font-size: 10px; color: #3fb950; }
+        .inline-diff-body {
+            max-height: 320px;
+            overflow-y: auto;
+            padding: 4px 0;
+            font-family: 'Consolas', 'Courier New', monospace;
+            font-size: 11px;
+            line-height: 1.5;
+        }
+        .inline-diff-body.light { background: #ffffff; }
+        .diff-line {
+            display: flex;
+            white-space: pre;
+            min-height: 18px;
+            padding: 0 10px;
+        }
+        .diff-line code { white-space: pre; font-family: inherit; font-size: inherit; color: inherit; }
+        .diff-mark { display: inline-block; width: 14px; user-select: none; color: inherit; }
+        .diff-add { background: rgba(46, 160, 67, 0.15); color: #3fb950; }
+        .diff-add .diff-mark { color: #3fb950; font-weight: 700; }
+        .diff-del { background: rgba(248, 81, 73, 0.15); color: #f85149; }
+        .diff-del .diff-mark { color: #f85149; font-weight: 700; }
+        .diff-ctx { color: #8b949e; }
+        .inline-diff-body.light .diff-ctx { color: #57606a; }
+        .inline-diff-actions {
+            display: flex;
+            gap: 8px;
+            padding: 6px 10px;
+            background: #161b22;
+            border-top: 1px solid #21262d;
+        }
+        .diff-btn {
+            border: 1px solid #30363d;
+            border-radius: 6px;
+            padding: 4px 12px;
+            font-size: 11px;
+            font-weight: 600;
+            cursor: pointer;
+            color: #e6edf3;
+        }
+        .diff-btn-keep { background: #238636; border-color: #2ea043; }
+        .diff-btn-keep:hover { background: #2ea043; }
+        .diff-btn-reject { background: #21262d; }
+        .diff-btn-reject:hover { background: #da3633; border-color: #f85149; }
+        .diff-result { font-size: 11px; font-weight: 600; }
+        .diff-kept { color: #3fb950; }
+        .diff-rejected { color: #f85149; }
+        body.theme-light .message.inline-diff { background: #fff; border-color: #d0d7de; }
+        body.theme-light .inline-diff-header { background: #f6f8fa; border-color: #d0d7de; color: #57606a; }
+        body.theme-light .inline-diff-actions { background: #f6f8fa; border-color: #d0d7de; }
+
         /* ===== Estilo opencode no chat ===== */
         .msg-content .chat-quote {
             background: rgba(22, 27, 34, 0.6);
@@ -2569,8 +2644,21 @@ body.theme-light .chat-area,
         .report-btn.accept:hover { background: #2ea043; }
         .report-btn.refine { background: #1f6feb; border-color: #1f6feb; }
         .report-btn.refine:hover { background: #388bfd; }
+        .report-btn.continue { background: #8250df; border-color: #8250df; }
+        .report-btn.continue:hover { background: #a371f7; }
         .report-btn.undo { color: #f85149; }
         .report-btn.undo:hover { background: #f8514922; border-color: #f85149; }
+        .report-auto { margin-top: 8px; }
+        .auto-continue-toggle {
+            display: inline-flex;
+            align-items: center;
+            gap: 6px;
+            font-size: 11px;
+            color: #8b949e;
+            cursor: pointer;
+            user-select: none;
+        }
+        .auto-continue-toggle input { cursor: pointer; }
 
         /* ===== ATTACHMENT PREVIEW ===== */
         .attachment-preview {
@@ -3682,12 +3770,14 @@ body.theme-light .chat-area,
             <div class="input-area">
                 <span class="agent-status-chip" id="agentStatusChip" style="display:none;margin:0 0 4px;"><span class="chip-dot"></span><span id="agentStatusChipText">🤖 IA trabalhando</span></span>
                 <div class="input-row">
-                    <input type="text" id="chatInput" placeholder="Digite seu comando... (@ para referenciar arquivos)">
+                    <input type="text" id="chatInput" placeholder="Digite seu comando... (@ para referenciar arquivos, / para comandos)">
                     <div class="autocomplete-dropdown" id="autocompleteDropdown"></div>
+                    <div class="autocomplete-dropdown" id="slashDropdown"></div>
                     <button id="sendButton" onclick="sendMessage()">Enviar</button>
                 </div>
                 <div class="input-buttons">
                     <button id="fixErrorsBtn" style="display:none;background:#d29922;border:none;color:#fff;padding:6px 12px;border-radius:6px;cursor:pointer;font-size:12px;white-space:nowrap;" onclick="fixErrorsWithAI()" title="Corrigir erros automaticamente">🔧 Corrigir erros</button>
+                    <button id="reactFileBtn" style="display:none;background:#8250df;border:none;color:#fff;padding:6px 12px;border-radius:6px;cursor:pointer;font-size:12px;white-space:nowrap;" title="Analisar a alteração salva com a IA">🔎 Analisar alteração</button>
                     <button id="cancelButton" style="display:none;" onclick="cancelTask()">⏹️ Cancelar</button>
                 </div>
             </div>
