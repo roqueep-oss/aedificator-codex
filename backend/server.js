@@ -1012,8 +1012,7 @@ async function retryWithBackoff(fn, { maxRetries = 3, baseDelay = 1000, maxDelay
             return await fn();
         } catch (e) {
             lastError = e;
-            const isRetryable = e.message?.includes('429') || e.message?.includes('500') || e.message?.includes('502') || e.message?.includes('503') || e.message?.includes('Limite de requisições') || e.message?.includes('rate') || e.message?.includes('timeout');
-            if (!isRetryable || attempt >= maxRetries) throw e;
+            if (!isRetryableError(e) || attempt >= maxRetries) throw e;
             const delay = Math.min(baseDelay * Math.pow(2, attempt) + Math.random() * 500, maxDelay);
             if (onRetry) onRetry(attempt + 1, maxRetries, Math.round(delay / 1000));
             await new Promise(resolve => setTimeout(resolve, delay));
@@ -2954,10 +2953,17 @@ function getAllToolDeclarations() {
     return [...builtin, ...mcpTools];
 }
 
+// Ferramentas avançadas/raras, escondidas em tarefas simples: menos tokens no
+// schema (custo) e menos chance de o agente escolher uma ferramenta inadequada.
+const ADVANCED_TOOLS = new Set(['generate_tests', 'browser_navigate', 'browser_screenshot', 'browser_click', 'browser_type', 'browser_evaluate', 'browser_console', 'browser_content', 'git_publish', 'git_push', 'git_pull', 'git_branch', 'git_log', 'git_stash', 'snapshot_create', 'snapshot_list', 'snapshot_restore', 'debug_start', 'debug_stop', 'debug_step', 'debug_resume', 'ssh_exec', 'ssh_status', 'docker_run', 'task']);
+
 function getAgentToolsForMode(mode) {
     const allTools = getAllToolDeclarations();
     if (mode === 'review' || mode === 'plan') {
         return allTools.filter(t => !['write_file', 'delete_file', 'search_replace', 'file_rename', 'exec_command', 'git_commit', 'git_push', 'git_publish', 'docker_run', 'ssh_exec', 'undo', 'redo', 'snapshot_restore', 'browser_navigate', 'browser_click', 'browser_type', 'task'].includes(t.name));
+    }
+    if (_currentTaskComplexity === 'simple') {
+        return allTools.filter(t => !ADVANCED_TOOLS.has(t.name));
     }
     return allTools;
 }
@@ -3222,7 +3228,10 @@ async function callAgentGemini(messages, tools, signal) {
         tools: [{ functionDeclarations: toolDeclarations }],
         toolConfig: { functionCallingConfig: { mode: 'AUTO' } }
     });
-    const raw = await fetchGeminiStreamRaw(url, body, null, signal);
+    const raw = await retryWithBackoff(
+        () => fetchGeminiStreamRaw(url, body, null, signal),
+        { maxRetries: 1, baseDelay: 2000, signal }
+    );
     if (raw.usage) {
         const cacheHit = raw.usage.cachedContentTokenCount || 0;
         trackTokens('gemini', raw.usage.promptTokenCount || 0, raw.usage.candidatesTokenCount || 0, cacheHit > 0, model, cacheHit);
@@ -3439,6 +3448,14 @@ function getConfiguredProviders() {
 function isNetworkError(err) {
     const m = String((err && err.message) || '').toLowerCase();
     return /fetch failed|enetunreach|econnrefused|econnreset|etimedout|timeout|network|socket hang up|failed to fetch|temporary failure/i.test(m);
+}
+
+// Erros transitórios (rede, 429, 5xx, instabilidade) merecem retry; os demais
+// (chave inválida, cota esgotada) não — retry só desperdiçaria tempo.
+function isRetryableError(err) {
+    if (isNetworkError(err)) return true;
+    const m = String((err && err.message) || '').toLowerCase();
+    return /429|500|502|503|504|rate ?limit|too many requests|timed ?out|temporarily|overloaded|inst[áa]vel|limite de requisi[çc][õo]es|tente novamente/i.test(m);
 }
 
 // Um erro é "elegível a fallback" quando o provider atual não consegue responder
@@ -4067,10 +4084,21 @@ function getRelevantFileContents(message) {
         if (ENTRY_NAMES.includes(path.basename(relPath)) && !topFiles.includes(relPath)) topFiles.push(relPath);
     }
 
+    // Carrega o conteúdo dos arquivos mais relevantes, com teto GLOBAL de
+    // caracteres: sem isso, até 15 arquivos × toolResultMax encheriam o prompt
+    // do plano (centenas de milhares de chars) e custo alto desnecessário.
+    let totalChars = 0;
+    const MAX_RELEVANT_CHARS = 60000;
     for (const f of topFiles.slice(0, 15)) {
+        if (totalChars >= MAX_RELEVANT_CHARS) break;
         try {
             const fullPath = resolveSafePath(f);
-            if (fullPath) relevant[f] = fs.readFileSync(fullPath, 'utf-8').slice(0, toolResultMax());
+            if (fullPath) {
+                const perFile = Math.min(toolResultMax(), MAX_RELEVANT_CHARS - totalChars);
+                const content = fs.readFileSync(fullPath, 'utf-8').slice(0, perFile);
+                relevant[f] = content;
+                totalChars += content.length;
+            }
         } catch (e) {}
     }
     return relevant;
