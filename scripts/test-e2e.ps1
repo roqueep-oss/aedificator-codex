@@ -85,7 +85,8 @@ try {
         @{ n = 'snapshot list';     m = 'POST'; u = '/api/snapshot/list';                 b = @{} },
         @{ n = 'snapshot diff';     m = 'POST'; u = '/api/snapshot/diff';                 b = @{ name = 'e2e' } },
         @{ n = 'backup list';       m = 'POST'; u = '/api/backup/list';                   b = @{} },
-        @{ n = 'build';             m = 'POST'; u = '/api/build';                         b = @{ command = 'node novo.js' } }
+        @{ n = 'run';               m = 'POST'; u = '/api/run';                           b = @{ command = 'node novo.js' } },
+        @{ n = 'build cancel';      m = 'POST'; u = '/api/build/cancel';                   b = @{} }
     )
 
     foreach ($c in $checks) {
