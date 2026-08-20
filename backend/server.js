@@ -292,6 +292,7 @@ let config = {
         model: 'claude-sonnet-5'
     },
     autoCommit: true,
+    memory: false,
     toolPermissions: {
         ask: ['delete_file', 'file_rename', 'exec_command', 'git_commit', 'git_push', 'git_publish', 'docker_run', 'ssh_exec', 'snapshot_restore'],
         grants: {}
@@ -644,6 +645,7 @@ if (fs.existsSync(configPath)) {
             if (Array.isArray(savedConfig.toolPermissions.ask)) config.toolPermissions.ask = savedConfig.toolPermissions.ask;
             if (savedConfig.toolPermissions.grants && typeof savedConfig.toolPermissions.grants === 'object') config.toolPermissions.grants = savedConfig.toolPermissions.grants;
         }
+        if (typeof savedConfig.memory === 'boolean') config.memory = savedConfig.memory;
         const undecrypted = ['gemini', 'deepseek', 'opencode', 'openai', 'claude'].filter(p =>
             savedConfig[p]?.apiKey && String(savedConfig[p].apiKey).startsWith('enc:v1:') && !config[p].apiKey
         );
@@ -673,7 +675,8 @@ function saveConfigToFile() {
         opencode: { apiKey: encOr(config.opencode.apiKey, existing.opencode?.apiKey), model: config.opencode.model },
         openai: { apiKey: encOr(config.openai.apiKey, existing.openai?.apiKey), model: config.openai.model },
         claude: { apiKey: encOr(config.claude.apiKey, existing.claude?.apiKey), model: config.claude.model },
-        toolPermissions: config.toolPermissions
+        toolPermissions: config.toolPermissions,
+        memory: !!config.memory
     };
     fs.writeFileSync(configPath, JSON.stringify(fileConfig, null, 2));
 }
@@ -3046,7 +3049,7 @@ ${getQualityRules()}
 
 DIRETÓRIO: ${PROJECT_ROOT}
 ${fileTree ? 'ESTRUTURA:\n' + fileTree : ''}${imageNote}
-
+${getMemoryContext()}
 TAREFA: ${task}
 
 COMPORTAMENTO:
@@ -3068,7 +3071,7 @@ ${LANGUAGE_RULE}
 
 1. DIRETÓRIO: ${PROJECT_ROOT}
 ${fileTree ? 'ESTRUTURA:\n' + fileTree : '(pasta vazia)'}
-
+${getMemoryContext()}
 2. TAREFA: ${task}
 
 3. COMPORTAMENTO (IMPORTANTE — siga rigorosamente):
@@ -3211,7 +3214,7 @@ function parseGeminiAgentResponse(rawText) {
 async function callAgentGemini(messages, tools, signal) {
     const geminiKey = config.gemini.apiKey;
     if (!geminiKey) throw new Error('Chave Gemini não configurada');
-    const model = _currentTaskModel || config.gemini.model || 'gemini-2.5-flash';
+    const model = _currentTaskModel || config.gemini.model || 'gemini-3.5-flash';
     const url = new URL(`https://generativelanguage.googleapis.com/v1beta/models/${model}:streamGenerateContent?alt=sse&key=${geminiKey}`);
     const toolDeclarations = tools.map(t => ({ name: t.name, description: t.description, parameters: t.parameters }));
     const body = JSON.stringify({
@@ -3975,6 +3978,41 @@ function loadProjectRules() {
     try { return fs.readFileSync(filePath, 'utf-8').trim(); } catch (e) { return ''; }
 }
 
+const MEMORY_FILE = '.aedificator-memory.md';
+const MEMORY_MAX_LINES = 30;
+
+// Memória de projeto: persistência leve de decisões/tarefas anteriores para dar
+// contexto ao agente entre sessões. Escrita é OPCIONAL (config.memory) para não
+// gerar custo/surpresas sem o usuário pedir.
+function loadProjectMemory() {
+    if (!PROJECT_ROOT) return '';
+    const filePath = path.join(PROJECT_ROOT, MEMORY_FILE);
+    if (!fs.existsSync(filePath)) return '';
+    try { return fs.readFileSync(filePath, 'utf-8').slice(0, 2000).trim(); } catch (e) { return ''; }
+}
+
+function rememberTask(task, summary) {
+    if (!config.memory || !PROJECT_ROOT) return;
+    try {
+        const filePath = path.join(PROJECT_ROOT, MEMORY_FILE);
+        const t = String(task || '').replace(/\s+/g, ' ').slice(0, 120);
+        const s = String(summary || '').replace(/\s+/g, ' ').slice(0, 160);
+        if (!t && !s) return;
+        const line = `- ${new Date().toISOString().slice(0, 10)} | ${t} | ${s}`.replace(/\s+\|/g, ' |');
+        const existing = fs.existsSync(filePath) ? fs.readFileSync(filePath, 'utf-8') : '';
+        const lines = existing.split('\n').filter(Boolean);
+        lines.push(line);
+        const trimmed = lines.slice(-MEMORY_MAX_LINES);
+        fs.writeFileSync(filePath, '# Memória do projeto (gerada pelo Aedificator)\n\n' + trimmed.join('\n') + '\n', 'utf-8');
+    } catch (e) {}
+}
+
+function getMemoryContext() {
+    const mem = loadProjectMemory();
+    if (!mem) return '';
+    return `\n\nMEMÓRIA DO PROJETO (tarefas/decisões anteriores):\n${mem}\n`;
+}
+
 app.get('/api/project/rules', (req, res) => {
     const filePath = path.join(PROJECT_ROOT, AGENTS_FILE);
     const content = fs.existsSync(filePath) ? fs.readFileSync(filePath, 'utf-8') : '';
@@ -4011,6 +4049,7 @@ function getRelevantFileContents(message) {
             if (parsed.classes.some(c => stripAccents(c).toLowerCase().includes(kw))) score += 2;
             if (parsed.variables.some(v => stripAccents(v).toLowerCase().includes(kw))) score += 1;
             if (parsed.imports.some(i => i.name && stripAccents(i.name).toLowerCase().includes(kw))) score += 1;
+            if (parsed.tokens && parsed.tokens.includes(kw)) score += 1;
         }
         if (score > 0) scoredFiles.push({ path: relPath, score });
     }
@@ -4411,6 +4450,8 @@ async function analyzeTask(message, onChunk, signal, mode = 'cowork', history = 
         ? `DIRETÓRIO: ${PROJECT_ROOT}\n\nESTRUTURA DO PROJETO:\n${getFileTree('') || '(pasta vazia)'}`
         : `DIRETÓRIO: ${PROJECT_ROOT}\n\nESTRUTURA DO PROJETO:\n${projectSummary || getFileTree('') || '(pasta vazia)'}`;
 
+    const memoryCtx = getMemoryContext();
+
     const analysisPrompt = `⚠️ REGRA ABSOLUTA: Sua ÚNICA resposta deve ser um OBJETO JSON puro, começando com { e terminando com }. NADA de texto antes ou depois. NADA de markdown. NADA de explicações fora do JSON. Se você responder com texto em vez de JSON, o sistema quebrará.
 
 Você é o Aedificator Codex IDE. O código é uma arte: respeite a estrutura existente.
@@ -4421,7 +4462,7 @@ ${getQualityRules()}
 ${explorationContext ? '📖 EXPLORAÇÃO PRÉVIA DO CÓDIGO (o agente já leu os seguintes arquivos):\n' + explorationContext + '\n' : ''}
 
 ${projectCtx}
-
+${memoryCtx}
 ${projectRules ? 'REGRAS DO PROJETO (.aedificator-agents.md):\n' + projectRules + '\n' : ''}${isQuestion ? '' : '\nARQUIVOS RELEVANTES:\n' + formatRelevantFiles(relevantFiles)}
 
 SOLICITAÇÃO DO USUÁRIO: "${message}"
@@ -4573,6 +4614,14 @@ async function executePlan(plan, onChunk, signal) {
             if (signal && signal.aborted) { cancelled = true; break; }
             const acao = a.acao || 'modificar';
             let ok = false;
+            // Sem conteúdo no plano não há o que escrever — pular em vez de
+            // sobrescrever um arquivo existente com string vazia (perda de dados).
+            if (acao !== 'deletar' && (a.conteudo == null || a.conteudo === '')) {
+                if (onChunk) onChunk('Sistema', `⚠️ ${a.caminho}: sem conteúdo no plano — pulado\n`);
+                const m = modifications.find(m => m.file === a.caminho);
+                if (m) m.status = 'skipped';
+                continue;
+            }
             try {
                 if (acao === 'deletar') ok = deleteFileContent(a.caminho);
                 else ok = writeFileContent(a.caminho, a.conteudo);
@@ -4585,13 +4634,13 @@ async function executePlan(plan, onChunk, signal) {
     }
 
     for (const mod of modifications) {
-        const icon = mod.status === 'created' ? '🆕' : mod.status === 'deleted' ? '🗑️' : mod.status === 'modified' ? '✏️' : '❌';
+        const icon = mod.status === 'created' ? '🆕' : mod.status === 'deleted' ? '🗑️' : mod.status === 'modified' ? '✏️' : mod.status === 'skipped' ? '⏭️' : '❌';
         if (onChunk) onChunk('Sistema', `${icon} ${mod.file} (${mod.status})\n`);
         const payload = { file: mod.file, action: mod.action, status: mod.status };
         // Para arquivos criados/modificados, atualiza o "after" real do disco.
         if (mod.action === 'criar' || mod.action === 'modificar') {
             payload.before = mod.before;
-            payload.after = mod.status === 'normal' ? mod.after : readProjectFileContent(mod.file);
+            payload.after = (mod.status === 'normal' || mod.status === 'skipped') ? mod.after : readProjectFileContent(mod.file);
         } else {
             payload.before = mod.before;
             payload.after = '';
@@ -4664,7 +4713,7 @@ app.post('/api/project/create', (req, res) => {
 });
 
 app.post('/api/config', (req, res) => {
-    const { geminiKey, deepseekKey, opencodeKey, openaiKey, claudeKey, openaiModel, claudeModel, deepseekModel, autoCommit } = req.body;
+    const { geminiKey, deepseekKey, opencodeKey, openaiKey, claudeKey, openaiModel, claudeModel, deepseekModel, autoCommit, memory } = req.body;
     if (geminiKey && geminiKey !== '********') config.gemini.apiKey = geminiKey;
     if (deepseekKey && deepseekKey !== '********') config.deepseek.apiKey = deepseekKey;
     if (opencodeKey && opencodeKey !== '********') {
@@ -4677,6 +4726,7 @@ app.post('/api/config', (req, res) => {
     if (claudeModel) config.claude.model = claudeModel;
     if (deepseekModel) config.deepseek.model = normalizeDeepseekModel(deepseekModel);
     if (autoCommit !== undefined) config.autoCommit = !!autoCommit;
+    if (memory !== undefined) config.memory = !!memory;
 
     try {
         saveConfigToFile();
@@ -4697,7 +4747,8 @@ app.get('/api/config/get', (req, res) => {
         openaiModel: config.openai.model || '',
         claudeModel: config.claude.model || '',
         deepseekModel: config.deepseek.model || 'deepseek-v4-flash',
-        autoCommit: config.autoCommit
+        autoCommit: config.autoCommit,
+        memory: !!config.memory
     });
 });
 
@@ -7660,6 +7711,7 @@ async function applyAgentChanges({ beforeContents, changes, agentResult, provide
             }
         } catch (e) {}
     }
+    if (!rolledBack) rememberTask(task, agentResult);
     return { changed: true, pending: false, rolledBack, modifiedFiles };
 }
 
@@ -7778,7 +7830,7 @@ wss.on('connection', (ws, req) => {
             try {
                 _lastProjectSnapshot = snapshotProjectContents();
                 _lastProjectFileList = new Set(snapshotProjectFiles().keys());
-                const model = data.model || 'gemini-3.5';
+                const model = data.model || 'gemini-3.5-flash';
                 const provider = data.provider || 'gemini';
                 const mode = data.mode || 'cowork';
                 const reviewMode = data.reviewMode === true;

@@ -75,6 +75,35 @@ function scanDir(dir, rootDir, idx) {
     }
 }
 
+function stripAccentsForIndex(s) {
+    return (s || '').normalize('NFD').replace(/[\u0300-\u036f]/g, '');
+}
+
+const CONTENT_STOPWORDS = new Set(['com', 'que', 'para', 'uma', 'isso', 'este', 'como', 'mas', 'por',
+    'dos', 'das', 'aos', 'tem', 'sua', 'ser', 'nao', 'mais', 'tudo', 'era', 'foi',
+    'the', 'and', 'for', 'with', 'this', 'that', 'from', 'have', 'has', 'was', 'are', 'you',
+    'your', 'our', 'all', 'not', 'can', 'will', 'should', 'would', 'could', 'when', 'what',
+    'how', 'una', 'los', 'las', 'del', 'con', 'new', 'var', 'let', 'const', 'function',
+    'return', 'if', 'else', 'for', 'while', 'import', 'export', 'require', 'module',
+    'true', 'false', 'null', 'undefined', 'typeof', 'instanceof', 'async', 'await',
+    'try', 'catch', 'throw', 'class', 'extends', 'super', 'this']);
+
+// Índice de termos do conteúdo do arquivo (acentos removidos, minúsculas, sem
+// stopwords, deduplicado e limitado). Permite busca por relevância no conteúdo,
+// não apenas em nomes de arquivo/símbolos.
+function extractContentTokens(content) {
+    const tokens = [];
+    const seen = new Set();
+    const clean = stripAccentsForIndex(content || '').toLowerCase().replace(/[^\w$]+/g, ' ');
+    for (const w of clean.split(/\s+/)) {
+        if (w.length <= 2 || CONTENT_STOPWORDS.has(w) || seen.has(w)) continue;
+        seen.add(w);
+        tokens.push(w);
+        if (tokens.length >= 200) break;
+    }
+    return tokens;
+}
+
 function parseFileExports(content, filePath, ext) {
     const result = {
         exports: [],
@@ -84,7 +113,6 @@ function parseFileExports(content, filePath, ext) {
         variables: [],
         filePath
     };
-
     // Imports
     const importRegex = /(?:import\s+(?:\{([^}]+)\}|(\w+)(?:\s*,\s*\{([^}]+)\})?|(\w+))\s+from\s+['"]([^'"]+)['"])|(?:const\s+(?:\{([^}]+)\}|(\w+))\s*=\s*require\s*\(\s*['"]([^'"]+)['"]\s*\))/g;
     let m;
@@ -150,6 +178,8 @@ function parseFileExports(content, filePath, ext) {
             result.exports.push(m[1]);
         }
     }
+
+    result.tokens = extractContentTokens(content);
 
     return result;
 }
