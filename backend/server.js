@@ -81,6 +81,11 @@ app.get('/project/*', (req, res) => {
         '.txt': 'text/plain', '.md': 'text/markdown',
     };
     res.type(mimeTypes[ext] || 'application/octet-stream');
+    // Sem cache no preview: garante que HTML/JS/CSS do projeto sempre sejam
+    // recarregados, evitando que o iframe use versões antigas após edições.
+    res.setHeader('Cache-Control', 'no-store, no-cache, must-revalidate, max-age=0');
+    res.setHeader('Pragma', 'no-cache');
+    res.setHeader('Expires', '0');
     res.sendFile(full);
 });
 
@@ -3430,6 +3435,15 @@ function isNetworkError(err) {
     return /fetch failed|enetunreach|econnrefused|econnreset|etimedout|timeout|network|socket hang up|failed to fetch|temporary failure/i.test(m);
 }
 
+// Um erro é "elegível a fallback" quando o provider atual não consegue responder
+// AGORA: falha de rede OU cota/limite/esgotamento OU instabilidade (5xx). Erros
+// de chave inválida (401) são de configuração e não trocamos de provider sozinhos.
+function isFallbackEligibleError(err) {
+    if (isNetworkError(err)) return true;
+    const m = String((err && err.message) || '').toLowerCase();
+    return /esgotad|insufficient|quota|billing|credit|balance|rate ?limit|too many requests|exhausted|payment required|overloaded|service unavailable|\b402\b|\b429\b|\b500\b|\b502\b|\b503\b|\b504\b/i.test(m);
+}
+
 async function callAgentProviderWithFallback(primary, messages, tools, signal, onChunk, activeProviderRef) {
     const candidates = [primary, ...getConfiguredProviders().filter(p => p !== primary)];
     let lastErr = null;
@@ -3444,11 +3458,11 @@ async function callAgentProviderWithFallback(primary, messages, tools, signal, o
             return result;
         } catch (err) {
             lastErr = err;
-            const networkErr = isNetworkError(err);
+            const eligible = isFallbackEligibleError(err);
             const isLast = candidate === candidates[candidates.length - 1];
             if (isLast) break;
             if (onChunk) onChunk('Sistema', `⚠️ ${candidate} falhou (${err.message.slice(0, 100)}). Tentando ${candidates[candidates.length - 1]}...\n`);
-            if (!networkErr) break;
+            if (!eligible) break;
         }
     }
     throw lastErr || new Error('Todos os providers falharam');
@@ -3986,11 +4000,14 @@ function getRelevantFileContents(message) {
 
     for (const [relPath, parsed] of Object.entries(idx.files)) {
         let score = 0;
-        const nameLow = relPath.toLowerCase();
+        const nameLow = stripAccents(relPath).toLowerCase();
         for (const kw of keywords) {
             if (nameLow.includes(kw)) score += 3;
-            if (parsed.exports.some(e => e.toLowerCase().includes(kw))) score += 2;
-            if (parsed.functions.some(f => f.name.toLowerCase().includes(kw))) score += 2;
+            if (parsed.exports.some(e => stripAccents(e).toLowerCase().includes(kw))) score += 2;
+            if (parsed.functions.some(f => f.name && stripAccents(f.name).toLowerCase().includes(kw))) score += 2;
+            if (parsed.classes.some(c => stripAccents(c).toLowerCase().includes(kw))) score += 2;
+            if (parsed.variables.some(v => stripAccents(v).toLowerCase().includes(kw))) score += 1;
+            if (parsed.imports.some(i => i.name && stripAccents(i.name).toLowerCase().includes(kw))) score += 1;
         }
         if (score > 0) scoredFiles.push({ path: relPath, score });
     }
@@ -4011,11 +4028,23 @@ function getRelevantFileContents(message) {
 }
 
 function extractKeywords(message) {
-    const clean = (message || '').toLowerCase().replace(/[.,!?;:(){}[\]"'/\\]/g, ' ');
+    const normalized = stripAccents(message || '');
+    const clean = normalized.toLowerCase().replace(/[.,!?;:(){}[\]"'/\\]/g, ' ');
     const words = clean.split(/\s+/).filter(w => w.length > 2);
     const stopWords = new Set(['com', 'que', 'para', 'uma', 'isso', 'este', 'como', 'mas', 'por',
-        'dos', 'das', 'aos', 'tem', 'sua', 'ser', 'não', 'mais', 'tudo', 'era', 'foi']);
-    return [...new Set(words.filter(w => !stopWords.has(w)))].slice(0, 20);
+        'dos', 'das', 'aos', 'tem', 'sua', 'ser', 'não', 'nao', 'mais', 'tudo', 'era', 'foi',
+        'the', 'and', 'for', 'with', 'this', 'that', 'from', 'have', 'has', 'was', 'are', 'you',
+        'your', 'our', 'all', 'not', 'can', 'will', 'should', 'would', 'could', 'when', 'what',
+        'how', 'por', 'una', 'para', 'los', 'las', 'del', 'con', 'que', 'ser', 'mas', 'mas', 'como']);
+    const seen = new Set();
+    const result = [];
+    for (const w of words) {
+        if (stopWords.has(w) || seen.has(w)) continue;
+        seen.add(w);
+        result.push(w);
+        if (result.length >= 20) break;
+    }
+    return result;
 }
 
 function formatRelevantFiles(files) {
@@ -4031,9 +4060,9 @@ function stripAccents(s) {
 
 function classifyIntent(message) {
     const m = stripAccents((message || '').toLowerCase()).trim();
-    if (/(^|\s)(o que e|o que|como funciona|explique|qual a diferenca|defina|conceito|significado|por que|porque|what is|how does|explain|what'?s the difference|define|meaning|why|quem|who|quando|when|onde|where)\b/i.test(m)) return 'question';
-    if (/^(o que|como|qual|quais|por que|quando|onde|quem)\b/i.test(m)) return 'question';
-    if (m.endsWith('?') && !/(crie|criar|cria|faca|fazer|implemente|implementar|corrija|corrigir|arrume|arrumar|adicione|adicionar|mude|mudar|altere|alterar|delete|deletar|remova|remover|refatore|refatorar|escreva|escrever|build|code|codigo|arquivo|file|funcao|function|componente|component|roda|rode|execute|executar|teste|testar)/i.test(m)) return 'question';
+    if (/(^|\s)(o que e|o que|como funciona|explique|qual a diferenca|defina|conceito|significado|por que|porque|what is|whats|how does|how do|explain|what'?s the difference|define|meaning|why|quem|who|quando|when|onde|where|que es|cual es|diferencia)\b/i.test(m)) return 'question';
+    if (/^(o que|como|qual|quais|por que|quando|onde|quem|what|how|why|when|where|which|who|que|cual|cuales|cuando|donde|porque)\b/i.test(m)) return 'question';
+    if (m.endsWith('?') && !/(crie|criar|cria|faca|fazer|implemente|implementar|corrija|corrigir|arrume|arrumar|adicione|adicionar|mude|mudar|altere|alterar|delete|deletar|remova|remover|refatore|refatorar|escreva|escrever|build|code|codigo|arquivo|file|funcao|function|componente|component|roda|rode|execute|executar|teste|testar|create|make|fix|add|remove|rename|update|refactor|write|implement|change|modify|crea|crear|corrige|anade|agregar|elimina|renombra|actualiza|refactoriza|escribe|implementa)\b/i.test(m)) return 'question';
     if (m.length < 15 && m.endsWith('?')) return 'question';
     return 'task';
 }
@@ -4173,9 +4202,29 @@ function buildProjectCache() {
             const files = dirs[d].slice(0, 5);
             return `  ${d}/ (${dirs[d].length} arquivos): ${files.join(', ')}${dirs[d].length > 5 ? '...' : ''}`;
         }).join('\n');
+
+        // Mapa de símbolos (função/classe/export → arquivo): permite ao agente
+        // localizar onde mexer sem ler arquivo por arquivo.
+        const symbolMap = {};
+        for (const [f, parsed] of Object.entries(idx.files || {})) {
+            const names = [];
+            for (const e of (parsed.exports || [])) names.push(e);
+            for (const c of (parsed.classes || [])) names.push(c);
+            for (const fn of (parsed.functions || [])) names.push(fn && fn.name);
+            for (const name of names) {
+                if (!name || name.length < 2) continue;
+                if (!symbolMap[name]) symbolMap[name] = f;
+            }
+        }
+        const symbolLines = Object.entries(symbolMap).slice(0, 120)
+            .map(([name, f]) => `  ${name} → ${f}`);
+        const symbolBlock = symbolLines.length
+            ? `\nSÍMBOLOS PRINCIPAIS (função/classe → arquivo):\n${symbolLines.join('\n')}`
+            : '';
+
         // Contexto enxuto no estilo opencode: árvore limitada + resumo por diretório.
         const treeCapped = String(tree || '').slice(0, 6000);
-        return `${treeCapped || '(pasta vazia)'}\n\nRESUMO: ${fileNames.length} arquivos em ${topDirs.length} diretórios\n${summary}`;
+        return `${treeCapped || '(pasta vazia)'}\n\nRESUMO: ${fileNames.length} arquivos em ${topDirs.length} diretórios\n${summary}${symbolBlock}`;
     } catch (e) {
         return getFileTree('') || '(pasta vazia)';
     }
@@ -4193,7 +4242,7 @@ const EXPLORATION_TOOLS = [
 
 async function runExplorationPhase(message, onChunk, signal, provider) {
     if (provider === 'opencode') return '';
-    if (!['gemini', 'deepseek'].includes(provider)) return '';
+    if (!getConfiguredProviders().includes(provider)) return '';
 
     const projectCache = getProjectCache();
     const explorationPrompt = `Você é um agente de exploração. Seu trabalho é identificar APENAS os arquivos relevantes para a tarefa, SEM ler código desnecessário.
@@ -4216,65 +4265,51 @@ MÉTODO (siga esta ordem):
 
     let explorationLog = '';
     try {
-        let conversationHistory = [{ role: 'user', content: explorationPrompt }];
+        const conversationHistory = [{ role: 'user', content: explorationPrompt }];
 
-        for (let iteration = 0; iteration < 2; iteration++) {  
+        for (let iteration = 0; iteration < 2; iteration++) {
             if (signal && signal.aborted) {
                 const err = new Error('Tarefa cancelada');
                 err.name = 'AbortError';
                 throw err;
             }
 
-            let response;
-            if (provider === 'gemini') {
-                response = await callGeminiWithTools(conversationHistory, EXPLORATION_TOOLS, signal);
-            } else if (provider === 'deepseek') {
-                response = await callDeepSeekWithTools(conversationHistory, EXPLORATION_TOOLS, signal);
-            } else {
-                break;
-            }
+            const response = await callAgentProvider(provider, conversationHistory, EXPLORATION_TOOLS, signal, onChunk);
 
-            conversationHistory.push({ role: 'assistant', content: response.text || '' });
+            const toolCalls = response.toolCalls || [];
+            conversationHistory.push({ role: 'assistant', content: response.text || '', tool_calls: toolCalls });
 
-            let hasToolCall = false;
+            if (toolCalls.length === 0) break;
+
             const toolResults = [];
-
-            if (response.toolCalls) {
-                for (const tc of response.toolCalls) {
-                    if (signal && signal.aborted) {
-                        const err = new Error('Tarefa cancelada');
-                        err.name = 'AbortError';
-                        throw err;
-                    }
-                    hasToolCall = true;
-                    const toolName = tc.name || tc.function?.name;
-                    let toolArgs = tc.args || {};
-                    if (!tc.args && tc.function?.arguments) {
-                        try { toolArgs = JSON.parse(tc.function.arguments); } catch (e) {}
-                    }
-                    if (onChunk) onChunk('Sistema', `🔍 Explorando: ${toolName}(${JSON.stringify(toolArgs).slice(0, 80)})...\n`);
-
-                    let result;
-                    try {
-                        result = await executeAgentTool(toolName, toolArgs);
-                        if (toolName === 'read_file') {
-                            explorationLog += `\n📄 ${toolArgs.caminho}:\n${result.slice(0, 2000)}\n`;
-                        } else if (toolName === 'search_code') {
-                            explorationLog += `\n🔎 Busca "${toolArgs.padrao}":\n${result.slice(0, 1500)}\n`;
-                        } else if (toolName === 'list_files') {
-                            explorationLog += `\n📂 ${toolArgs.diretorio || 'raiz'}:\n${result.slice(0, 800)}\n`;
-                        } else if (toolName === 'analyzer_symbols') {
-                            explorationLog += `\n🔣 Símbolos de ${toolArgs.caminho}:\n${result.slice(0, 2000)}\n`;
-                        }
-                    } catch (e) {
-                        result = `Erro: ${e.message}`;
-                    }
-
-                    toolResults.push({ tool_call_id: tc.id, role: 'tool', name: toolName, content: truncateToolResult(toolName, result) });
+            for (const tc of toolCalls) {
+                if (signal && signal.aborted) {
+                    const err = new Error('Tarefa cancelada');
+                    err.name = 'AbortError';
+                    throw err;
                 }
-            }
+                const toolName = tc.name;
+                const toolArgs = tc.args || {};
+                if (onChunk) onChunk('Sistema', `🔍 Explorando: ${toolName}(${JSON.stringify(toolArgs).slice(0, 80)})...\n`);
 
-            if (!hasToolCall) break;
+                let result;
+                try {
+                    result = await executeAgentTool(toolName, toolArgs);
+                    if (toolName === 'read_file') {
+                        explorationLog += `\n📄 ${toolArgs.caminho}:\n${result.slice(0, 2000)}\n`;
+                    } else if (toolName === 'search_code') {
+                        explorationLog += `\n🔎 Busca "${toolArgs.padrao}":\n${result.slice(0, 1500)}\n`;
+                    } else if (toolName === 'list_files') {
+                        explorationLog += `\n📂 ${toolArgs.diretorio || 'raiz'}:\n${result.slice(0, 800)}\n`;
+                    } else if (toolName === 'analyzer_symbols') {
+                        explorationLog += `\n🔣 Símbolos de ${toolArgs.caminho}:\n${result.slice(0, 2000)}\n`;
+                    }
+                } catch (e) {
+                    result = `Erro: ${e.message}`;
+                }
+
+                toolResults.push({ tool_call_id: tc.id, role: 'tool', name: toolName, content: truncateToolResult(toolName, result) });
+            }
 
             for (const tr of toolResults) {
                 conversationHistory.push(tr);
@@ -4288,173 +4323,27 @@ MÉTODO (siga esta ordem):
     }
 }
 
-async function callGeminiWithTools(messages, tools, signal) {
-    const apiKey = config.gemini.apiKey;
-    if (!apiKey) throw new Error('Chave Gemini não configurada');
-    const model = _currentTaskModel || config.gemini.model || 'gemini-3.5';
-
-    const systemMsg = messages[0]?.role === 'user' ? messages[0].content : '';
-    const contents = messages.map((m, idx) => {
-        if (m.role === 'tool') return { role: 'user', parts: [{ functionResponse: { name: m.name || 'tool', response: { result: String(m.content || '') } } }] };
-        if (m.role === 'assistant') return { role: 'model', parts: [{ text: m.content || '' }] };
-        const userParts = [{ text: m.content }];
-        if (idx === 0 && _pendingImages && _pendingImages.length) {
-            for (const img of _pendingImages) {
-                if (img.dataUrl) {
-                    const match = img.dataUrl.match(/^data:(image\/\w+);base64,(.+)/);
-                    if (match) userParts.unshift({ inlineData: { mimeType: match[1], data: match[2] } });
-                }
-            }
-            clearPendingImages();
-        }
-        return { role: 'user', parts: userParts };
-    });
-
-    const toolDeclarations = tools.map(t => ({
-        name: t.name,
-        description: t.description,
-        parameters: t.parameters.type === 'object' ? t.parameters : {
-            type: 'object',
-            properties: Object.fromEntries(Object.entries(t.parameters).map(([k, v]) => [k, { type: 'string', description: String(v) }])),
-            required: Object.keys(t.parameters)
-        }
-    }));
-
-    return new Promise((resolve, reject) => {
-        const url = `https://generativelanguage.googleapis.com/v1beta/models/${model}:generateContent?key=${apiKey}`;
-        const body = JSON.stringify({
-            systemInstruction: { parts: [{ text: systemMsg }] },
-            contents: contents.slice(1),
-            tools: [{ functionDeclarations: toolDeclarations }],
-            generationConfig: { temperature: 0.3, maxOutputTokens: 4096 }
-        });
-
-        const abort = new AbortController();
-        if (signal) signal.addEventListener('abort', () => abort.abort());
-
-        fetch(url, {
-            method: 'POST',
-            headers: { 'Content-Type': 'application/json' },
-            body,
-            signal: abort.signal
-        }).then(async (res) => {
-            if (!res.ok) {
-                const err = await res.text();
-                throw new Error(`Gemini HTTP ${res.status}: ${err.slice(0, 200)}`);
-            }
-            const data = await res.json();
-            if (data.usageMetadata) {
-                const cacheHit = data.usageMetadata.cachedContentTokenCount || 0;
-                trackTokens('gemini', data.usageMetadata.promptTokenCount || 0, data.usageMetadata.candidatesTokenCount || 0, cacheHit > 0, model, cacheHit);
-            }
-            const candidate = data.candidates?.[0];
-            const text = candidate?.content?.parts?.map(p => p.text || '').join('') || '';
-
-            const toolCalls = [];
-            for (const part of (candidate?.content?.parts || [])) {
-                if (part.functionCall) {
-                    toolCalls.push({
-                        id: `call_${Date.now()}_${toolCalls.length}`,
-                        name: part.functionCall.name,
-                        args: part.functionCall.args || {}
-                    });
-                }
-            }
-
-            resolve({ text, toolCalls });
-        }).catch(reject);
-    });
-}
-
-async function callDeepSeekWithTools(messages, tools, signal) {
-    const apiKey = config.deepseek.apiKey;
-    if (!apiKey) throw new Error('Chave DeepSeek não configurada');
-    const model = _currentTaskModel || config.deepseek.model || 'deepseek-v4-flash';
-
-    const toolDefs = tools.map(t => ({
-        type: 'function',
-        function: {
-            name: t.name,
-            description: t.description,
-            parameters: t.parameters.type === 'object' ? t.parameters : {
-                type: 'object',
-                properties: Object.fromEntries(Object.entries(t.parameters).map(([k, v]) => [k, { type: 'string', description: String(v) }])),
-                required: Object.keys(t.parameters)
-            }
-        }
-    }));
-
-    const formattedMessages = messages.map(m => ({
-        role: m.role === 'tool' ? 'tool' : m.role === 'assistant' ? 'assistant' : 'user',
-        content: m.content || '',
-        ...(m.role === 'tool' ? { tool_call_id: m.tool_call_id } : {})
-    }));
-
-    return new Promise((resolve, reject) => {
-        const url = new URL('https://api.deepseek.com/chat/completions');
-        const body = JSON.stringify({
-            model,
-            messages: formattedMessages,
-            tools: toolDefs,
-            temperature: 0.3,
-            max_tokens: 4096
-        });
-
-        const abort = new AbortController();
-        if (signal) signal.addEventListener('abort', () => abort.abort());
-
-        fetch(url, {
-            method: 'POST',
-            headers: { 'Content-Type': 'application/json', 'Authorization': `Bearer ${apiKey}` },
-            body,
-            signal: abort.signal
-        }).then(async (res) => {
-            if (!res.ok) {
-                const err = await res.text();
-                throw new Error(`DeepSeek HTTP ${res.status}: ${err.slice(0, 200)}`);
-            }
-            const data = await res.json();
-            if (data.usage) {
-                const cacheHit = data.usage.prompt_cache_hit_tokens || data.usage.prompt_tokens_details?.cached_tokens || 0;
-                trackTokens('deepseek', data.usage.prompt_tokens || 0, data.usage.completion_tokens || 0, cacheHit > 0, model, cacheHit);
-            }
-            const msg = data.choices?.[0]?.message;
-            const toolCalls = [];
-            if (msg?.tool_calls) {
-                for (const tc of msg.tool_calls) {
-                    toolCalls.push({
-                        id: tc.id,
-                        name: tc.function?.name,
-                        args: JSON.parse(tc.function?.arguments || '{}')
-                    });
-                }
-            }
-            resolve({ text: msg?.content || '', toolCalls });
-        }).catch(reject);
-    });
-}
-
 function classifyRequest(message) {
     const m = (message || '').trim();
-    const mLower = m.toLowerCase();
+    const mLower = stripAccents(m).toLowerCase();
 
     const intent = classifyIntent(message);
 
     if (intent === 'question') return { route: 'answer', reason: 'Pergunta detectada' };
 
     const simplePatterns = [
-        /^(corrig(a|ir)|arrum(a|ar)|consert(a|ar)|fix)\s/i,
-        /^(adicione|adicionar|acrescent(a|ar)|inclu(a|ir))\s.+\s(no|na|em|ao)\s/i,
-        /^(remova|remover|delete|deletar|apag(a|ar)|exclu(a|ir))\s/i,
-        /^(renomei(a|ar)|renomear|mova|mover|move)\s/i,
-        /^(troque|trocar|altere|alterar|mude|mudar|substitua|substituir)\s.+\s(por|para)\s/i,
-        /^(crie|criar|faça|fazer|implemente|implementar)\s.+\s(com|usando|que)\s/i,
-        /^(execute|executar|rode|rodar|teste|testar)\s/i,
-        /^(atualize|atualizar|refatore|refatorar)\s\w+\s/i,
-        /^(formate|formatar|lint|organize|organizar)\s/i,
-        /^(adicione|adicionar|coloque|colocar|ponha|pôr)\s.+\s(no|na|antes|depois|após)\s/i,
-        /^(extraia|extrair|separe|separar|divida|dividir)\s/i,
-        /^(converta|converter|transforme|transformar)\s/i,
+        /^(corrig(a|ir)|arrum(a|ar)|consert(a|ar)|fix|correg(i|ir)|arregla(r)?)\s/i,
+        /^(adicione|adicionar|acrescent(a|ar)|inclu(a|ir)|add)\s.+\s(no|na|em|ao|to|in|into|on|a|en)\s/i,
+        /^(remova|remover|delete|deletar|apag(a|ar)|exclu(a|ir)|remove|elimina(r)?|borra(r)?)\s/i,
+        /^(renomei(a|ar)|renomear|mova|mover|move|rename)\s/i,
+        /^(troque|trocar|altere|alterar|mude|mudar|substitua|substituir|replace|change)\s.+\s(por|para|with|for|to)\s/i,
+        /^(crie|criar|faca|fazer|implemente|implementar|create|make|implement|crea(r)?|crear|implementa(r)?)\s.+\s(com|usando|que|with|using|that)\s/i,
+        /^(execute|executar|rode|rodar|teste|testar|run|test|ejecuta(r)?|ejecutar|prueba(r)?)\s/i,
+        /^(atualize|atualizar|refatore|refatorar|update|refactor|actualiza(r)?|actualizar|refactoriza(r)?)\s\w+\s/i,
+        /^(formate|formatar|lint|organize|organizar|format|organiza(r)?)\s/i,
+        /^(adicione|adicionar|coloque|colocar|ponha|pôr|add|put|agrega(r)?)\s.+\s(no|na|antes|depois|após|to|in|before|after|en|antes|despues)\s/i,
+        /^(extraia|extrair|separe|separar|divida|dividir|extract|split)\s/i,
+        /^(converta|converter|transforme|transformar|convert|transform)\s/i,
     ];
 
     for (const pattern of simplePatterns) {
@@ -4463,9 +4352,9 @@ function classifyRequest(message) {
 
     const complexSignals = [
         /\?/g,
-        /\b(ou|ou então|alternativa|opção|opções|escolha|escolher|qual|como)\b/gi,
-        /\b(qualquer|tanto faz|decida|decidir|sugira|sugerir|recomende|recomendar)\b/gi,
-        /\b(melhorar|melhore|aprimorar|aprimore|otimizar|otimize)\b/gi,
+        /\b(ou|ou então|alternativa|opção|opções|escolha|escolher|qual|como|or|option|options|choice|choose|which|how|o|opcion|opciones|eleccion|elegir|cual)\b/gi,
+        /\b(qualquer|tanto faz|decida|decidir|sugira|sugerir|recomende|recomendar|any|either|decide|suggest|recommend|cualquiera|da igual|decidir|sugiere|recomienda)\b/gi,
+        /\b(melhorar|melhore|aprimorar|aprimore|otimizar|otimize|improve|enhance|optimize|optimise|mejorar|optimizar)\b/gi,
     ];
     let complexityScore = 0;
     for (const sig of complexSignals) {
@@ -4474,7 +4363,7 @@ function classifyRequest(message) {
     }
 
     if (mLower.length < 30) complexityScore += 3;
-    if (mLower.includes('melhorar') && !mLower.includes('arquivo') && !mLower.includes('função')) complexityScore += 2;
+    if (/(melhorar|improve|mejorar)/.test(mLower) && !/(arquivo|funcao|file|function|archivo)/.test(mLower)) complexityScore += 2;
     if (mLower.split(/\s+/).length > 40) complexityScore -= 2;
 
     if (complexityScore >= 3) return { route: 'options', reason: 'Pedido complexo/aberto — gerar opções' };
@@ -4547,9 +4436,10 @@ FORMATO B — Para pedidos CLAROS de correção, alteração ou implementação:
   "resumo": "Resumo do que será feito (1-2 frases)",
   "arquivos": [
     { "caminho": "src/index.js", "acao": "modificar", "explicacao": "o que mudar neste arquivo" },
-    { "caminho": "src/novo.js", "acao": "criar", "explicacao": "o que este arquivo fará" }
+    { "caminho": "src/novo.js", "acao": "criar", "explicacao": "o que este arquivo fará", "ordem": 2 }
   ]
 }
+- "ordem" é OPCIONAL (inteiro, 1 = primeiro): use apenas quando um arquivo DEPENDER de outro criado antes.
 
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 REGRAS:
@@ -4640,6 +4530,10 @@ async function executePlan(plan, onChunk, signal) {
         const acao = a.acao || 'modificar';
         (phases[acao] || phases.modificar).push(a);
     }
+    // Arquivos com "ordem" (dependência) são escritos na sequência indicada;
+    // os sem "ordem" vão ao final. Estável: preserva a ordem original entre iguais.
+    const byOrdem = (x, y) => (Number.isInteger(x.ordem) ? x.ordem : Infinity) - (Number.isInteger(y.ordem) ? y.ordem : Infinity);
+    for (const key of Object.keys(phases)) phases[key].sort(byOrdem);
 
     for (const a of phases.deletar) {
         if (signal && signal.aborted) { cancelled = true; break; }
@@ -4662,24 +4556,19 @@ async function executePlan(plan, onChunk, signal) {
     }
 
     if (!cancelled) {
-        const writeOps = phases.deletar.map(a => (async () => {
-            const ok = deleteFileContent(a.caminho);
+        const ordered = [...phases.deletar, ...phases.modificar, ...phases.criar];
+        for (const a of ordered) {
+            if (signal && signal.aborted) { cancelled = true; break; }
+            const acao = a.acao || 'modificar';
+            let ok = false;
+            try {
+                if (acao === 'deletar') ok = deleteFileContent(a.caminho);
+                else ok = writeFileContent(a.caminho, a.conteudo);
+            } catch (e) {
+                if (onChunk) onChunk('Sistema', `❌ Erro ao escrever ${a.caminho}: ${e.message}\n`);
+            }
             const m = modifications.find(m => m.file === a.caminho);
-            if (m) m.status = ok ? 'deleted' : 'normal';
-        })());
-        writeOps.push(...phases.modificar.map(a => (async () => {
-            const ok = writeFileContent(a.caminho, a.conteudo);
-            const m = modifications.find(m => m.file === a.caminho);
-            if (m) m.status = ok ? 'modified' : 'normal';
-        })()));
-        writeOps.push(...phases.criar.map(a => (async () => {
-            const ok = writeFileContent(a.caminho, a.conteudo);
-            const m = modifications.find(m => m.file === a.caminho);
-            if (m) m.status = ok ? 'created' : 'normal';
-        })()));
-
-        try { await Promise.all(writeOps); } catch (e) {
-            if (onChunk) onChunk('Sistema', `❌ Erro paralelo: ${e.message}\n`);
+            if (m) m.status = ok ? (acao === 'deletar' ? 'deleted' : acao === 'criar' ? 'created' : 'modified') : 'normal';
         }
     }
 
@@ -4701,7 +4590,7 @@ async function executePlan(plan, onChunk, signal) {
     if (cancelled) {
         result += `\n⏹️ **Tarefa cancelada** (${modifications.length} arquivo(s) processado(s)).\n`;
     } else {
-        result += `\n✅ **${modifications.length} arquivo(s) processado(s) em paralelo!**\n`;
+        result += `\n✅ **${modifications.length} arquivo(s) processado(s)!**\n`;
     }
 
     if (modifications.length > 0) {
@@ -6578,6 +6467,15 @@ async function _runPostExecutionDiagnostics(affectedFiles, planResumo) {
             const lintErrors = analyzer.runLinter(filePath, PROJECT_ROOT);
             for (const le of lintErrors) {
                 allLint.push({ file: filePath, line: le.line, column: le.column, message: le.message, severity: le.severity || 'warning', type: le.type || 'linter' });
+            }
+
+            // Type-check semântico real para TypeScript: além da sintaxe, valida
+            // tipos/assinaturas. Só roda em projetos com tsconfig.json (evita
+            // falsos positivos de strict mode em arquivos TS isolados).
+            if (['.ts', '.tsx'].includes(ext) && fs.existsSync(path.join(PROJECT_ROOT, 'tsconfig.json'))) {
+                for (const te of (analyzer.validateWithTSProgram(filePath, PROJECT_ROOT) || []).slice(0, 50)) {
+                    allErrors.push({ file: filePath, line: te.line, column: te.column, message: te.message, severity: te.severity || 'error', type: 'typescript' });
+                }
             }
         } catch (e) {}
     }
