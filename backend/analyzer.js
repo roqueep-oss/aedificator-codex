@@ -89,16 +89,32 @@ const CONTENT_STOPWORDS = new Set(['com', 'que', 'para', 'uma', 'isso', 'este', 
     'try', 'catch', 'throw', 'class', 'extends', 'super', 'this']);
 
 // Índice de termos do conteúdo do arquivo (acentos removidos, minúsculas, sem
-// stopwords, deduplicado e limitado). Permite busca por relevância no conteúdo,
-// não apenas em nomes de arquivo/símbolos.
+// stopwords, deduplicado e limitado). Identificadores camelCase/snake_case são
+// divididos em subpalavras ("authenticateUser" → authenticate, user), permitindo
+// casar termos do pedido com nomes compostos sem depender de embeddings.
+function splitSubWords(token) {
+    const parts = String(token || '')
+        .replace(/^\$+/, '')
+        .replace(/([a-z0-9])([A-Z])/g, '$1 $2')
+        .replace(/([A-Z]+)([A-Z][a-z])/g, '$1 $2')
+        .replace(/[_\-.]+/g, ' ')
+        .split(/\s+/)
+        .filter(Boolean);
+    return parts.length ? parts : [String(token || '').replace(/^\$+/, '')];
+}
+
 function extractContentTokens(content) {
     const tokens = [];
     const seen = new Set();
-    const clean = stripAccentsForIndex(content || '').toLowerCase().replace(/[^\w$]+/g, ' ');
-    for (const w of clean.split(/\s+/)) {
-        if (w.length <= 2 || CONTENT_STOPWORDS.has(w) || seen.has(w)) continue;
-        seen.add(w);
-        tokens.push(w);
+    const clean = stripAccentsForIndex(content || '').replace(/[^\w$]+/g, ' ');
+    for (const raw of clean.split(/\s+/)) {
+        for (let s of splitSubWords(raw)) {
+            s = s.toLowerCase();
+            if (s.length <= 2 || CONTENT_STOPWORDS.has(s) || seen.has(s)) continue;
+            seen.add(s);
+            tokens.push(s);
+            if (tokens.length >= 200) break;
+        }
         if (tokens.length >= 200) break;
     }
     return tokens;
@@ -2256,6 +2272,7 @@ module.exports = {
     FORMATTERS,
     detectCodeSmells,
     detectCodeSmellsEnhanced,
+    splitSubWords,
     validateWithTSProgram,
     getTSSymbols,
     validateWithPythonAST,

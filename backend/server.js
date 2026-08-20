@@ -1607,7 +1607,7 @@ function getToolIcon(toolName) {
     const icons = {
         bash: '⚡', execute_command: '⚡', shell: '⚡',
         read: '📖', read_file: '📖',
-        write: '✏️', write_file: '✏️', edit: '✏️',
+        write: '✏️', write_file: '✏️', edit: '✏️', apply_patch: '✏️',
         glob: '🔍', grep: '🔎',
         task: '🤖', agent: '🤖', subagent: '🤖',
         webfetch: '🌐', websearch: '🔎',
@@ -1642,6 +1642,8 @@ function buildToolLabel(toolName, input) {
         case 'write': case 'write_file':
             return `Escrevendo: ${filePath.slice(0, 60) || 'arquivo'}`;
         case 'edit':
+            return `Editando: ${filePath.slice(0, 60) || 'arquivo'}`;
+        case 'apply_patch':
             return `Editando: ${filePath.slice(0, 60) || 'arquivo'}`;
         case 'glob':
             return `Buscando: ${pattern.slice(0, 60) || '*'}`;
@@ -2249,6 +2251,19 @@ const TOOL_SCHEMAS = {
                 caminho: { type: 'string', description: 'Arquivo ou diretório onde aplicar (opcional, padrão: todo o projeto)' }
             },
             required: ['padrao', 'substituto']
+        }
+    },
+    apply_patch: {
+        name: 'apply_patch',
+        description: 'Substitui um trecho de um arquivo por outro. O old_string é casado de forma tolerante a diferenças de espaços/indentação. Use para edições cirúrgicas; copie o trecho exato do arquivo.',
+        parameters: {
+            type: 'object',
+            properties: {
+                file_path: { type: 'string', description: 'Caminho relativo do arquivo a editar' },
+                old_string: { type: 'string', description: 'Trecho EXATO a ser substituído (copiado do arquivo)' },
+                new_string: { type: 'string', description: 'Novo conteúdo que substituirá old_string' }
+            },
+            required: ['file_path', 'old_string', 'new_string']
         }
     },
     file_rename: {
@@ -2895,6 +2910,24 @@ async function executeAgentTool(name, args) {
                 return count > 0 ? `${count} arquivo(s) alterado(s)` : 'Nenhum arquivo alterado (padrão não encontrado em nenhum arquivo). Tente usar write_file para reescrever o arquivo inteiro.';
             } catch (e) { return `Erro: ${e.message}`; }
         }
+        case 'apply_patch': {
+            try {
+                const full = resolveSafePath(args.file_path || args.caminho || '');
+                if (!full || !fs.existsSync(full)) return 'Erro: arquivo não encontrado';
+                const oldStr = stripBOM(args.old_string || '');
+                const newStr = args.new_string || '';
+                if (!oldStr) return 'Erro: informe old_string';
+                const content = stripBOM(fs.readFileSync(full, 'utf-8'));
+                const { content: newContent, matched } = replaceInContent(content, oldStr, newStr);
+                if (!matched || newContent === content) {
+                    return 'Erro: old_string não encontrado no arquivo. Releia o trecho exato com read_file e tente novamente, ou use write_file para reescrever o arquivo inteiro.';
+                }
+                backupFromContent(path.relative(PROJECT_ROOT, full), content);
+                fs.writeFileSync(full, newContent, 'utf-8');
+                invalidateProjectCache();
+                return 'Patch aplicado com sucesso.';
+            } catch (e) { return `Erro: ${e.message}`; }
+        }
         case 'task': {
             const descricao = args.descricao || args.task || '';
             if (!descricao) return 'Erro: descrição da subtarefa vazia';
@@ -2960,7 +2993,7 @@ const ADVANCED_TOOLS = new Set(['generate_tests', 'browser_navigate', 'browser_s
 function getAgentToolsForMode(mode) {
     const allTools = getAllToolDeclarations();
     if (mode === 'review' || mode === 'plan') {
-        return allTools.filter(t => !['write_file', 'delete_file', 'search_replace', 'file_rename', 'exec_command', 'git_commit', 'git_push', 'git_publish', 'docker_run', 'ssh_exec', 'undo', 'redo', 'snapshot_restore', 'browser_navigate', 'browser_click', 'browser_type', 'task'].includes(t.name));
+        return allTools.filter(t => !['write_file', 'apply_patch', 'delete_file', 'search_replace', 'file_rename', 'exec_command', 'git_commit', 'git_push', 'git_publish', 'docker_run', 'ssh_exec', 'undo', 'redo', 'snapshot_restore', 'browser_navigate', 'browser_click', 'browser_type', 'task'].includes(t.name));
     }
     if (_currentTaskComplexity === 'simple') {
         return allTools.filter(t => !ADVANCED_TOOLS.has(t.name));
@@ -3033,10 +3066,10 @@ function getLanguageQualityRules() {
 
 const AGENT_BEHAVIOR_RULES = `
 REGRAS DE EXECUÇÃO:
-- AÇÃO DIRETA: aja como o opencode. Após 1-2 leituras para entender, EDITE o arquivo (search_replace para mudanças pontuais, write_file para novos/reescritas). Não fique lendo arquivo após arquivo sem modificar nada.
+- AÇÃO DIRETA: aja como o opencode. Após 1-2 leituras para entender, EDITE o arquivo (apply_patch para mudanças pontuais, write_file para novos/reescritas). Não fique lendo arquivo após arquivo sem modificar nada.
 - AUTO-CORREÇÃO: após cada write_file ou search_replace, SE o resultado do validador mostrar ERROS REAIS (não avisos de escopo como "pode não estar definido neste escopo", que são falsos positivos), corrija-os NO MESMO ARQUIVO antes de seguir para outro. Máximo ~3 tentativas por arquivo.
 - VERIFICAÇÃO FINAL: antes de concluir, releia os arquivos alterados (read_file), valide a sintaxe e, se houver testes no projeto, rode test_run. Corrija erros reais antes de finalizar.
-- EDIÇÃO CIRÚRGICA: prefira search_replace para alterações pontuais em arquivos existentes. Use write_file apenas para arquivos novos ou reescritas completas necessárias.
+- EDIÇÃO CIRÚRGICA: prefira apply_patch para alterações pontuais em arquivos existentes. Use write_file apenas para arquivos novos ou reescritas completas necessárias.
 - NÃO EXECUTE SERVIDORES/NPM INSTALL/DEPENDÊNCIAS: evite comandos que não terminam (ex.: node app.js, npm run dev, servidores). Use exec_command apenas para validação rápida (testes, lint, sintaxe) e sempre com fim definido.
 - CONVERGÊNCIA: você SÓ deve finalizar sem modificar nada se a tarefa for uma pergunta ou se concluir com certeza que nenhuma mudança é necessária. Para tarefas de correção/melhoria, você DEVE aplicar a alteração.
 - AMBIGUIDADE: se o pedido for genuinamente ambíguo e houver 2+ direções válidas, use a ferramenta question para perguntar ao usuário ANTES de implementar.${LANGUAGE_RULE}`;
@@ -3081,7 +3114,7 @@ ${getMemoryContext()}
 2. TAREFA: ${task}
 
 3. COMPORTAMENTO (IMPORTANTE — siga rigorosamente):
-- Aja como o opencode: leia o arquivo relevante UMA vez, identifique o problema, e EDITE imediatamente com search_replace (edição cirúrgica) ou write_file (arquivo novo/reescrita).
+- Aja como o opencode: leia o arquivo relevante UMA vez, identifique o problema, e EDITE imediatamente com apply_patch (edição cirúrgica) ou write_file (arquivo novo/reescrita).
 - NÃO fique lendo vários arquivos antes de agir. Máximo 2-3 leituras totais.
 - NÃO use exec_command para ls/dir/cat/type/npm/npx/node -e. Use read_file/search_code.
 - Depois de editar, releia o arquivo (read_file) para confirmar que a mudança ficou correta.
@@ -3626,7 +3659,7 @@ async function runAgentLoop(task, onChunk, signal, mode, history, provider) {
     // Ferramentas que efetivamente alteram o projeto. Tool calls de leitura/
     // busca/browser/execução não contam como ação — se o agente fizer muitas
     // delas sem nunca escrever, entramos num loop de exploração infinito.
-    const WRITE_TOOLS = new Set(['write_file', 'search_replace', 'delete_file', 'file_rename', 'file_mkdir', 'undo', 'redo', 'git_commit', 'git_push', 'git_publish', 'git_stash', 'snapshot_create', 'docker_run', 'ssh_exec']);
+    const WRITE_TOOLS = new Set(['write_file', 'apply_patch', 'search_replace', 'delete_file', 'file_rename', 'file_mkdir', 'undo', 'redo', 'git_commit', 'git_push', 'git_publish', 'git_stash', 'snapshot_create', 'docker_run', 'ssh_exec']);
     const MAX_NO_WRITE_TOOLCALLS = 8;
     let noWriteCount = 0;
     // Rastreia quantas vezes cada arquivo foi lido: reler o mesmo arquivo várias
@@ -3691,8 +3724,8 @@ async function runAgentLoop(task, onChunk, signal, mode, history, provider) {
                         ev: 'tool_start', id: tc.id, tool: tc.name,
                         label: buildToolLabel(tc.name, tc.args), icon: getToolIcon(tc.name),
                         file: tc.args.filePath || tc.args.path || tc.args.file || tc.args.caminho || '',
-                        code: (tc.name === 'write_file' || tc.name === 'search_replace')
-                            ? String(tc.args.content || tc.args.code || tc.args.newContent || '').slice(0, 4000)
+                        code: (tc.name === 'write_file' || tc.name === 'search_replace' || tc.name === 'apply_patch')
+                            ? String(tc.args.content || tc.args.code || tc.args.newContent || tc.args.new_string || '').slice(0, 4000)
                             : ''
                     }));
                     const toolStart = Date.now();
@@ -3732,7 +3765,7 @@ async function runAgentLoop(task, onChunk, signal, mode, history, provider) {
                 }
 
                 const toolResultStr = String(result);
-                if ((tc.name === 'write_file' || tc.name === 'search_replace') && !toolError && hasRealWriteErrors(toolResultStr)) {
+                if ((tc.name === 'write_file' || tc.name === 'search_replace' || tc.name === 'apply_patch') && !toolError && hasRealWriteErrors(toolResultStr)) {
                     autoCorrectPending = true;
                     if (onChunk) onChunk('Sistema', '⚠️ Auto-correção: há erros reais no arquivo. Corrija antes de prosseguir.\n');
                 }
@@ -3752,7 +3785,7 @@ async function runAgentLoop(task, onChunk, signal, mode, history, provider) {
                 messages.push({
                     role: 'user',
                     content: `⚠️ [AÇÃO OBRIGATÓRIA] Você fez ${feitas} chamadas de leitura/busca sem alterar nenhum arquivo.
-1. Se você JÁ identificou a causa raiz, aplique a correção AGORA com search_replace (mudança pontual) ou write_file (arquivo novo/reescrita).
+1. Se você JÁ identificou a causa raiz, aplique a correção AGORA com apply_patch (mudança pontual) ou write_file (arquivo novo/reescrita).
 2. ${dicaReleitura ? dicaReleitura : 'Se ainda não tem certeza da causa, faça NO MÁXIMO 1 leitura adicional FOCADA no arquivo mais provável e aplique a correção imediatamente depois.'}
 NÃO é permitido continuar lendo/buscando/reproduzindo no browser até você alterar ao menos um arquivo.`
                 });
@@ -4107,7 +4140,15 @@ function getRelevantFileContents(message) {
 function extractKeywords(message) {
     const normalized = stripAccents(message || '');
     const clean = normalized.toLowerCase().replace(/[.,!?;:(){}[\]"'/\\]/g, ' ');
-    const words = clean.split(/\s+/).filter(w => w.length > 2);
+    const rawWords = clean.split(/\s+/).filter(w => w.length > 2);
+    // Divide identificadores compostos ("getUserName" → get, user, name) para
+    // casar com as subpalavras do índice de conteúdo.
+    const words = [];
+    for (const w of rawWords) {
+        for (const sub of (analyzer.splitSubWords(w) || [w])) {
+            if (sub.length > 2) words.push(sub);
+        }
+    }
     const stopWords = new Set(['com', 'que', 'para', 'uma', 'isso', 'este', 'como', 'mas', 'por',
         'dos', 'das', 'aos', 'tem', 'sua', 'ser', 'nao', 'mais', 'tudo', 'era', 'foi',
         'the', 'and', 'for', 'with', 'this', 'that', 'from', 'have', 'has', 'was', 'are', 'you',
