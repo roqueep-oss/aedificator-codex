@@ -293,6 +293,8 @@ let config = {
     },
     autoCommit: true,
     memory: false,
+    semanticSearch: false,
+    inlineCompletion: true,
     toolPermissions: {
         ask: ['delete_file', 'file_rename', 'exec_command', 'git_commit', 'git_push', 'git_publish', 'docker_run', 'ssh_exec', 'snapshot_restore'],
         grants: {}
@@ -646,6 +648,8 @@ if (fs.existsSync(configPath)) {
             if (savedConfig.toolPermissions.grants && typeof savedConfig.toolPermissions.grants === 'object') config.toolPermissions.grants = savedConfig.toolPermissions.grants;
         }
         if (typeof savedConfig.memory === 'boolean') config.memory = savedConfig.memory;
+        if (typeof savedConfig.semanticSearch === 'boolean') config.semanticSearch = savedConfig.semanticSearch;
+        if (typeof savedConfig.inlineCompletion === 'boolean') config.inlineCompletion = savedConfig.inlineCompletion;
         const undecrypted = ['gemini', 'deepseek', 'opencode', 'openai', 'claude'].filter(p =>
             savedConfig[p]?.apiKey && String(savedConfig[p].apiKey).startsWith('enc:v1:') && !config[p].apiKey
         );
@@ -676,7 +680,9 @@ function saveConfigToFile() {
         openai: { apiKey: encOr(config.openai.apiKey, existing.openai?.apiKey), model: config.openai.model },
         claude: { apiKey: encOr(config.claude.apiKey, existing.claude?.apiKey), model: config.claude.model },
         toolPermissions: config.toolPermissions,
-        memory: !!config.memory
+        memory: !!config.memory,
+        semanticSearch: !!config.semanticSearch,
+        inlineCompletion: config.inlineCompletion !== false
     };
     fs.writeFileSync(configPath, JSON.stringify(fileConfig, null, 2));
 }
@@ -4083,7 +4089,108 @@ app.post('/api/project/rules', (req, res) => {
 // =============================================
 //  CONTEXTO INTELIGENTE (arquivos relevantes)
 // =============================================
-function getRelevantFileContents(message) {
+
+// Busca semântica OPCIONAL via embeddings (config.semanticSearch). Usa OpenAI
+// (text-embedding-3-small) ou Gemini (text-embedding-004) conforme a chave
+// disponível, com índice cacheado em disco — custo por arquivo é ínfimo e só
+// acontece quando o usuário liga a feature.
+const EMBEDDING_INDEX_FILE = '.aedificator-embeddings.json';
+const EMBEDDING_MAX_FILES = 300;
+
+function getEmbeddingProvider() {
+    if (config.openai?.apiKey) return 'openai';
+    if (config.gemini?.apiKey) return 'gemini';
+    return null;
+}
+
+async function embedText(text) {
+    const provider = getEmbeddingProvider();
+    if (!provider) return null;
+    const input = String(text || '').slice(0, 8000).trim();
+    if (!input) return null;
+    if (provider === 'openai') {
+        const r = await fetchWithTimeout('https://api.openai.com/v1/embeddings', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json', 'Authorization': `Bearer ${config.openai.apiKey}` },
+            body: JSON.stringify({ model: 'text-embedding-3-small', input })
+        }, 30000);
+        if (!r.ok) throw new Error(`Embedding OpenAI HTTP ${r.status}`);
+        const d = await r.json();
+        return d.data?.[0]?.embedding || null;
+    }
+    const r = await fetchWithTimeout(`https://generativelanguage.googleapis.com/v1beta/models/text-embedding-004:embedContent?key=${config.gemini.apiKey}`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ content: { parts: [{ text: input }] } })
+    }, 30000);
+    if (!r.ok) throw new Error(`Embedding Gemini HTTP ${r.status}`);
+    const d = await r.json();
+    return d.embedding?.values || null;
+}
+
+function cosineSimilarity(a, b) {
+    if (!a || !b || a.length !== b.length) return 0;
+    let dot = 0, na = 0, nb = 0;
+    for (let i = 0; i < a.length; i++) { dot += a[i] * b[i]; na += a[i] * a[i]; nb += b[i] * b[i]; }
+    if (!na || !nb) return 0;
+    return dot / (Math.sqrt(na) * Math.sqrt(nb));
+}
+
+function embeddingIndexPath() { return path.join(PROJECT_ROOT, EMBEDDING_INDEX_FILE); }
+
+function loadEmbeddingIndex() {
+    try {
+        if (fs.existsSync(embeddingIndexPath())) return JSON.parse(fs.readFileSync(embeddingIndexPath(), 'utf-8'));
+    } catch (e) {}
+    return { files: {} };
+}
+
+function saveEmbeddingIndex(idx) {
+    try { fs.writeFileSync(embeddingIndexPath(), JSON.stringify(idx)); } catch (e) {}
+}
+
+function fileSignature(absPath) {
+    try { const st = fs.statSync(absPath); return `${st.size}:${st.mtimeMs}`; } catch (e) { return ''; }
+}
+
+// Embeda somente arquivos novos/alterados (assinatura tamanho+mtime), preservando
+// o restante do índice em disco.
+async function buildEmbeddingIndex() {
+    const idx = loadEmbeddingIndex();
+    const files = Object.keys(analyzer.indexProject(PROJECT_ROOT).files || {});
+    let changed = 0;
+    for (const rel of files.slice(0, EMBEDDING_MAX_FILES)) {
+        const abs = resolveSafePath(rel);
+        if (!abs) continue;
+        const sig = fileSignature(abs);
+        if (!sig || (idx.files[rel] && idx.files[rel].sig === sig)) continue;
+        try {
+            const content = fs.readFileSync(abs, 'utf-8').slice(0, 6000);
+            const vec = await embedText(`${rel}\n${content}`);
+            if (vec) { idx.files[rel] = { sig, vec }; changed++; }
+        } catch (e) {}
+    }
+    if (changed) saveEmbeddingIndex(idx);
+    return idx;
+}
+
+async function semanticRelevantFiles(message, topK = 15) {
+    if (!config.semanticSearch || !getEmbeddingProvider()) return [];
+    try {
+        const qv = await embedText(message);
+        if (!qv) return [];
+        const idx = await buildEmbeddingIndex();
+        const scored = [];
+        for (const [rel, entry] of Object.entries(idx.files || {})) {
+            const sim = cosineSimilarity(qv, entry.vec);
+            if (sim > 0) scored.push({ path: rel, score: sim });
+        }
+        scored.sort((a, b) => b.score - a.score);
+        return scored.slice(0, topK).map(s => s.path);
+    } catch (e) { return []; }
+}
+
+async function getRelevantFileContents(message) {
     const relevant = {};
     const idx = analyzer.indexProject(PROJECT_ROOT);
     const keywords = extractKeywords(message);
@@ -4105,6 +4212,15 @@ function getRelevantFileContents(message) {
     }
     scoredFiles.sort((a, b) => b.score - a.score);
     const topFiles = scoredFiles.slice(0, 15).map(f => f.path);
+
+    // Com busca semântica ligada, arquivos similares semanticamente ao pedido
+    // entram na frente — cobre casos que o casamento lexical perde.
+    if (config.semanticSearch) {
+        const semantic = await semanticRelevantFiles(message, 10);
+        for (const f of semantic) {
+            if (!topFiles.includes(f)) topFiles.unshift(f);
+        }
+    }
 
     const ENTRY_NAMES = ['index.js', 'index.ts', 'main.js', 'main.ts', 'app.js', 'app.ts', 'server.js', 'server.ts'];
     for (const ep of ENTRY_NAMES) {
@@ -4505,7 +4621,7 @@ async function analyzeTask(message, onChunk, signal, mode = 'cowork', history = 
         : '(sem histórico)';
 
     const isQuestion = intent === 'question';
-    const relevantFiles = isQuestion ? {} : getRelevantFileContents(message);
+    const relevantFiles = isQuestion ? {} : await getRelevantFileContents(message);
     const projectSummary = isQuestion ? '' : getProjectCache();
 
     if (isQuestion) {
@@ -4782,7 +4898,7 @@ app.post('/api/project/create', (req, res) => {
 });
 
 app.post('/api/config', (req, res) => {
-    const { geminiKey, deepseekKey, opencodeKey, openaiKey, claudeKey, openaiModel, claudeModel, deepseekModel, autoCommit, memory } = req.body;
+    const { geminiKey, deepseekKey, opencodeKey, openaiKey, claudeKey, openaiModel, claudeModel, deepseekModel, autoCommit, memory, semanticSearch, inlineCompletion } = req.body;
     if (geminiKey && geminiKey !== '********') config.gemini.apiKey = geminiKey;
     if (deepseekKey && deepseekKey !== '********') config.deepseek.apiKey = deepseekKey;
     if (opencodeKey && opencodeKey !== '********') {
@@ -4796,6 +4912,8 @@ app.post('/api/config', (req, res) => {
     if (deepseekModel) config.deepseek.model = normalizeDeepseekModel(deepseekModel);
     if (autoCommit !== undefined) config.autoCommit = !!autoCommit;
     if (memory !== undefined) config.memory = !!memory;
+    if (semanticSearch !== undefined) config.semanticSearch = !!semanticSearch;
+    if (inlineCompletion !== undefined) config.inlineCompletion = !!inlineCompletion;
 
     try {
         saveConfigToFile();
@@ -4817,7 +4935,9 @@ app.get('/api/config/get', (req, res) => {
         claudeModel: config.claude.model || '',
         deepseekModel: config.deepseek.model || 'deepseek-v4-flash',
         autoCommit: config.autoCommit,
-        memory: !!config.memory
+        memory: !!config.memory,
+        semanticSearch: !!config.semanticSearch,
+        inlineCompletion: config.inlineCompletion !== false
     });
 });
 
@@ -5994,6 +6114,7 @@ app.post('/api/ai/inline-completion', async (req, res) => {
     const { prefix, suffix, filePath, provider, language } = req.body || {};
     if (!PROJECT_ROOT) return res.status(400).json({ error: 'Nenhum projeto aberto' });
     if (!prefix || prefix.length < 2) return res.json({ completion: '' });
+    if (!config.inlineCompletion) return res.json({ completion: '' });
 
     const prefixSnip = prefix.length > 2000 ? prefix.slice(-2000) : prefix;
     const suffixSnip = (suffix || '').slice(0, 500);
