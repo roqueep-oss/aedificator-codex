@@ -4090,42 +4090,29 @@ app.post('/api/project/rules', (req, res) => {
 //  CONTEXTO INTELIGENTE (arquivos relevantes)
 // =============================================
 
-// Busca semântica OPCIONAL via embeddings (config.semanticSearch). Usa OpenAI
-// (text-embedding-3-small) ou Gemini (text-embedding-004) conforme a chave
-// disponível, com índice cacheado em disco — custo por arquivo é ínfimo e só
-// acontece quando o usuário liga a feature.
+// Busca semântica OPCIONAL (config.semanticSearch). Dois caminhos:
+// - embeddings via OpenAI (text-embedding-3-small), cacheado em disco (rápido e barato);
+// - ranking por LLM (funciona com QUALQUER provider: deepseek, opencode, claude,
+//   gemini) — usado quando não há chave OpenAI, já que DeepSeek/OpenCode não têm API de embeddings.
 const EMBEDDING_INDEX_FILE = '.aedificator-embeddings.json';
 const EMBEDDING_MAX_FILES = 300;
 
-function getEmbeddingProvider() {
-    if (config.openai?.apiKey) return 'openai';
-    if (config.gemini?.apiKey) return 'gemini';
-    return null;
+function hasOpenAIEmbeddings() {
+    return !!config.openai?.apiKey;
 }
 
 async function embedText(text) {
-    const provider = getEmbeddingProvider();
-    if (!provider) return null;
+    if (!hasOpenAIEmbeddings()) return null;
     const input = String(text || '').slice(0, 8000).trim();
     if (!input) return null;
-    if (provider === 'openai') {
-        const r = await fetchWithTimeout('https://api.openai.com/v1/embeddings', {
-            method: 'POST',
-            headers: { 'Content-Type': 'application/json', 'Authorization': `Bearer ${config.openai.apiKey}` },
-            body: JSON.stringify({ model: 'text-embedding-3-small', input })
-        }, 30000);
-        if (!r.ok) throw new Error(`Embedding OpenAI HTTP ${r.status}`);
-        const d = await r.json();
-        return d.data?.[0]?.embedding || null;
-    }
-    const r = await fetchWithTimeout(`https://generativelanguage.googleapis.com/v1beta/models/text-embedding-004:embedContent?key=${config.gemini.apiKey}`, {
+    const r = await fetchWithTimeout('https://api.openai.com/v1/embeddings', {
         method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ content: { parts: [{ text: input }] } })
+        headers: { 'Content-Type': 'application/json', 'Authorization': `Bearer ${config.openai.apiKey}` },
+        body: JSON.stringify({ model: 'text-embedding-3-small', input })
     }, 30000);
-    if (!r.ok) throw new Error(`Embedding Gemini HTTP ${r.status}`);
+    if (!r.ok) throw new Error(`Embedding OpenAI HTTP ${r.status}`);
     const d = await r.json();
-    return d.embedding?.values || null;
+    return d.data?.[0]?.embedding || null;
 }
 
 function cosineSimilarity(a, b) {
@@ -4174,23 +4161,55 @@ async function buildEmbeddingIndex() {
     return idx;
 }
 
-async function semanticRelevantFiles(message, topK = 15) {
-    if (!config.semanticSearch || !getEmbeddingProvider()) return [];
+// Ranking semântico via LLM: seleciona os arquivos mais relevantes usando o
+// próprio provedor de chat (deepseek, opencode, claude, gemini) — sem exigir API
+// de embeddings, que DeepSeek/OpenCode não oferecem.
+async function semanticRelevantFilesLlm(message, topK, provider) {
+    const entries = Object.entries(analyzer.indexProject(PROJECT_ROOT).files || {});
+    if (!entries.length) return [];
+    const candidates = entries.slice(0, 200).map(([rel, p]) => {
+        const syms = [...(p.exports || []), ...(p.functions || []).map(f => f && f.name), ...(p.classes || [])]
+            .filter(Boolean).slice(0, 8).join(', ');
+        return `${rel}${syms ? ` [${syms}]` : ''}`;
+    }).join('\n');
+    const prompt = `Selecione os arquivos mais relevantes para o pedido abaixo. Responda APENAS com os caminhos dos arquivos (um por linha), no máximo ${topK}. Nada de explicações.\n\nPEDIDO: "${message}"\n\nARQUIVOS:\n${candidates}`;
+    const response = await callAI(provider || 'deepseek', prompt, null, null);
+    const known = new Set(entries.map(([rel]) => rel));
+    const byBasename = {};
+    for (const rel of known) { const b = path.basename(rel); if (!byBasename[b]) byBasename[b] = rel; }
+    const picked = [];
+    for (const line of String(response || '').split('\n')) {
+        const raw = line.trim().replace(/^[-*\d.)\s]+/, '').trim();
+        if (!raw) continue;
+        const match = known.has(raw) ? raw : (byBasename[raw] || null);
+        if (!match || picked.includes(match)) continue;
+        picked.push(match);
+        if (picked.length >= topK) break;
+    }
+    return picked;
+}
+
+async function semanticRelevantFiles(message, topK = 15, provider) {
+    if (!config.semanticSearch) return [];
     try {
-        const qv = await embedText(message);
-        if (!qv) return [];
-        const idx = await buildEmbeddingIndex();
-        const scored = [];
-        for (const [rel, entry] of Object.entries(idx.files || {})) {
-            const sim = cosineSimilarity(qv, entry.vec);
-            if (sim > 0) scored.push({ path: rel, score: sim });
+        if (hasOpenAIEmbeddings()) {
+            const qv = await embedText(message);
+            if (qv) {
+                const idx = await buildEmbeddingIndex();
+                const scored = [];
+                for (const [rel, entry] of Object.entries(idx.files || {})) {
+                    const sim = cosineSimilarity(qv, entry.vec);
+                    if (sim > 0) scored.push({ path: rel, score: sim });
+                }
+                scored.sort((a, b) => b.score - a.score);
+                return scored.slice(0, topK).map(s => s.path);
+            }
         }
-        scored.sort((a, b) => b.score - a.score);
-        return scored.slice(0, topK).map(s => s.path);
+        return await semanticRelevantFilesLlm(message, topK, provider);
     } catch (e) { return []; }
 }
 
-async function getRelevantFileContents(message) {
+async function getRelevantFileContents(message, provider) {
     const relevant = {};
     const idx = analyzer.indexProject(PROJECT_ROOT);
     const keywords = extractKeywords(message);
@@ -4213,10 +4232,11 @@ async function getRelevantFileContents(message) {
     scoredFiles.sort((a, b) => b.score - a.score);
     const topFiles = scoredFiles.slice(0, 15).map(f => f.path);
 
-    // Com busca semântica ligada, arquivos similares semanticamente ao pedido
-    // entram na frente — cobre casos que o casamento lexical perde.
+    // Com busca semântica ligada, arquivos semanticamente relevantes ao pedido
+    // entram na frente — cobre casos que o casamento lexical perde. Funciona
+    // com qualquer provider (embeddings OpenAI ou ranking por LLM).
     if (config.semanticSearch) {
-        const semantic = await semanticRelevantFiles(message, 10);
+        const semantic = await semanticRelevantFiles(message, 10, provider);
         for (const f of semantic) {
             if (!topFiles.includes(f)) topFiles.unshift(f);
         }
@@ -4621,7 +4641,7 @@ async function analyzeTask(message, onChunk, signal, mode = 'cowork', history = 
         : '(sem histórico)';
 
     const isQuestion = intent === 'question';
-    const relevantFiles = isQuestion ? {} : await getRelevantFileContents(message);
+    const relevantFiles = isQuestion ? {} : await getRelevantFileContents(message, provider);
     const projectSummary = isQuestion ? '' : getProjectCache();
 
     if (isQuestion) {
