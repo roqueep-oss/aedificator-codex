@@ -7599,6 +7599,17 @@ app.post('/api/build/cancel', (req, res) => {
 
 // ===== WEBSOCKET =====
 
+// Resume o resultado textual do agente em uma linha curta para o chat. Usa o
+// texto real do agente (o que foi feito) e só cai para o fallback quando o texto
+// é vazio ou genérico ("Concluído").
+function summarizeAgentResult(resultText, fallback) {
+    const text = resultText ? String(resultText).replace(/\n+/g, ' ').trim() : '';
+    if (text && !/^(agente conclu[ií]do|conclu[ií]do|done|ok|pronto)$/i.test(text)) {
+        return text.slice(0, 200);
+    }
+    return fallback;
+}
+
 // Cria o callback onChunk padrão que converte eventos do agente em mensagens WS.
 function buildWsOnChunk(ws) {
     return (agent, text) => {
@@ -7912,7 +7923,7 @@ wss.on('connection', (ws, req) => {
                             ws.send(JSON.stringify({ type: 'done', summary: 'Alterações revertidas (testes falharam)', command: task }));
                             return;
                         }
-                        const agentSummary = agentChanges.length > 0 ? `${agentChanges.length} arquivo(s) alterado(s)` : (agentResult ? agentResult.slice(0, 200).trim() : 'Concluído');
+                        const agentSummary = summarizeAgentResult(agentResult, agentChanges.length > 0 ? `${agentChanges.length} arquivo(s) alterado(s)` : 'Concluído');
                         ws.send(JSON.stringify({ type: 'done', summary: agentSummary, modifiedFiles: agentChanges.map(c => c.file), command: task }));
                     } else {
                         ws.send(JSON.stringify({ type: 'done', summary: agentResult ? agentResult.slice(0, 200).trim() : 'Agente concluído ✅', command: task }));
@@ -8066,7 +8077,7 @@ wss.on('connection', (ws, req) => {
                                 ws.send(JSON.stringify({ type: 'done', summary: 'Alterações revertidas (testes falharam)', command: task }));
                                 return;
                             }
-                            const fastSummary = `${fastChanges.length} arquivo(s) alterado(s)`;
+                            const fastSummary = summarizeAgentResult(fastResult, `${fastChanges.length} arquivo(s) alterado(s)`);
                             ws.send(JSON.stringify({ type: 'done', summary: fastSummary, modifiedFiles: fastChanges.map(c => c.file), command: task }));
                         } else {
                             ws.send(JSON.stringify({ type: 'done', summary: fastResult ? fastResult.slice(0, 200).trim() : 'Concluído ✅', command: task }));
