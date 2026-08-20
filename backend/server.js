@@ -3391,13 +3391,16 @@ async function callAgentClaude(messages, tools, signal) {
     const model = _currentTaskModel || config.claude.model || 'claude-sonnet-5';
     const toolDefs = tools.map(t => ({ name: t.name, description: t.description, input_schema: t.parameters }));
 
-    const response = await fetch('https://api.anthropic.com/v1/messages', {
+    const response = await fetchWithTimeout('https://api.anthropic.com/v1/messages', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json', 'x-api-key': apiKey, 'anthropic-version': '2023-06-01' },
-        body: safeJsonStringify({ model, max_tokens: 4096, messages: claudeMessagesFromCanonical(messages), tools: toolDefs }),
-        signal
-    });
-    if (!response.ok) throw new Error(`Claude HTTP ${response.status}: ${(await response.text()).slice(0, 300)}`);
+        body: safeJsonStringify({ model, max_tokens: 4096, messages: claudeMessagesFromCanonical(messages), tools: toolDefs })
+    }, 180000, signal);
+    if (!response.ok) {
+        const errorBody = await response.text().catch(() => '');
+        const hint = getProviderErrorHint(response.status, errorBody, 'claude');
+        throw new Error(hint || `Claude HTTP ${response.status}: ${errorBody.slice(0, 300)}`);
+    }
 
     const data = await response.json();
     if (data.usage) {
@@ -4014,8 +4017,15 @@ function getRelevantFileContents(message) {
     scoredFiles.sort((a, b) => b.score - a.score);
     const topFiles = scoredFiles.slice(0, 15).map(f => f.path);
 
-    for (const ep of ['index.js', 'index.ts', 'main.js', 'main.ts', 'app.js', 'app.ts', 'server.js', 'server.ts']) {
+    const ENTRY_NAMES = ['index.js', 'index.ts', 'main.js', 'main.ts', 'app.js', 'app.ts', 'server.js', 'server.ts'];
+    for (const ep of ENTRY_NAMES) {
         if (idx.files[ep] && !topFiles.includes(ep)) topFiles.unshift(ep);
+    }
+    // Arquivos de entrada em subpastas (ex.: src/index.js) também são incluídos,
+    // mas só até o limite e sem tirar da frente os arquivos casados por keyword.
+    for (const relPath of Object.keys(idx.files)) {
+        if (topFiles.length >= 15) break;
+        if (ENTRY_NAMES.includes(path.basename(relPath)) && !topFiles.includes(relPath)) topFiles.push(relPath);
     }
 
     for (const f of topFiles.slice(0, 15)) {
@@ -4032,10 +4042,10 @@ function extractKeywords(message) {
     const clean = normalized.toLowerCase().replace(/[.,!?;:(){}[\]"'/\\]/g, ' ');
     const words = clean.split(/\s+/).filter(w => w.length > 2);
     const stopWords = new Set(['com', 'que', 'para', 'uma', 'isso', 'este', 'como', 'mas', 'por',
-        'dos', 'das', 'aos', 'tem', 'sua', 'ser', 'não', 'nao', 'mais', 'tudo', 'era', 'foi',
+        'dos', 'das', 'aos', 'tem', 'sua', 'ser', 'nao', 'mais', 'tudo', 'era', 'foi',
         'the', 'and', 'for', 'with', 'this', 'that', 'from', 'have', 'has', 'was', 'are', 'you',
         'your', 'our', 'all', 'not', 'can', 'will', 'should', 'would', 'could', 'when', 'what',
-        'how', 'por', 'una', 'para', 'los', 'las', 'del', 'con', 'que', 'ser', 'mas', 'mas', 'como']);
+        'how', 'una', 'los', 'las', 'del', 'con']);
     const seen = new Set();
     const result = [];
     for (const w of words) {
@@ -4080,9 +4090,11 @@ let _currentTaskComplexity = 'simple';
 
 // Detecta tarefas grandes/abertas que exigem capacidade total do agente. As
 // demais usam limites econômicos (menos iterações, contexto compactado).
-const COMPLEX_TASK_RE = /refatorar|refatore|refactor|reestrutur|migr\w*|mudan[çc]a (grande|completa|total)|mudar (tudo|completo|o app|o projeto|o sistema)|todos (os arquivos|os m[oó]dulos)|v[áa]rios arquivos|arquitetur\w*|nov[oa] m[oó]dulo|nov[oa] funcionalidade completa|implementar por completo|do zero|sistema inteiro|grande refatora|reorganiz|redesenhar/i;
+// Entrada já sem acentos (isComplexTask chama stripAccents) e multilíngue (PT/EN/ES).
+const COMPLEX_TASK_RE = /refatorar|refatore|refactor|reestrutur|restructur|reestructur|migr\w*|mudanca (grande|completa|total)|mudar (tudo|completo|o app|o projeto|o sistema)|cambiar (todo|el proyecto|el sistema)|change (all|everything|the whole)|todos (os arquivos|os modulos|los archivos)|varios arquivos|several files|multiple files|all files|arquitetur|architecture|arquitectura|nov[oa] modulo|nov[oa] funcionalidade completa|implementar por completo|do zero|from scratch|desde cero|sistema inteiro|grande refatora|reorganiz|redesenhar|redesign|redisenar/i;
 function isComplexTask(task) {
-    return (task && task.length > 200) || COMPLEX_TASK_RE.test(task || '');
+    const t = stripAccents(task || '');
+    return t.length > 200 || COMPLEX_TASK_RE.test(t);
 }
 
 const pendingInteractions = new Map();
