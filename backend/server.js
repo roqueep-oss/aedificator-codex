@@ -3031,7 +3031,14 @@ async function executeAgentTool(name, args) {
             const pergunta = args.pergunta || args.question || '';
             if (!pergunta) return 'Erro: pergunta vazia';
             const response = await requestUserInteraction('question', { pergunta }, _currentAgentSignal || null);
-            if (!response || !response.resposta) return 'Usuário não respondeu.';
+            if (!response || !response.resposta) {
+                // Sem resposta: pausa a tarefa em vez de o agente inventar uma
+                // direção e prosseguir. Aborta o sinal para encerrar o loop e
+                // sinaliza ao stream handler para mostrar "aguardando resposta".
+                _awaitingUserAnswer = true;
+                if (_currentAgentSignal) { try { _currentAgentSignal.abort(); } catch (e) {} }
+                throw new Error('Pergunta sem resposta — tarefa pausada aguardando o usuário.');
+            }
             return `Resposta do usuário: ${response.resposta}`;
         }
         case 'todo': {
@@ -3636,7 +3643,9 @@ function requestUserInteraction(kind, payload, signal) {
             pendingInteractions.delete(id);
         };
         const onAbort = () => { if (!settled) { settled = true; cleanup(); resolve(null); } };
-        timer = setTimeout(() => { if (!settled) { settled = true; cleanup(); resolve(null); } }, 120000);
+        // Perguntas de clarificação esperam mais (5 min) que permissões (2 min):
+        // o agente não deve prosseguir no chute logo após o usuário se ausentar.
+        timer = setTimeout(() => { if (!settled) { settled = true; cleanup(); resolve(null); } }, kind === 'question' ? 300000 : 120000);
         if (signal) signal.addEventListener('abort', onAbort, { once: true });
         pendingInteractions.set(id, {
             kind,
@@ -3751,6 +3760,7 @@ async function runAgentLoop(task, onChunk, signal, mode, history, provider) {
     const WRITE_TOOLS = new Set(['write_file', 'apply_patch', 'search_replace', 'delete_file', 'file_rename', 'file_mkdir', 'undo', 'redo', 'git_commit', 'git_push', 'git_publish', 'git_stash', 'snapshot_create', 'docker_run', 'ssh_exec']);
     const MAX_NO_WRITE_TOOLCALLS = 8;
     let noWriteCount = 0;
+    let stoppedEarly = false;
     // Rastreia quantas vezes cada arquivo foi lido: reler o mesmo arquivo várias
     // vezes é sinal de que a causa não está nele, mas no que ele chama.
     const arquivosLidos = new Map();
@@ -3866,6 +3876,13 @@ async function runAgentLoop(task, onChunk, signal, mode, history, provider) {
             if (noWriteCount >= MAX_NO_WRITE_TOOLCALLS) {
                 const feitas = noWriteCount;
                 noWriteCount = 0;
+                // Se o agente JÁ escreveu arquivos e agora só está verificando
+                // (browser/lendo) sem novas escritas, não há mais o que forçar —
+                // conclui em vez de ficar preso até a iteração 20.
+                if (diffSnapshots(loopStartSnapshot, snapshotProjectFiles()).length > 0) {
+                    stoppedEarly = true;
+                    break;
+                }
                 const relidos = Array.from(arquivosLidos.entries()).filter(([, n]) => n >= 2).map(([f]) => f);
                 if (onChunk) onChunk('Sistema', `⚠️ ${feitas} chamadas de leitura/busca sem alterar arquivos. Forçando ação...\n`);
                 const dicaReleitura = relidos.length
@@ -3892,9 +3909,13 @@ NÃO é permitido continuar lendo/buscando/reproduzindo no browser até você al
         const loopChanges = diffSnapshots(loopStartSnapshot, snapshotProjectFiles());
         if (loopChanges.length > 0) {
             const fileList = loopChanges.slice(0, 8).map(c => `${c.file} (${c.action})`).join(', ');
-            return `Limite de iterações atingido — ${loopChanges.length} arquivo(s) alterado(s): ${fileList}${loopChanges.length > 8 ? '...' : ''}`;
+            return stoppedEarly
+                ? `${loopChanges.length} arquivo(s) alterado(s): ${fileList}${loopChanges.length > 8 ? '...' : ''}`
+                : `Limite de iterações atingido — ${loopChanges.length} arquivo(s) alterado(s): ${fileList}${loopChanges.length > 8 ? '...' : ''}`;
         }
-        return 'Limite de iterações atingido sem alterações de arquivos — o pedido pode ser amplo demais; separe em tarefas menores ou use o modo Direto.';
+        return stoppedEarly
+            ? 'Concluído'
+            : 'Limite de iterações atingido sem alterações de arquivos — o pedido pode ser amplo demais; separe em tarefas menores ou use o modo Direto.';
     } finally {
         _currentAgentProvider = prevProvider;
         _currentAgentSignal = prevSignal;
@@ -4507,6 +4528,9 @@ function isComplexTask(task) {
 
 const pendingInteractions = new Map();
 let _interactionSeq = 0;
+// Marca que o agente pausou por falta de resposta a uma pergunta de clarificação.
+// Usado no catch do stream para dar mensagem clara em vez de "Tarefa cancelada".
+let _awaitingUserAnswer = false;
 
 function registerChildProcess(child) {
     _activeChildProcesses.push(child);
@@ -8609,7 +8633,9 @@ wss.on('connection', (ws, req) => {
                     content = '⏰ A tarefa excedeu o tempo máximo (10 minutos) e foi interrompida. Tente novamente ou divida o pedido em etapas menores.';
                 } else if (cancelled) {
                     type = 'cancelled';
-                    content = '⏹️ Tarefa cancelada';
+                    content = _awaitingUserAnswer
+                        ? '⏸️ Aguardando sua resposta. Envie uma nova mensagem para continuar.'
+                        : '⏹️ Tarefa cancelada';
                 } else {
                     type = 'error';
                     content = `❌ ${error.message}`;
@@ -8634,6 +8660,7 @@ wss.on('connection', (ws, req) => {
                 ws._taskActive = false;
                 _lastProjectSnapshot = null;
                 _lastProjectFileList = null;
+                _awaitingUserAnswer = false;
             }
             return;
         }
