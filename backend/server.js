@@ -1059,9 +1059,9 @@ async function fetchWithTimeout(url, options = {}, timeoutMs = 120000, externalS
     }
 }
 
-async function callGemini(prompt, onChunk, signal) {
+async function callGemini(prompt, onChunk, signal, forcedModel) {
     const apiKey = config.gemini.apiKey;
-    const model = _currentTaskModel || config.gemini.model || 'gemini-3.5-flash';
+    const model = forcedModel || _currentTaskModel || config.gemini.model || 'gemini-3.5-flash';
 
     if (!apiKey) {
         throw new Error('Chave API Gemini não configurada!');
@@ -1902,7 +1902,7 @@ function normalizeDeepseekModel(model) {
     return model;
 }
 
-async function callDeepSeek(prompt, onChunk, signal) {
+async function callDeepSeek(prompt, onChunk, signal, forcedModel) {
     const apiKey = config.deepseek.apiKey;
     if (!apiKey) {
         throw new Error('Chave API DeepSeek não configurada!');
@@ -1915,7 +1915,7 @@ async function callDeepSeek(prompt, onChunk, signal) {
     }
 
     const cachePrefix = getDeepseekCachePrefix();
-    const model = _currentTaskModel || config.deepseek.model || 'deepseek-v4-flash';
+    const model = forcedModel || _currentTaskModel || config.deepseek.model || 'deepseek-v4-flash';
     const url = 'https://api.deepseek.com/chat/completions';
     const safePrompt = sanitizeForJson(prompt);
     const safeSystem = sanitizeForJson(cachePrefix);
@@ -2026,10 +2026,10 @@ async function callAI(provider, prompt, onChunk, signal, model) {
 }
 
 // ===== OpenAI (ChatGPT) =====
-async function callOpenAI(prompt, onChunk, signal) {
+async function callOpenAI(prompt, onChunk, signal, forcedModel) {
     const apiKey = config.openai.apiKey;
     if (!apiKey) throw new Error('Chave OpenAI não configurada');
-    const model = _currentTaskModel || config.openai.model || 'gpt-4o';
+    const model = forcedModel || _currentTaskModel || config.openai.model || 'gpt-4o';
 
     return new Promise((resolve, reject) => {
         const url = new URL('https://api.openai.com/v1/chat/completions');
@@ -4161,13 +4161,94 @@ async function buildEmbeddingIndex() {
     return idx;
 }
 
+// Índice semântico batch: descrição curta por arquivo (gerada uma vez pelo LLM,
+// cacheada em disco por assinatura). Pré-filtra candidatos antes do ranking LLM,
+// eliminando o custo de re-avaliar todos os arquivos a cada consulta.
+const SEMANTIC_INDEX_FILE = '.aedificator-semantic.json';
+const SEMANTIC_BUILD_BATCH_MAX = 60;
+
+function semanticIndexPath() { return path.join(PROJECT_ROOT, SEMANTIC_INDEX_FILE); }
+function loadSemanticIndex() {
+    try { if (fs.existsSync(semanticIndexPath())) return JSON.parse(fs.readFileSync(semanticIndexPath(), 'utf-8')); } catch (e) {}
+    return { files: {} };
+}
+function saveSemanticIndex(idx) { try { fs.writeFileSync(semanticIndexPath(), JSON.stringify(idx)); } catch (e) {} }
+
+// Processa no máximo SEMANTIC_BUILD_BATCH_MAX arquivos novos por chamada (o
+// restante é indexado incrementalmente nas próximas consultas), para não travar
+// a primeira requisição com dezenas de chamadas LLM.
+async function buildSemanticIndex(provider) {
+    const idx = loadSemanticIndex();
+    const parsed = analyzer.indexProject(PROJECT_ROOT).files || {};
+    const allFiles = Object.keys(parsed);
+    const pending = [];
+    for (const rel of allFiles.slice(0, EMBEDDING_MAX_FILES)) {
+        const abs = resolveSafePath(rel);
+        if (!abs) continue;
+        const sig = fileSignature(abs);
+        if (!sig || (idx.files[rel] && idx.files[rel].sig === sig)) continue;
+        pending.push(rel);
+        if (pending.length >= SEMANTIC_BUILD_BATCH_MAX) break;
+    }
+    const BATCH = 20;
+    for (let i = 0; i < pending.length; i += BATCH) {
+        const batch = pending.slice(i, i + BATCH);
+        const list = batch.map((rel) => {
+            const p = parsed[rel] || {};
+            const syms = [...(p.exports || []), ...(p.functions || []).map(f => f && f.name), ...(p.classes || [])]
+                .filter(Boolean).slice(0, 8).join(', ');
+            return `${rel}${syms ? ` [${syms}]` : ''}`;
+        }).join('\n');
+        const prompt = `Para cada arquivo abaixo, responda UMA linha no formato exato "caminho :: descrição" (descrição de até 12 palavras do que o arquivo faz). Nada de markdown nem explicações extras.\n\n${list}`;
+        try {
+            const resp = await callAI(provider || 'deepseek', prompt, null, null);
+            for (const line of String(resp || '').split('\n')) {
+                const m = line.match(/^([^:]+?)\s*::\s*(.+)$/);
+                if (!m) continue;
+                const name = m[1].trim();
+                const desc = m[2].trim();
+                const actual = batch.find(x => x === name) || batch.find(x => path.basename(x) === path.basename(name));
+                if (!actual) continue;
+                const abs = resolveSafePath(actual);
+                const sig = abs ? fileSignature(abs) : '';
+                if (sig && desc) idx.files[actual] = { sig, desc };
+            }
+        } catch (e) {}
+    }
+    saveSemanticIndex(idx);
+    return idx;
+}
+
+async function semanticShortlist(message, topK, provider) {
+    const idx = await buildSemanticIndex(provider);
+    const kws = extractKeywords(message);
+    const scored = [];
+    for (const [rel, entry] of Object.entries(idx.files || {})) {
+        const hay = stripAccents(`${rel} ${entry.desc || ''}`).toLowerCase();
+        let s = 0;
+        for (const kw of kws) if (hay.includes(kw)) s++;
+        if (s > 0) scored.push({ path: rel, score: s });
+    }
+    scored.sort((a, b) => b.score - a.score);
+    return scored.slice(0, Math.max(topK, 30)).map(s => s.path);
+}
+
 // Ranking semântico via LLM: seleciona os arquivos mais relevantes usando o
 // próprio provedor de chat (deepseek, opencode, claude, gemini) — sem exigir API
 // de embeddings, que DeepSeek/OpenCode não oferecem.
 async function semanticRelevantFilesLlm(message, topK, provider) {
     const entries = Object.entries(analyzer.indexProject(PROJECT_ROOT).files || {});
     if (!entries.length) return [];
-    const candidates = entries.slice(0, 200).map(([rel, p]) => {
+    const parsed = analyzer.indexProject(PROJECT_ROOT).files || {};
+    // Pré-filtro barato via descrições indexadas (sem custo LLM): restringe o
+    // ranking a ~30 candidatos em vez de todos os arquivos.
+    let candidatePaths;
+    try {
+        candidatePaths = await semanticShortlist(message, topK, provider);
+    } catch (e) { candidatePaths = []; }
+    if (!candidatePaths.length) candidatePaths = entries.slice(0, 200).map(([rel]) => rel);
+    const candidates = candidatePaths.map((rel) => {
+        const p = parsed[rel] || {};
         const syms = [...(p.exports || []), ...(p.functions || []).map(f => f && f.name), ...(p.classes || [])]
             .filter(Boolean).slice(0, 8).join(', ');
         return `${rel}${syms ? ` [${syms}]` : ''}`;
@@ -6130,6 +6211,21 @@ app.post('/api/analyzer/completions', (req, res) => {
 });
 
 // ===== AI INLINE COMPLETION (PRIORIDADE 2) =====
+
+// Compleção usa o provider/modelo mais barato disponível (não necessariamente o
+// do chat) — é a feature de maior frequência, então custo/velocidade importam.
+function pickCompletionProvider() {
+    const order = ['deepseek', 'gemini', 'openai', 'claude'];
+    for (const p of order) if (config[p]?.apiKey) return p;
+    if (getOpenCodeAuthKey()) return 'opencode';
+    return null;
+}
+
+function completionModelFor(provider) {
+    const cheap = { deepseek: 'deepseek-v4-flash', gemini: 'gemini-3.5-flash-lite', openai: 'gpt-4o-mini', claude: 'claude-haiku-4.5' };
+    return cheap[provider] || null;
+}
+
 app.post('/api/ai/inline-completion', async (req, res) => {
     const { prefix, suffix, filePath, provider, language } = req.body || {};
     if (!PROJECT_ROOT) return res.status(400).json({ error: 'Nenhum projeto aberto' });
@@ -6166,7 +6262,9 @@ ${suffixSnip}
 Complete o código após o cursor. Apenas a continuação:`;
 
     try {
-        const completion = await callAI(provider || 'gemini', prompt, null, null);
+        const completionProvider = pickCompletionProvider() || provider || 'gemini';
+        const completionModel = completionModelFor(completionProvider);
+        const completion = await callAI(completionProvider, prompt, null, null, completionModel);
         const clean = (completion || '')
             .replace(/```[\s\S]*?```/g, '')
             .replace(/^\s*[\r\n]+/, '')
