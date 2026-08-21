@@ -6960,7 +6960,12 @@ async function _runPostExecutionDiagnostics(affectedFiles, planResumo) {
             }
         };
         walkTests(PROJECT_ROOT, '');
-        if (testFiles.length && detectedFramework) {
+        // Só roda testes (e reverte em falha) quando havia testes ANTES do pedido.
+        // Teste criado AGORA pelo agente não dispara rollback automático: evita
+        // reverter trabalho novo quando o modelo gera teste com sintaxe de outro
+        // framework (ex.: describe/it do Jest rodando sob o fallback "node --test").
+        const preExistingTests = testFiles.filter(f => _lastProjectFileList && _lastProjectFileList.has(f));
+        if (testFiles.length && detectedFramework && preExistingTests.length) {
             const { command, args } = detectedFramework;
             broadcastAll({ type: 'test-status', status: 'running', message: '[' + command + '] ' + testFiles.length + ' teste(s)...' });
             // Timeout de 120s: testes que nunca terminam (ex.: Jest com watch mode ou
