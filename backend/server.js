@@ -6333,6 +6333,28 @@ function completionModelFor(provider) {
     return cheap[provider] || null;
 }
 
+// FIM (fill-in-the-middle) do DeepSeek: completa o trecho entre prefixo e sufixo
+// de forma nativa — mais rápido e barato que o chat, e melhor para o meio do arquivo.
+// Endpoint beta /completions (máx 4K tokens de resposta).
+async function callDeepSeekFim(prefix, suffix, model) {
+    const apiKey = config.deepseek.apiKey;
+    if (!apiKey) throw new Error('Chave DeepSeek não configurada');
+    const m = model || 'deepseek-v4-flash';
+    const body = { model: m, prompt: prefix, max_tokens: 256, temperature: 0.2 };
+    if (suffix) body.suffix = suffix;
+    const r = await fetchWithTimeout('https://api.deepseek.com/beta/completions', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', 'Authorization': `Bearer ${apiKey}` },
+        body: JSON.stringify(body)
+    }, 20000);
+    if (!r.ok) throw new Error(`DeepSeek FIM HTTP ${r.status}`);
+    const data = await r.json();
+    if (data.usage) {
+        trackTokens('deepseek', data.usage.prompt_tokens || 0, data.usage.completion_tokens || 0, false, m);
+    }
+    return data.choices?.[0]?.text || '';
+}
+
 app.post('/api/ai/inline-completion', async (req, res) => {
     const { prefix, suffix, filePath, provider, language } = req.body || {};
     if (!PROJECT_ROOT) return res.status(400).json({ error: 'Nenhum projeto aberto' });
@@ -6371,7 +6393,17 @@ Complete o código após o cursor. Apenas a continuação:`;
     try {
         const completionProvider = pickCompletionProvider() || provider || 'gemini';
         const completionModel = completionModelFor(completionProvider);
-        const completion = await callAI(completionProvider, prompt, null, null, completionModel);
+        let completion;
+        if (completionProvider === 'deepseek') {
+            try {
+                completion = await callDeepSeekFim(prefixSnip, suffixSnip, completionModel);
+            } catch (e) {
+                // FIM indisponível (ex.: modelo sem suporte) → cai no chat completion.
+                completion = await callAI(completionProvider, prompt, null, null, completionModel);
+            }
+        } else {
+            completion = await callAI(completionProvider, prompt, null, null, completionModel);
+        }
         const clean = (completion || '')
             .replace(/```[\s\S]*?```/g, '')
             .replace(/^\s*[\r\n]+/, '')
