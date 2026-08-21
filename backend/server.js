@@ -1615,7 +1615,7 @@ function getToolIcon(toolName) {
         read: '📖', read_file: '📖',
         write: '✏️', write_file: '✏️', edit: '✏️', apply_patch: '✏️',
         glob: '🔍', grep: '🔎',
-        task: '🤖', agent: '🤖', subagent: '🤖',
+        task: '🤖', agent: '🤖', subagent: '🤖', parallel_task: '🤖',
         webfetch: '🌐', websearch: '🔎',
         todowrite: '📝', todo: '📝', question: '❓',
         skill: '🎯', lsp: '🔬',
@@ -1661,6 +1661,8 @@ function buildToolLabel(toolName, input) {
             return `Pesquisando: ${(query || pattern || '').slice(0, 60)}`;
         case 'task': case 'agent': case 'subagent':
             return `Sub-agente: ${(desc || prompt || '').slice(0, 60)}`;
+        case 'parallel_task':
+            return `Subagentes paralelos (${Array.isArray(inp.tarefas) ? inp.tarefas.length : '?'})`;
         case 'todowrite': case 'todo':
             return `Planejando tarefas`;
         case 'question':
@@ -2534,6 +2536,21 @@ const TOOL_SCHEMAS = {
             required: ['pergunta']
         }
     },
+    parallel_task: {
+        name: 'parallel_task',
+        description: 'Executa várias subtarefas de investigação EM PARALELO (somente leitura) e retorna um resumo de cada uma. Use para investigar áreas independentes do código de uma só vez, sem poluir o contexto do agente principal.',
+        parameters: {
+            type: 'object',
+            properties: {
+                tarefas: {
+                    type: 'array',
+                    description: 'Lista de descrições de subtarefas (máximo 3)',
+                    items: { type: 'string' }
+                }
+            },
+            required: ['tarefas']
+        }
+    },
     todo: {
         name: 'todo',
         description: 'Cria ou atualiza a lista de tarefas do plano atual. Use para expor um plano rastreável do trabalho em andamento.',
@@ -2947,6 +2964,24 @@ async function executeAgentTool(name, args) {
                 return `Erro no subagente: ${e.message}`;
             }
         }
+        case 'parallel_task': {
+            const lista = Array.isArray(args.tarefas) ? args.tarefas : [];
+            const subProvider = _currentAgentProvider || 'gemini';
+            const subSignal = _currentAgentSignal || null;
+            const tasks = lista.slice(0, 3).map(d => String(d || '').trim()).filter(Boolean);
+            if (!tasks.length) return 'Erro: informe uma lista de subtarefas';
+            const runOne = async (descricao) => {
+                const subPrompt = `Você é um subagente de investigação. Execute APENAS esta subtarefa e retorne um resumo conciso (máximo 150 palavras).\n\nSUBTAREFA: ${descricao}\n\nUse as ferramentas de leitura (read_file, search_code, list_files, analyzer_symbols) para investigar. NÃO modifique arquivos.`;
+                try {
+                    const summary = await runAgentLoop(subPrompt, null, subSignal, 'plan', [], subProvider);
+                    return `[${descricao.slice(0, 60)}] ${summary ? String(summary).slice(0, 1200) : 'sem resumo'}`;
+                } catch (e) {
+                    return `[${descricao.slice(0, 60)}] Erro: ${e.message}`;
+                }
+            };
+            const results = await Promise.all(tasks.map(runOne));
+            return `Subagentes paralelos concluídos (${results.length}):\n\n${results.join('\n\n')}`;
+        }
         case 'question': {
             const pergunta = args.pergunta || args.question || '';
             if (!pergunta) return 'Erro: pergunta vazia';
@@ -2994,12 +3029,12 @@ function getAllToolDeclarations() {
 
 // Ferramentas avançadas/raras, escondidas em tarefas simples: menos tokens no
 // schema (custo) e menos chance de o agente escolher uma ferramenta inadequada.
-const ADVANCED_TOOLS = new Set(['generate_tests', 'browser_navigate', 'browser_screenshot', 'browser_click', 'browser_type', 'browser_evaluate', 'browser_console', 'browser_content', 'git_publish', 'git_push', 'git_pull', 'git_branch', 'git_log', 'git_stash', 'snapshot_create', 'snapshot_list', 'snapshot_restore', 'debug_start', 'debug_stop', 'debug_step', 'debug_resume', 'ssh_exec', 'ssh_status', 'docker_run', 'task']);
+const ADVANCED_TOOLS = new Set(['generate_tests', 'browser_navigate', 'browser_screenshot', 'browser_click', 'browser_type', 'browser_evaluate', 'browser_console', 'browser_content', 'git_publish', 'git_push', 'git_pull', 'git_branch', 'git_log', 'git_stash', 'snapshot_create', 'snapshot_list', 'snapshot_restore', 'debug_start', 'debug_stop', 'debug_step', 'debug_resume', 'ssh_exec', 'ssh_status', 'docker_run', 'task', 'parallel_task']);
 
 function getAgentToolsForMode(mode) {
     const allTools = getAllToolDeclarations();
     if (mode === 'review' || mode === 'plan') {
-        return allTools.filter(t => !['write_file', 'apply_patch', 'delete_file', 'search_replace', 'file_rename', 'exec_command', 'git_commit', 'git_push', 'git_publish', 'docker_run', 'ssh_exec', 'undo', 'redo', 'snapshot_restore', 'browser_navigate', 'browser_click', 'browser_type', 'task'].includes(t.name));
+        return allTools.filter(t => !['write_file', 'apply_patch', 'delete_file', 'search_replace', 'file_rename', 'exec_command', 'git_commit', 'git_push', 'git_publish', 'docker_run', 'ssh_exec', 'undo', 'redo', 'snapshot_restore', 'browser_navigate', 'browser_click', 'browser_type', 'task', 'parallel_task'].includes(t.name));
     }
     if (_currentTaskComplexity === 'simple') {
         return allTools.filter(t => !ADVANCED_TOOLS.has(t.name));
