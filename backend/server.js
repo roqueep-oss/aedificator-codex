@@ -1615,7 +1615,7 @@ function getToolIcon(toolName) {
         read: '📖', read_file: '📖',
         write: '✏️', write_file: '✏️', edit: '✏️', apply_patch: '✏️',
         glob: '🔍', grep: '🔎',
-        task: '🤖', agent: '🤖', subagent: '🤖', parallel_task: '🤖',
+        task: '🤖', agent: '🤖', subagent: '🤖', parallel_task: '🤖', parallel_write: '✏️',
         webfetch: '🌐', websearch: '🔎',
         todowrite: '📝', todo: '📝', question: '❓',
         skill: '🎯', lsp: '🔬',
@@ -1663,6 +1663,8 @@ function buildToolLabel(toolName, input) {
             return `Sub-agente: ${(desc || prompt || '').slice(0, 60)}`;
         case 'parallel_task':
             return `Subagentes paralelos (${Array.isArray(inp.tarefas) ? inp.tarefas.length : '?'})`;
+        case 'parallel_write':
+            return `Edição paralela (${Array.isArray(inp.tarefas) ? inp.tarefas.length : '?'} arquivos)`;
         case 'todowrite': case 'todo':
             return `Planejando tarefas`;
         case 'question':
@@ -2551,6 +2553,21 @@ const TOOL_SCHEMAS = {
             required: ['tarefas']
         }
     },
+    parallel_write: {
+        name: 'parallel_write',
+        description: 'Aplica alterações em VÁRIOS arquivos independentes EM PARALELO. Cada item indica o arquivo a modificar e o que fazer nele. Use apenas para mudanças em arquivos que NÃO dependem um do outro, para acelerar a escrita.',
+        parameters: {
+            type: 'object',
+            properties: {
+                tarefas: {
+                    type: 'array',
+                    description: 'Lista de { caminho, descricao } (máximo 3, arquivos distintos)',
+                    items: { type: 'object', properties: { caminho: { type: 'string' }, descricao: { type: 'string' } } }
+                }
+            },
+            required: ['tarefas']
+        }
+    },
     todo: {
         name: 'todo',
         description: 'Cria ou atualiza a lista de tarefas do plano atual. Use para expor um plano rastreável do trabalho em andamento.',
@@ -2982,6 +2999,34 @@ async function executeAgentTool(name, args) {
             const results = await Promise.all(tasks.map(runOne));
             return `Subagentes paralelos concluídos (${results.length}):\n\n${results.join('\n\n')}`;
         }
+        case 'parallel_write': {
+            const lista = Array.isArray(args.tarefas) ? args.tarefas : [];
+            const subProvider = _currentAgentProvider || 'gemini';
+            const subSignal = _currentAgentSignal || null;
+            const seenFiles = new Set();
+            const tasks = [];
+            for (const t of lista.slice(0, 3)) {
+                const caminho = String((t && t.caminho) || '').trim();
+                const descricao = String((t && t.descricao) || '').trim();
+                if (!caminho || !descricao || seenFiles.has(caminho)) continue;
+                seenFiles.add(caminho);
+                tasks.push({ caminho, descricao });
+            }
+            if (!tasks.length) return 'Erro: informe uma lista de { caminho, descricao } (arquivos distintos)';
+            const runOne = async ({ caminho, descricao }) => {
+                const subPrompt = `Você é um subagente de edição. Modifique APENAS o arquivo "${caminho}" conforme a tarefa. Leia o arquivo (read_file) e aplique a mudança com apply_patch (edição cirúrgica) ou write_file (reescrita). NÃO altere NENHUM outro arquivo.\n\nTAREFA: ${descricao}\n\nAo final, responda em 1 linha o que foi alterado.`;
+                try {
+                    const summary = await runAgentLoop(subPrompt, null, subSignal, 'write_subagent', [], subProvider);
+                    return `[${caminho}] ${summary ? String(summary).slice(0, 800) : 'sem resumo'}`;
+                } catch (e) {
+                    return `[${caminho}] Erro: ${e.message}`;
+                }
+            };
+            const results = await Promise.all(tasks.map(runOne));
+            invalidateProjectCache();
+            analyzer.invalidateIndex();
+            return `Edição paralela concluída (${results.length}):\n\n${results.join('\n\n')}`;
+        }
         case 'question': {
             const pergunta = args.pergunta || args.question || '';
             if (!pergunta) return 'Erro: pergunta vazia';
@@ -3029,12 +3074,15 @@ function getAllToolDeclarations() {
 
 // Ferramentas avançadas/raras, escondidas em tarefas simples: menos tokens no
 // schema (custo) e menos chance de o agente escolher uma ferramenta inadequada.
-const ADVANCED_TOOLS = new Set(['generate_tests', 'browser_navigate', 'browser_screenshot', 'browser_click', 'browser_type', 'browser_evaluate', 'browser_console', 'browser_content', 'git_publish', 'git_push', 'git_pull', 'git_branch', 'git_log', 'git_stash', 'snapshot_create', 'snapshot_list', 'snapshot_restore', 'debug_start', 'debug_stop', 'debug_step', 'debug_resume', 'ssh_exec', 'ssh_status', 'docker_run', 'task', 'parallel_task']);
+const ADVANCED_TOOLS = new Set(['generate_tests', 'browser_navigate', 'browser_screenshot', 'browser_click', 'browser_type', 'browser_evaluate', 'browser_console', 'browser_content', 'git_publish', 'git_push', 'git_pull', 'git_branch', 'git_log', 'git_stash', 'snapshot_create', 'snapshot_list', 'snapshot_restore', 'debug_start', 'debug_stop', 'debug_step', 'debug_resume', 'ssh_exec', 'ssh_status', 'docker_run', 'task', 'parallel_task', 'parallel_write']);
 
 function getAgentToolsForMode(mode) {
     const allTools = getAllToolDeclarations();
     if (mode === 'review' || mode === 'plan') {
-        return allTools.filter(t => !['write_file', 'apply_patch', 'delete_file', 'search_replace', 'file_rename', 'exec_command', 'git_commit', 'git_push', 'git_publish', 'docker_run', 'ssh_exec', 'undo', 'redo', 'snapshot_restore', 'browser_navigate', 'browser_click', 'browser_type', 'task', 'parallel_task'].includes(t.name));
+        return allTools.filter(t => !['write_file', 'apply_patch', 'delete_file', 'search_replace', 'file_rename', 'exec_command', 'git_commit', 'git_push', 'git_publish', 'docker_run', 'ssh_exec', 'undo', 'redo', 'snapshot_restore', 'browser_navigate', 'browser_click', 'browser_type', 'task', 'parallel_task', 'parallel_write'].includes(t.name));
+    }
+    if (mode === 'write_subagent') {
+        return allTools.filter(t => ['read_file', 'list_files', 'search_code', 'analyzer_symbols', 'analyzer_validate', 'apply_patch', 'write_file', 'search_replace'].includes(t.name));
     }
     if (_currentTaskComplexity === 'simple') {
         return allTools.filter(t => !ADVANCED_TOOLS.has(t.name));
