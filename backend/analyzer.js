@@ -351,14 +351,20 @@ function validateCode(code, filePath, rootDir) {
 
 function checkJSSyntax(code) {
     const errors = [];
-    if (/(import\s+React|from\s+['"]react['"]|<[A-Z]\w*[\s/>]|@tailwind|@import\s+['"]|body\s*\{|\.\w+\s*\{)/.test(code)) {
+    // Remove blocos <style>...</style> (CSS embutido em template literals) antes
+    // de validar: o conteúdo deles não é JS e não pode justificar pular a checagem.
+    // Sem isso, um .js com <style> corrompido passava como "sintaticamente válido".
+    const withoutStyle = String(code || '').replace(/<style[^>]*>[\s\S]*?<\/style>/gi, '');
+    // Mantém o skip apenas para sintaxe que o acorn realmente não parseia (JSX/React).
+    // CSS dentro de strings/template literals é opaco ao parser e não precisa de skip.
+    if (/(import\s+React|from\s+['"]react['"]|<[A-Z]\w*[\s/>])/.test(withoutStyle)) {
         return errors;
     }
     const ac = getAcorn();
     if (!ac) return errors;
 
     try {
-        ac.parse(code, { ecmaVersion: 2022, sourceType: 'module', locations: true, allowAwaitOutsideFunction: true });
+        ac.parse(withoutStyle, { ecmaVersion: 2022, sourceType: 'module', locations: true, allowAwaitOutsideFunction: true });
     } catch (e) {
         errors.push({
             type: 'syntax',

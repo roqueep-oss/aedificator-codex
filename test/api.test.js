@@ -627,3 +627,21 @@ test('search_code com regex global encontra todas as ocorrências (não pula)', 
         fs.rmSync(projectRoot, { recursive: true, force: true });
     }
 });
+
+test('analyzer detecta erro de sintaxe em JS com <style> embutido', () => {
+    const analyzer = require(SERVER_PATH.replace(/server\.js$/, 'analyzer.js'));
+    const projectRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'aedificator-ide-style-'));
+    try {
+        // CSS dentro de <style> (em template literal) não pode pular a validação JS:
+        // o "const M = {" duplicado é erro de sintaxe real.
+        const code = 'const M = {\n  const html = `<style>.x { color:red }</style>`;\n  const M = {\n}';
+        const r = analyzer.validateCode(code, 'broken.js', projectRoot);
+        assert.ok(r.errors.some(e => e.type === 'syntax'), 'deve achar erro de sintaxe: ' + JSON.stringify(r.errors.map(e => e.message)));
+
+        const valido = 'const M = {\n  render() { return `<style>.x { color:red }</style>`; }\n};\nif (typeof module !== "undefined") module.exports = M;';
+        const r2 = analyzer.validateCode(valido, 'ok.js', projectRoot);
+        assert.ok(!r2.errors.some(e => e.type === 'syntax'), 'JS válido com <style> não pode dar erro de sintaxe: ' + JSON.stringify(r2.errors.map(e => e.message)));
+    } finally {
+        fs.rmSync(projectRoot, { recursive: true, force: true });
+    }
+});
