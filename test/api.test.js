@@ -645,3 +645,14 @@ test('analyzer detecta erro de sintaxe em JS com <style> embutido', () => {
         fs.rmSync(projectRoot, { recursive: true, force: true });
     }
 });
+
+test('question sem resposta pausa a tarefa (não prossegue no chute)', async () => {
+    const { executeAgentTool } = require(SERVER_PATH);
+    // Sem callback de stream ativo, requestUserInteraction resolve null imediatamente,
+    // simulando a pergunta que ficou sem resposta. O agente deve PARAR (throw),
+    // não retornar "Usuário não respondeu." e continuar inventando uma direção.
+    await assert.rejects(
+        () => executeAgentTool('question', { pergunta: 'Qual melhoria você quer?' }),
+        /Pergunta sem resposta/
+    );
+});
