@@ -16,25 +16,31 @@ Ferramenta de desenvolvimento assistida por IA que analisa, planeja e aplica alt
 - `npm start` abre o app em uma janela do Electron.
 
 ## Primeiros passos
-1. Clique em **🔑 Chave** e cadastre sua chave da API Gemini (ou DeepSeek).
+1. Abra **⚙️ Configurações → Chaves API** e cadastre a chave de pelo menos um provedor: **Google Gemini**, **DeepSeek**, **OpenAI**, **Anthropic** ou **opencode**.
 2. Clique em **📁 Selecionar Pasta** e escolha a pasta raiz do projeto.
 3. Digite um comando no chat (ex.: *"Crie um arquivo server.js com Express"*).
-4. A IA analisa, monta um **plano** e aguarda sua **aprovação** antes de alterar arquivos.
+4. A IA analisa, monta um **plano** e aguarda sua **aprovação** antes de alterar arquivos (ou, no modo Smart/Auto, executa conforme a classificação do pedido).
 
 ## Recursos
 - **Explorador de arquivos** com ícones por tipo e cores de status (editando=vermelho, modificado=verde, criado=azul).
 - **Editor de arquivos com abas** (clique em um arquivo; salve com `Ctrl+S`).
 - **Visualização de imagens** (PNG, JPG, GIF, SVG, etc.).
-- **Aprovação de plano** com opção de execução automática (⚡).
+- **Aprovação de plano** com opção de execução automática (⚡) e **modo 💡 Opções** (o app analisa e apresenta opções para você escolher antes de executar).
 - **Backups versionados** antes de cada alteração (até 10 versões por arquivo) — restaure pelo botão ↩️.
 - **Snapshots rotulados da pasta** (botão 📸): salve uma versão completa da pasta com um rótulo, liste, veja o diff e restaure quando quiser.
 - **Executar comandos** no projeto (ex.: `npm test`, `npm run build`) — barra ▶️ ou `/run <comando>` no chat.
-- **Busca** por nome de arquivo e conteúdo no explorador (🔍).
+- **Busca** por nome de arquivo, conteúdo (🔍), **busca avançada** com regex/substituição e **busca semântica** (com embeddings).
+- **Terminal integrado** (Ctrl+B), **navegador integrado** (🌐) e **live preview HTML**.
+- **Test Runner** (🧪): auto-discovery e execução de Jest/pytest/go test/etc.
+- **Git**: status, commit, push, pull, branches, merge, stash, diff visual e blame.
+- **Debug** (🐛): Node.js, Python, Go e Chrome/Edge (via DevTools Protocol).
+- **Docker** (🐳): build, run, stop, logs de containers.
+- **SSH Remoto** (🔗): conectar e executar comandos em servidor remoto.
+- **Publicação automática**: detecta repositório GitHub/GitLab e publica tags/com um clique (botão 🚀).
+- **Agentes de IA**: múltiplos provedores (Gemini, DeepSeek, OpenAI, Claude, opencode), modelo selecionável, contexto de conversa, subagentes paralelos, ferramentas de edição (apply_patch, write_file, search_replace), rollback automático em erros.
+- **Modos de trabalho**: Agente, Equipe, Esclarecer, Código e Arquitetura, além dos modos **Smart/Auto** (classificação automática do pedido).
+- **Dashboard de custos IA** (📊), **preços por modelo** (💲) e **logs de erro** (📋).
 - **Histórico de chat por projeto** e **projetos recentes**.
-- **Git**: status e commit pelo botão 🔀.
-- **Publicação automática de membros**: detecta repositório GitHub/GitLab na pasta e publica tags/com aceite um clique (botão 🚀).
-- **Modos de trabalho**: Equipe, Esclarecer, Código e Arquitetura (ajustam o comportamento da IA).
-- **Contexto de conversa**: a IA leva em conta o histórico do chat.
 - **Reconexão automática** do WebSocket com o backend.
 - **Tema claro/escuro** (botão ☀️/🌙).
 - Exportar e limpar conversa.

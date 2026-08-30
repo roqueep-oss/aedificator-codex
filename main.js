@@ -502,10 +502,12 @@ app.on('activate', () => {
 
 process.on('uncaughtException', (error) => {
     console.error('❌ Erro não tratado:', error);
+    process.exit(1);
 });
 
 process.on('unhandledRejection', (reason) => {
     console.error('❌ Rejeição não tratada:', reason);
+    process.exit(1);
 });
 
 console.log('🏗️ Aedificator Codex IDE aguardando eventos...');

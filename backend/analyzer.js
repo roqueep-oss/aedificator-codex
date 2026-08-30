@@ -212,6 +212,24 @@ function parseParams(paramsStr) {
 //  VALIDADOR DE CÓDIGO
 // =============================================
 
+function _withValidation(fn) {
+    return function (filePath, rootDir) {
+        const errors = [];
+        try {
+            const absPath = path.resolve(rootDir, filePath);
+            if (!fs.existsSync(filePath)) return errors;
+            const result = fn(absPath, rootDir);
+            if (Array.isArray(result)) return result;
+            if (result && typeof result === 'object') errors.push(...result);
+        } catch (e) {
+            // Fallback para validação básica se a específica falhar
+            try { const basic = basicSyntaxCheck('', 'file'); /* fallback básico */ } catch (_) {}
+            errors.push({ type: 'file', line: 1, column: 1, message: 'Validação falhou: ' + (e.message || String(e)), severity: 'error' });
+        }
+        return errors;
+    };
+}
+
 function basicSyntaxCheck(code, langType) {
     const errors = [];
     const lines = code.split('\n');
@@ -272,30 +290,26 @@ const COMPILER_INSTALL_HINTS = {
 };
 
 function safeValidate(filePath, rootDir, langType, nativeValidator, requiredCmd) {
-    const errors = [];
     const absPath = path.resolve(rootDir, filePath);
-    if (!fs.existsSync(absPath)) return errors;
+    if (!fs.existsSync(absPath)) return [];
 
-    let nativeRan = false;
-    try {
-        const nativeErrors = nativeValidator(filePath, rootDir);
-        nativeRan = true;
-        errors.push(...nativeErrors);
-    } catch (e) {}
-
-    if (!nativeRan) {
-        const hint = COMPILER_INSTALL_HINTS[langType] || '';
-        const hintMsg = hint ? `Instale: ${hint}` : '';
-        if (hintMsg) {
-            errors.push({ type: langType, line: 1, column: 1, message: `${requiredCmd || langType} não encontrado. ${hintMsg}. Usando validação básica.`, severity: 'info' });
-        }
+    return _withValidation(() => {
+        const errors = [];
         try {
-            const content = fs.readFileSync(absPath, 'utf-8');
-            errors.push(...basicSyntaxCheck(content, langType));
-        } catch (e) {}
-    }
-
-    return errors;
+            const nativeErrors = nativeValidator(filePath, rootDir);
+            errors.push(...nativeErrors);
+        } catch (e) {
+            // Erros do validador nativo são capturados abaixo
+        }
+        // Se o validador nativo falhou ou não foi possível executar, usar validação básica
+        if (errors.length === 0) {
+            try {
+                const content = fs.readFileSync(absPath, 'utf-8');
+                errors.push(...basicSyntaxCheck(content, langType));
+            } catch (e) {}
+        }
+        return errors;
+    })(filePath, rootDir);
 }
 
 function validateCode(code, filePath, rootDir) {

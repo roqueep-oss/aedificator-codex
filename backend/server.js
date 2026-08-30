@@ -11,10 +11,23 @@ require('dotenv').config({ path: path.join(__dirname, '.env') });
 const { McpManager } = require('./mcp-client');
 const mcpManager = new McpManager();
 const { browserClient, getBrowserStatus, executeBrowserTool } = require('./browser-client');
+const { stripAccents, classifyIntent, classifyRequest } = require('./ai/classify');
+const { LANGUAGE_RULE, MODE_INSTRUCTIONS, AGENT_BEHAVIOR_RULES, getAgentSystemPrompt, getDeepSeekAgentPrompt } = require('./ai/prompts');
+const { TOOL_SCHEMAS, AGENT_TOOLS, ADVANCED_TOOLS, stripBOM, normalizeLine, replaceIgnoringIndent, replaceInContent, getAllToolDeclarations, getAgentToolsForMode, setToolContext, executeAgentTool } = require('./ai/tools');
+const { callAgentProvider, callAgentProviderWithFallback, getConfiguredProviders, setProvidersContext } = require('./ai/providers');
+const { runAgentLoop, setLoopContext } = require('./ai/loop');
 
 // ===== ENCODING UTF-8 (evita acentos corrompidos no console Windows) =====
 process.stdout.setDefaultEncoding('utf8');
 process.stderr.setDefaultEncoding('utf8');
+
+// ====== HELPER: detecta Formato B (arquivos sem conteúdo) ======
+// O analyzeTask retorna Formato B quando o request é claro de correção/impl.
+// Nesse caso, os arquivos vêm SEM 'conteudo' — o agente deve escrevê-lo.
+// Esse helper centraliza a checagem para evitar repetir o padrão em 3 lugares.
+function isFormatoB(plan) {
+    return !!(plan && plan.arquivos && plan.arquivos.length > 0 && !plan.sugestoes);
+}
 
 const app = express();
 
@@ -276,7 +289,7 @@ let config = {
     },
     deepseek: {
         apiKey: process.env.DEEPSEEK_API_KEY || '',
-        model: 'deepseek-v4-flash',
+        model: 'deepseek-v4-pro',
         reasoningEffort: 'medium'
     },
     opencode: {
@@ -663,6 +676,10 @@ if (fs.existsSync(configPath)) {
     }
 }
 
+// Sincroniza as chaves de provedor para o opencode logo na inicialização,
+// para que o modo opencode esteja pronto antes de qualquer tarefa.
+syncOpenCodeProviderAuth();
+
 function saveConfigToFile() {
     let existing = {};
     try {
@@ -854,23 +871,6 @@ function deleteFileContent(filePath) {
 // ===== BACKUP VERSIONADO ANTES DE ALTERAR/APAGAR =====
 const MAX_BACKUP_VERSIONS = 10;
 
-function backupRelativePath(relativePath) {
-    const fullPath = resolveSafePath(relativePath);
-    if (!fullPath || !fs.existsSync(fullPath)) return null;
-    const backupRoot = path.join(PROJECT_ROOT, BACKUP_DIR_NAME);
-    const ts = Date.now();
-    const backupFile = path.join(backupRoot, relativePath + '.' + ts);
-    try {
-        fs.mkdirSync(path.dirname(backupFile), { recursive: true });
-        fs.copyFileSync(fullPath, backupFile);
-        trimOldBackups(relativePath);
-        return backupFile;
-    } catch (e) {
-        console.error('❌ Erro ao fazer backup:', e);
-        return null;
-    }
-}
-
 function trimOldBackups(relativePath) {
     const backupRoot = path.join(PROJECT_ROOT, BACKUP_DIR_NAME);
     const dir = path.dirname(path.join(backupRoot, relativePath));
@@ -890,6 +890,27 @@ function trimOldBackups(relativePath) {
             try { fs.unlinkSync(path.join(dir, v.name)); } catch (e) { console.warn("Backup trim unlink:", e.message); }
         }
     }
+}
+
+function _backupCore(relativePath, writeFn) {
+    const fullPath = resolveSafePath(relativePath);
+    if (!fullPath || !fs.existsSync(fullPath)) return null;
+    const backupRoot = path.join(PROJECT_ROOT, BACKUP_DIR_NAME);
+    const ts = Date.now();
+    const backupFile = path.join(backupRoot, relativePath + '.' + ts);
+    try {
+        fs.mkdirSync(path.dirname(backupFile), { recursive: true });
+        writeFn(fullPath, backupFile);
+        trimOldBackups(relativePath);
+        return backupFile;
+    } catch (e) {
+        console.error('❌ Erro ao fazer backup:', e);
+        return null;
+    }
+}
+
+function backupRelativePath(relativePath) {
+    return _backupCore(relativePath, (src, dst) => fs.copyFileSync(src, dst));
 }
 
 function listBackups() {
@@ -1027,8 +1048,8 @@ async function retryWithBackoff(fn, { maxRetries = 3, baseDelay = 1000, maxDelay
     throw lastError;
 }
 
-function getProviderErrorHint(statusCode, errorBody, provider) {
-    const msg = (errorBody || '').toLowerCase();
+function _errorHint(statusCode, errorBody, provider) {
+    const msg = (typeof errorBody === 'string' ? errorBody : (errorBody && errorBody.message || '')).toLowerCase();
     if (statusCode === 401 || msg.includes('invalid api key') || msg.includes('incorrect api key') || msg.includes('unauthorized'))
         return `🔑 Chave API ${provider.toUpperCase()} inválida. Verifique em Configurações.`;
     if (statusCode === 402 || msg.includes('insufficient_quota') || msg.includes('billing') || msg.includes('credit') || msg.includes('balance'))
@@ -1040,6 +1061,10 @@ function getProviderErrorHint(statusCode, errorBody, provider) {
     if (statusCode >= 500)
         return `🔥 Servidor ${provider.toUpperCase()} instável. Tente novamente em alguns segundos.`;
     return '';
+}
+
+function getProviderErrorHint(statusCode, errorBody, provider) {
+    return _errorHint(statusCode, errorBody, provider);
 }
 
 const RETRY_STATUSES = new Set([429, 500, 502, 503, 504]);
@@ -1153,13 +1178,24 @@ async function callGemini(prompt, onChunk, signal, forcedModel) {
 }
 
 function resolveOpenCodeBinary() {
-    if (process.platform !== 'win32') return 'opencode';
-    const candidates = [
-        path.join(process.env.APPDATA || '', 'npm', 'node_modules', 'opencode-ai', 'bin', 'opencode.exe'),
-        path.join(process.env.LOCALAPPDATA || '', 'opencode', 'opencode.exe')
+    // Prioriza o binário EMPACOTADO com o projeto (node_modules local), para o
+    // Aedificator ser autossuficiente e não depender de uma instalação global.
+    const projectNodeModules = [
+        path.join(__dirname, '..', 'node_modules', 'opencode-ai', 'bin', 'opencode.exe'),
+        path.join(__dirname, '..', 'resources', 'opencode', 'bin', 'opencode.exe')
     ];
-    for (const c of candidates) {
+    for (const c of projectNodeModules) {
         if (fs.existsSync(c)) return c;
+    }
+    // Fallback para instalação global (ex.: durante desenvolvimento).
+    if (process.platform === 'win32') {
+        const globalCandidates = [
+            path.join(process.env.APPDATA || '', 'npm', 'node_modules', 'opencode-ai', 'bin', 'opencode.exe'),
+            path.join(process.env.LOCALAPPDATA || '', 'opencode', 'opencode.exe')
+        ];
+        for (const c of globalCandidates) {
+            if (fs.existsSync(c)) return c;
+        }
     }
     return 'opencode';
 }
@@ -1265,47 +1301,84 @@ function getOpenCodeAuthKey() {
     }
 }
 
+// ===== SINCRONIZA AS CHAVES DOS PROVEDORES NO auth.json DO OPEncode =====
+// Permite usar o harness do opencode com as mesmas chaves já cadastradas no
+// Aedificator (DeepSeek, Gemini→Google, OpenAI, Claude→Anthropic), sem exigir
+// que o usuário as configure de novo no CLI. Apenas ADICIONA/atualiza as chaves
+// que existem no Aedificator; não remove nem sobrescreve as que já estão lá.
+// Os pares [id no opencode, chave no config do Aedificator] são lidos dinamicamente
+// na hora da chamada, para a função poder rodar em qualquer ponto do carregamento
+// do módulo sem erro de Temporal Dead Zone (constante usada antes de inicializar).
+function getOpenCodeProviderKeyPairs() {
+    return [
+        ['deepseek', config.deepseek?.apiKey],
+        ['anthropic', config.claude?.apiKey],
+        ['openai', config.openai?.apiKey],
+        ['google', config.gemini?.apiKey]
+    ];
+}
+
+function syncOpenCodeProviderAuth() {
+    try {
+        const dataDir = path.join(os.homedir(), '.local', 'share', 'opencode');
+        const authFile = path.join(dataDir, 'auth.json');
+        let auth = {};
+        if (fs.existsSync(authFile)) {
+            try { auth = JSON.parse(fs.readFileSync(authFile, 'utf-8')); } catch (e) {}
+        }
+        let changed = false;
+        // Usa os pares obtidos na hora da chamada, evitando depender de uma
+        // constante definida depois deste ponto no módulo.
+        for (const [providerId, key] of getOpenCodeProviderKeyPairs()) {
+            if (!key) continue;
+            if (!auth[providerId] || auth[providerId].key !== key) {
+                auth[providerId] = { type: 'api', key };
+                changed = true;
+            }
+        }
+        if (changed) {
+            fs.mkdirSync(dataDir, { recursive: true });
+            fs.writeFileSync(authFile, JSON.stringify(auth, null, 2), 'utf-8');
+            console.log('✅ Chaves dos provedores sincronizadas no auth.json do opencode');
+        }
+    } catch (e) {
+        console.log('⚠️ Não foi possível sincronizar as chaves no opencode:', e.message);
+    }
+}
+
 // ===== LISTAR MODELOS OPEncode (TODOS ou apenas FREE) =====
 function parseOpenCodeModelsVerbose(raw, allModels = false) {
     const models = [];
     const lines = raw.split('\n');
+    // Percorre uma única vez, agrupando cada "opencode/<id>" com o JSON na linha
+    // seguinte, sem re-varredura de caractere por caractere (o CLI retorna milhares
+    // de linhas; a versão antiga era O(n²) e travava o seletor).
     let i = 0;
     while (i < lines.length) {
         const m = lines[i].trim().match(/^opencode\/([\w.-]+)$/);
         if (!m) { i++; continue; }
         const shortId = m[1];
-        let depth = 0, inString = false, started = false;
-        const jsonLines = [];
-        let j = i + 1;
-        for (; j < lines.length; j++) {
-            const line = lines[j];
-            jsonLines.push(line);
-            for (let k = 0; k < line.length; k++) {
-                const ch = line[k];
-                if (inString) {
-                    if (ch === '\\') { k++; continue; }
-                    if (ch === '"') inString = false;
-                } else if (ch === '"') {
-                    inString = true;
-                } else if (ch === '{') {
-                    depth++;
-                    started = true;
-                } else if (ch === '}') {
-                    depth--;
-                    if (started && depth === 0) break;
-                }
+        // O JSON com metadados (name, free) vem na linha imediatamente seguinte.
+        let name = shortId;
+        let isFree = /free/i.test(shortId);
+        const next = i + 1;
+        if (next < lines.length) {
+            const jsonLine = lines[next].trim();
+            if (jsonLine.startsWith('{')) {
+                const nameM = jsonLine.match(/"name"\s*:\s*"([^"]+)"/);
+                if (nameM) name = nameM[1];
+                isFree = /free/i.test(name) || /free/i.test(shortId);
+                // Pula a linha do JSON já consumida.
+                i = next + 1;
+            } else {
+                i = next;
             }
-            if (started && depth === 0) break;
+        } else {
+            i++;
         }
-        try {
-            const obj = JSON.parse(jsonLines.join('\n'));
-            const name = obj.name || shortId;
-            const isFree = /free/i.test(name) || /free/i.test(shortId);
-            if (allModels || isFree) {
-                models.push({ id: 'opencode/' + shortId, name, provider: 'opencode', free: isFree });
-            }
-        } catch (e) {}
-        i = j + 1;
+        if (allModels || isFree) {
+            models.push({ id: 'opencode/' + shortId, name, provider: 'opencode', free: isFree });
+        }
     }
     return models;
 }
@@ -1373,6 +1446,52 @@ function listOpenCodeFreeModels() {
     return listOpenCodeModels(false);
 }
 
+// Modelos ATIVOS dos provedores diretos (google/deepseek/anthropic/openai), já com
+// nome de exibição limpo. É um catálogo curado (sem modelos antigos/descontinuados),
+// usado no seletor do provedor opencode em vez da listagem crua do CLI — que traz
+// dezenas de modelos legados. O nome de exibição segue "Provedor + Modelo", e a lista
+// é devolvida em ordem alfabética pelo nome. Modelos fora desta lista podem ser
+// usados via a opção "✏️ Outro modelo" do seletor.
+const ACTIVE_DIRECT_MODELS = [
+    { id: 'deepseek/deepseek-v4-pro', name: 'DeepSeek V4 Pro' },
+    { id: 'deepseek/deepseek-v4-flash', name: 'DeepSeek V4 Flash' },
+    { id: 'deepseek/deepseek-chat', name: 'DeepSeek Chat' },
+    { id: 'deepseek/deepseek-reasoner', name: 'DeepSeek Reasoner' },
+    { id: 'google/gemini-3.7-flash', name: 'Gemini 3.7 Flash' },
+    { id: 'google/gemini-3.6-flash', name: 'Gemini 3.6 Flash' },
+    { id: 'google/gemini-3.5-flash', name: 'Gemini 3.5 Flash' },
+    { id: 'google/gemini-3.5-flash-lite', name: 'Gemini 3.5 Flash Lite' },
+    { id: 'google/gemini-3.1-pro', name: 'Gemini 3.1 Pro' },
+    { id: 'google/gemini-3.1-flash-lite', name: 'Gemini 3.1 Flash Lite' },
+    { id: 'google/gemini-3-flash', name: 'Gemini 3 Flash' },
+    { id: 'anthropic/claude-opus-5', name: 'Claude Opus 5' },
+    { id: 'anthropic/claude-sonnet-5', name: 'Claude Sonnet 5' },
+    { id: 'anthropic/claude-haiku-4.5', name: 'Claude Haiku 4.5' },
+    { id: 'openai/gpt-4o', name: 'GPT-4o' },
+    { id: 'openai/gpt-4o-mini', name: 'GPT-4o Mini' }
+];
+
+const DIRECT_PROVIDER_LABELS = {
+    deepseek: 'DeepSeek', google: 'Gemini', anthropic: 'Claude', openai: 'GPT'
+};
+
+// Lista os modelos ativos dos provedores diretos, ordenados por nome de exibição.
+// Não consulta o CLI: usa o catálogo curado acima, garantindo que apenas modelos
+// atuais apareçam e que a ordem seja sempre alfabética.
+function listAllProviderModels() {
+    return ACTIVE_DIRECT_MODELS
+        .map(m => {
+            const providerId = m.id.split('/')[0];
+            return {
+                id: m.id,
+                name: m.name,
+                provider: (DIRECT_PROVIDER_LABELS[providerId] || providerId) + ' (sua chave)',
+                free: false
+            };
+        })
+        .sort((a, b) => a.name.localeCompare(b.name, 'pt-BR'));
+}
+
 function listOpenCodeModels(allModels = false) {
     const binary = resolveOpenCodeBinary();
     return new Promise((resolve, reject) => {
@@ -1403,15 +1522,35 @@ function listOpenCodeModels(allModels = false) {
 }
 
 // ===== MONTA O PROMPT DO OPEncode COM MODO E HISTÓRICO =====
-// Regra de idioma: todo diálogo do chat deve ser em português do Brasil.
-const LANGUAGE_RULE = `
-IDIOMA (OBRIGATÓRIO): Responda SEMPRE em português do Brasil (pt-BR), mesmo que o código, comentários ou trechos da conversa estejam em inglês. Use vocabulário brasileiro (ex.: "arquivo", "pasta", "executar", "teste").`;
+// Regra de idioma (LANGUAGE_RULE) agora vive em ./ai/prompts.js
 
-function buildOpenCodePrompt(message, mode, history) {
+function buildOpenCodePrompt(message, mode, history, isOptionsMode = false) {
     const modeInstruction = MODE_INSTRUCTIONS[mode] || MODE_INSTRUCTIONS.cowork;
     const historyText = (history && history.length)
         ? history.slice(-15).map(h => `- ${h.role === 'user' ? 'Usuário' : 'Assistente'}: ${String(h.content || '').slice(0, 800)}`).join('\n')
         : '(sem histórico)';
+
+    // No modo Opções/Recomendação, o agente deve ANALISAR o código de verdade e
+    // propor melhorias ESPECÍFICAS e RANQUEADAS (da mais complexa para a mais
+    // simples), devolvendo JSON — em vez de opções genéricas "Completo/Médio/Mínimo".
+    const optionsBlock = isOptionsMode ? `
+
+⚠️ MODO OPÇÕES — OBRIGATÓRIO:
+A solicitação pede sugestões de melhoria/análise do código. Você DEVE:
+1. Analisar os arquivos reais do projeto (use read_file/search_code/grep) para entender o estado do código.
+2. Propor de 3 a 5 melhorias CONCRETAS e específicas, baseadas no que realmente está no código (ex.: "Corrigir XSS no sanitizador de texto", "Extrair função duplicada em X", "Adicionar validação de entrada em Y", "Corrigir vazamento de dados em Z").
+3. Ordená-las da MAIS COMPLEXA para a MAIS SIMPLES de implementar.
+4. NÃO alterar nenhum arquivo — apenas analisar e listar.
+
+Responda APENAS com um JSON válido, sem texto antes ou depois (sem markdown, sem explicações):
+{
+  "resumo": "resumo de 1-2 frases sobre o estado do app",
+  "sugestoes": [
+    {"id":"s1","titulo":"Melhoria mais complexa","descricao":"O que envolve, onde e por quê. 1-2 frases.","impacto":"alto"},
+    {"id":"s2","titulo":"Melhoria intermediária","descricao":"O que envolve. 1-2 frases.","impacto":"médio"},
+    {"id":"s3","titulo":"Melhoria mais simples","descricao":"O que envolve. 1-2 frases.","impacto":"baixo"}
+  ]
+}` : '';
 
     return `Você é o Aedificator Codex IDE, um assistente de desenvolvimento prático que opera no diretório atual do projeto.
 ${LANGUAGE_RULE}
@@ -1465,7 +1604,8 @@ Execute a solicitação no diretório do projeto seguindo estas REGRAS:
 - REGRA DE OURO: pode melhorar o código, mas funções existentes devem continuar funcionando com o mesmo comportamento.
 - Só crie/modifique/delete arquivos se o usuário pedir EXPLICITAMENTE.
 - NUNCA faça mudanças drásticas (refatorações grandes, reescritas completas) sem o usuário pedir.
-- SEJA CONCISO: responda de forma curta e direta. Nada de explicações longas.`;
+- SEJA CONCISO: responda de forma curta e direta. Nada de explicações longas.
+${optionsBlock}`;
 }
 
 // ===== SNAPSHOT DOS ARQUIVOS PARA DETECTAR MUDANÇAS DO OPEncode =====
@@ -1731,7 +1871,11 @@ async function callOpenCode(prompt, onChunk, signal, model, onToolEvent) {
         ? ['run', '--format', 'json', '--attach', `http://127.0.0.1:${opencodeServerPort}`, '--dir', PROJECT_ROOT]
         : ['run', '--format', 'json'];
     let useModel = model || _currentTaskModel || OPENCODE_DEFAULT_MODEL;
-    if (!useModel.startsWith('opencode/') && !useModel.startsWith('opencode-go/')) {
+    // Modelos com prefixo de provedor direto (deepseek/, anthropic/, openai/,
+    // google/) são usados como estão: o opencode roteia para a chave do provedor
+    // (sincronizada no auth.json). Qualquer outro nome (sem prefixo) é tratado
+    // como modelo do gateway opencode (Zen) e recebe o prefixo "opencode/".
+    if (!/^(opencode|opencode-go|deepseek|anthropic|openai|google)\//.test(useModel)) {
         useModel = 'opencode/' + useModel;
     }
     args.push('--model', useModel);
@@ -2177,925 +2321,12 @@ function extractJson(text) {
 // =============================================
 //  MODOS DE TRABALHO
 // =============================================
-const MODE_INSTRUCTIONS = {
-    cowork: 'Modo Equipe (conservador): se o usuário fizer uma pergunta, análise ou pedir opinião/sugestões, responda no "resumo" e NÃO altere arquivos (deixe "arquivos" como []). Só crie/modifique/delete arquivos se o usuário pedir EXPLICITAMENTE. Nunca faça mudanças drásticas (refatorações grandes, reescritas completas, reorganização de pastas, criação de muitos arquivos) a menos que o usuário peça explicitamente. Prefira sempre alterações mínimas e localizadas.',
-    autonomo: 'Modo Autônomo: você tem autonomia para planejar e executar. Analise o pedido, crie um plano de alterações e o backend executará automaticamente. SEMPRE retorne no Formato B (arquivos), nunca no Formato A (sugestoes). Faça as alterações necessárias para atender ao pedido. Seja prático e direto.',
-    clarify: 'Modo Esclarecer: NÃO altere nenhum arquivo. Apenas faça perguntas de esclarecimento. Responda com um JSON onde "resumo" contém suas perguntas e "arquivos" é uma lista VAZIA [].',
-    code: 'Modo Código: foque exclusivamente em código. Faça apenas as alterações mínimas necessárias e mantenha explicações curtas.',
-    acp: 'Modo Arquitetura: foque na arquitetura do sistema. Prefira criar ou atualizar um documento de arquitetura (ex.: ARQUITETURA.md) descrevendo a solução, em vez de alterar código diretamente.',
-    agent: 'Modo Agente: você tem acesso a ferramentas (ler arquivos, escrever, listar, executar comandos). Use-as livremente para explorar o código, fazer alterações e verificar o resultado. Itere até resolver o pedido. Seja prático e direto.'
-};
+// MODE_INSTRUCTIONS agora vive em ./ai/prompts.js
 
 // =============================================
 //  MODO AGENTE — FERRAMENTAS
 // =============================================
-const TOOL_SCHEMAS = {
-    read_file: {
-        name: 'read_file',
-        description: 'Lê o conteúdo completo de um arquivo do projeto. Retorna o conteúdo com diagnóstico de erros para arquivos de código.',
-        parameters: {
-            type: 'object',
-            properties: { caminho: { type: 'string', description: 'Caminho relativo do arquivo a partir da raiz do projeto' } },
-            required: ['caminho']
-        }
-    },
-    write_file: {
-        name: 'write_file',
-        description: 'Cria ou sobrescreve um arquivo com o conteúdo completo. O diretório pai é criado automaticamente se não existir. Use para criar novos arquivos ou substituir arquivos existentes inteiros.',
-        parameters: {
-            type: 'object',
-            properties: {
-                caminho: { type: 'string', description: 'Caminho relativo do arquivo a ser criado/modificado' },
-                conteudo: { type: 'string', description: 'Conteúdo COMPLETO do arquivo' }
-            },
-            required: ['caminho', 'conteudo']
-        }
-    },
-    delete_file: {
-        name: 'delete_file',
-        description: 'Remove um arquivo do projeto permanentemente.',
-        parameters: {
-            type: 'object',
-            properties: { caminho: { type: 'string', description: 'Caminho relativo do arquivo a ser removido' } },
-            required: ['caminho']
-        }
-    },
-    list_files: {
-        name: 'list_files',
-        description: 'Lista arquivos e pastas de um diretório do projeto.',
-        parameters: {
-            type: 'object',
-            properties: { diretorio: { type: 'string', description: 'Caminho relativo do diretório. Omita ou use "" para a raiz.' } },
-            required: []
-        }
-    },
-    search_code: {
-        name: 'search_code',
-        description: 'Busca por um padrão (regex) nos arquivos do projeto. Use para encontrar funções, classes, imports ou padrões de código.',
-        parameters: {
-            type: 'object',
-            properties: {
-                padrao: { type: 'string', description: 'Padrão regex para buscar no código' },
-                diretorio: { type: 'string', description: 'Diretório onde buscar (opcional, padrão: raiz do projeto)' }
-            },
-            required: ['padrao']
-        }
-    },
-    exec_command: {
-        name: 'exec_command',
-        description: 'Executa um comando shell no diretório do projeto. Use para rodar testes, builds, lint, npm/pip install, git commands não cobertos por outras tools, ou scripts de verificação.',
-        parameters: {
-            type: 'object',
-            properties: { comando: { type: 'string', description: 'Comando shell completo a ser executado' } },
-            required: ['comando']
-        }
-    },
-    search_replace: {
-        name: 'search_replace',
-        description: 'Busca e substitui texto em arquivos do projeto. Mais eficiente que write_file para mudanças pontuais.',
-        parameters: {
-            type: 'object',
-            properties: {
-                padrao: { type: 'string', description: 'Texto exato a ser encontrado e substituído' },
-                substituto: { type: 'string', description: 'Novo texto que substituirá o padrão' },
-                caminho: { type: 'string', description: 'Arquivo ou diretório onde aplicar (opcional, padrão: todo o projeto)' }
-            },
-            required: ['padrao', 'substituto']
-        }
-    },
-    apply_patch: {
-        name: 'apply_patch',
-        description: 'Substitui um trecho de um arquivo por outro. O old_string é casado de forma tolerante a diferenças de espaços/indentação. Use para edições cirúrgicas; copie o trecho exato do arquivo.',
-        parameters: {
-            type: 'object',
-            properties: {
-                file_path: { type: 'string', description: 'Caminho relativo do arquivo a editar' },
-                old_string: { type: 'string', description: 'Trecho EXATO a ser substituído (copiado do arquivo)' },
-                new_string: { type: 'string', description: 'Novo conteúdo que substituirá old_string' }
-            },
-            required: ['file_path', 'old_string', 'new_string']
-        }
-    },
-    file_rename: {
-        name: 'file_rename',
-        description: 'Renomeia ou move um arquivo/pasta do projeto.',
-        parameters: {
-            type: 'object',
-            properties: {
-                origem: { type: 'string', description: 'Caminho relativo atual do arquivo/pasta' },
-                destino: { type: 'string', description: 'Novo caminho relativo' }
-            },
-            required: ['origem', 'destino']
-        }
-    },
-    file_mkdir: {
-        name: 'file_mkdir',
-        description: 'Cria um diretório (e diretórios pais se necessário).',
-        parameters: {
-            type: 'object',
-            properties: { caminho: { type: 'string', description: 'Caminho relativo do diretório a ser criado' } },
-            required: ['caminho']
-        }
-    },
-    analyzer_validate: {
-        name: 'analyzer_validate',
-        description: 'Valida um arquivo de código e retorna erros e avisos de sintaxe/lint.',
-        parameters: {
-            type: 'object',
-            properties: { caminho: { type: 'string', description: 'Caminho relativo do arquivo a ser validado' } },
-            required: ['caminho']
-        }
-    },
-    analyzer_symbols: {
-        name: 'analyzer_symbols',
-        description: 'Extrai símbolos (funções, classes, variáveis, imports) de um arquivo de código.',
-        parameters: {
-            type: 'object',
-            properties: { caminho: { type: 'string', description: 'Caminho relativo do arquivo' } },
-            required: ['caminho']
-        }
-    },
-    test_run: {
-        name: 'test_run',
-        description: 'Executa os testes do projeto (jest, pytest, go test, cargo test) e retorna o resultado.',
-        parameters: { type: 'object', properties: {}, required: [] }
-    },
-    undo: {
-        name: 'undo',
-        description: 'Desfaz a última alteração de arquivo feita pelo agente. Use se cometeu um erro.',
-        parameters: { type: 'object', properties: {}, required: [] }
-    },
-    redo: {
-        name: 'redo',
-        description: 'Refaz a última alteração desfeita pelo undo.',
-        parameters: { type: 'object', properties: {}, required: [] }
-    },
-    generate_tests: {
-        name: 'generate_tests',
-        description: 'Gera testes unitários para um arquivo de código existente e executa os testes.',
-        parameters: {
-            type: 'object',
-            properties: { caminho: { type: 'string', description: 'Caminho relativo do arquivo para gerar testes' } },
-            required: ['caminho']
-        }
-    },
-    browser_navigate: {
-        name: 'browser_navigate',
-        description: 'Navega o browser Playwright para uma URL. Use para testar frontend web.',
-        parameters: {
-            type: 'object',
-            properties: { url: { type: 'string', description: 'URL completa para navegar (ex: http://localhost:3000)' } },
-            required: ['url']
-        }
-    },
-    browser_screenshot: {
-        name: 'browser_screenshot',
-        description: 'Tira um screenshot da página atual do browser.',
-        parameters: { type: 'object', properties: {}, required: [] }
-    },
-    browser_click: {
-        name: 'browser_click',
-        description: 'Clica em um elemento CSS na página do browser.',
-        parameters: {
-            type: 'object',
-            properties: { selector: { type: 'string', description: 'Seletor CSS do elemento a clicar' } },
-            required: ['selector']
-        }
-    },
-    browser_type: {
-        name: 'browser_type',
-        description: 'Digita texto em um campo input/textarea na página do browser.',
-        parameters: {
-            type: 'object',
-            properties: {
-                selector: { type: 'string', description: 'Seletor CSS do campo input/textarea' },
-                text: { type: 'string', description: 'Texto a ser digitado' }
-            },
-            required: ['selector', 'text']
-        }
-    },
-    browser_evaluate: {
-        name: 'browser_evaluate',
-        description: 'Executa JavaScript na página do browser e retorna o resultado.',
-        parameters: {
-            type: 'object',
-            properties: { js: { type: 'string', description: 'Código JavaScript a ser executado na página' } },
-            required: ['js']
-        }
-    },
-    browser_console: {
-        name: 'browser_console',
-        description: 'Lê os logs do console do browser atual.',
-        parameters: { type: 'object', properties: {}, required: [] }
-    },
-    browser_content: {
-        name: 'browser_content',
-        description: 'Obtém o conteúdo HTML completo da página atual do browser.',
-        parameters: { type: 'object', properties: {}, required: [] }
-    },
-    git_publish: {
-        name: 'git_publish',
-        description: 'Publica uma release: faz commit, cria tag semver e push. Use após concluir uma feature.',
-        parameters: {
-            type: 'object',
-            properties: { mensagem: { type: 'string', description: 'Mensagem do commit (opcional)' } },
-            required: []
-        }
-    },
-    git_status: {
-        name: 'git_status',
-        description: 'Mostra o status do git (arquivos modificados, staged, untracked).',
-        parameters: { type: 'object', properties: {}, required: [] }
-    },
-    git_diff: {
-        name: 'git_diff',
-        description: 'Mostra o diff das alterações atuais (unstaged).',
-        parameters: { type: 'object', properties: {}, required: [] }
-    },
-    git_log: {
-        name: 'git_log',
-        description: 'Mostra histórico de commits (últimos 10).',
-        parameters: { type: 'object', properties: {}, required: [] }
-    },
-    git_commit: {
-        name: 'git_commit',
-        description: 'Faz commit das alterações staged. Use git_status antes para ver o que será commitado.',
-        parameters: {
-            type: 'object',
-            properties: { mensagem: { type: 'string', description: 'Mensagem descritiva do commit' } },
-            required: ['mensagem']
-        }
-    },
-    git_push: {
-        name: 'git_push',
-        description: 'Faz push dos commits para o remote.',
-        parameters: { type: 'object', properties: {}, required: [] }
-    },
-    git_pull: {
-        name: 'git_pull',
-        description: 'Faz pull das alterações do remote.',
-        parameters: { type: 'object', properties: {}, required: [] }
-    },
-    git_branch: {
-        name: 'git_branch',
-        description: 'Lista branches locais e remotas.',
-        parameters: { type: 'object', properties: {}, required: [] }
-    },
-    git_stash: {
-        name: 'git_stash',
-        description: 'Salva ou restaura alterações não commitadas no stash.',
-        parameters: {
-            type: 'object',
-            properties: { acao: { type: 'string', description: '"push" para salvar ou "pop" para restaurar' } },
-            required: ['acao']
-        }
-    },
-    snapshot_create: {
-        name: 'snapshot_create',
-        description: 'Cria um snapshot completo do estado atual do projeto para backup.',
-        parameters: {
-            type: 'object',
-            properties: { rotulo: { type: 'string', description: 'Nome descritivo do snapshot (opcional)' } },
-            required: []
-        }
-    },
-    snapshot_list: {
-        name: 'snapshot_list',
-        description: 'Lista todos os snapshots salvos do projeto.',
-        parameters: { type: 'object', properties: {}, required: [] }
-    },
-    snapshot_restore: {
-        name: 'snapshot_restore',
-        description: 'Restaura o projeto para um snapshot anterior. CUIDADO: desfaz todas as alterações posteriores.',
-        parameters: {
-            type: 'object',
-            properties: { rotulo: { type: 'string', description: 'Nome do snapshot para restaurar' } },
-            required: ['rotulo']
-        }
-    },
-    debug_start: {
-        name: 'debug_start',
-        description: 'Inicia uma sessão de debug Node.js para um arquivo.',
-        parameters: {
-            type: 'object',
-            properties: { arquivo: { type: 'string', description: 'Caminho do arquivo para debugar' } },
-            required: ['arquivo']
-        }
-    },
-    debug_stop: {
-        name: 'debug_stop',
-        description: 'Para a sessão de debug atual.',
-        parameters: { type: 'object', properties: {}, required: [] }
-    },
-    debug_step: {
-        name: 'debug_step',
-        description: 'Avança um passo no debug (step over).',
-        parameters: { type: 'object', properties: {}, required: [] }
-    },
-    debug_resume: {
-        name: 'debug_resume',
-        description: 'Continua a execução até o próximo breakpoint.',
-        parameters: { type: 'object', properties: {}, required: [] }
-    },
-    ssh_exec: {
-        name: 'ssh_exec',
-        description: 'Executa um comando no servidor remoto via SSH. Requer conexão SSH ativa.',
-        parameters: {
-            type: 'object',
-            properties: { comando: { type: 'string', description: 'Comando a ser executado no servidor remoto' } },
-            required: ['comando']
-        }
-    },
-    ssh_status: {
-        name: 'ssh_status',
-        description: 'Verifica o status da conexão SSH com o servidor remoto.',
-        parameters: { type: 'object', properties: {}, required: [] }
-    },
-    docker_run: {
-        name: 'docker_run',
-        description: 'Executa um container Docker com a imagem especificada. O comando deve começar com "docker".',
-        parameters: {
-            type: 'object',
-            properties: { comando: { type: 'string', description: 'Comando docker completo' } },
-            required: ['comando']
-        }
-    },
-    task: {
-        name: 'task',
-        description: 'Delega uma subtarefa a um subagente isolado (somente leitura) que investiga o projeto e retorna um resumo. Use para buscas complexas, exploração de código ou análises paralelas sem poluir o contexto do agente principal.',
-        parameters: {
-            type: 'object',
-            properties: { descricao: { type: 'string', description: 'Descrição detalhada da subtarefa a ser executada pelo subagente' } },
-            required: ['descricao']
-        }
-    },
-    question: {
-        name: 'question',
-        description: 'Faz uma pergunta ao usuário e aguarda a resposta. Use quando precisar de uma decisão, esclarecimento ou preferência do usuário durante a execução.',
-        parameters: {
-            type: 'object',
-            properties: { pergunta: { type: 'string', description: 'A pergunta a ser feita ao usuário' } },
-            required: ['pergunta']
-        }
-    },
-    parallel_task: {
-        name: 'parallel_task',
-        description: 'Executa várias subtarefas de investigação EM PARALELO (somente leitura) e retorna um resumo de cada uma. Use para investigar áreas independentes do código de uma só vez, sem poluir o contexto do agente principal.',
-        parameters: {
-            type: 'object',
-            properties: {
-                tarefas: {
-                    type: 'array',
-                    description: 'Lista de descrições de subtarefas (máximo 3)',
-                    items: { type: 'string' }
-                }
-            },
-            required: ['tarefas']
-        }
-    },
-    parallel_write: {
-        name: 'parallel_write',
-        description: 'Aplica alterações em VÁRIOS arquivos independentes EM PARALELO. Cada item indica o arquivo a modificar e o que fazer nele. Use apenas para mudanças em arquivos que NÃO dependem um do outro, para acelerar a escrita.',
-        parameters: {
-            type: 'object',
-            properties: {
-                tarefas: {
-                    type: 'array',
-                    description: 'Lista de { caminho, descricao } (máximo 3, arquivos distintos)',
-                    items: { type: 'object', properties: { caminho: { type: 'string' }, descricao: { type: 'string' } } }
-                }
-            },
-            required: ['tarefas']
-        }
-    },
-    todo: {
-        name: 'todo',
-        description: 'Cria ou atualiza a lista de tarefas do plano atual. Use para expor um plano rastreável do trabalho em andamento.',
-        parameters: {
-            type: 'object',
-            properties: {
-                tarefas: {
-                    type: 'array',
-                    description: 'Lista de tarefas, cada uma como { "titulo": "...", "status": "pending|in_progress|completed" }',
-                    items: { type: 'object', properties: { titulo: { type: 'string' }, status: { type: 'string' } } }
-                }
-            },
-            required: ['tarefas']
-        }
-    }
-};
 
-const AGENT_TOOLS = Object.values(TOOL_SCHEMAS).map(t => ({
-    name: t.name,
-    description: t.description,
-    parameters: Object.fromEntries(
-        Object.entries(t.parameters.properties || {}).map(([k, v]) => [k, v.description || v.type || 'string'])
-    )
-}));
-
-function stripBOM(text) {
-    return typeof text === 'string' ? text.replace(/^\uFEFF+/, '') : text;
-}
-
-function normalizeLine(line) {
-    return line.trim().replace(/\s+/g, ' ');
-}
-
-function replaceIgnoringIndent(content, pattern, replacement) {
-    const pLines = pattern.split('\n').map(l => l.trim()).filter(l => l.length > 0);
-    if (!pLines.length) return content;
-    const pNormalized = pLines.map(normalizeLine);
-    const cLines = content.split('\n');
-    for (let i = 0; i <= cLines.length - pLines.length; i++) {
-        let ok = true;
-        for (let j = 0; j < pLines.length; j++) {
-            if (normalizeLine(cLines[i + j]) !== pNormalized[j]) { ok = false; break; }
-        }
-        if (ok) {
-            const indent = (cLines[i].match(/^\s*/) || [''])[0];
-            const rLines = replacement.split('\n').map((l, idx) => idx === 0 ? indent + l.trim() : l);
-            cLines.splice(i, pLines.length, ...rLines);
-            return cLines.join('\n');
-        }
-    }
-    return content;
-}
-
-function replaceInContent(content, pattern, replacement) {
-    if (content.includes(pattern)) {
-        return { content: content.split(pattern).join(replacement), matched: true };
-    }
-    let matched = false;
-    try {
-        const regex = new RegExp(pattern, 'g');
-        const replaced = content.replace(regex, replacement);
-        if (replaced !== content) { content = replaced; matched = true; }
-    } catch (e) {}
-    if (!matched) {
-        const normalized = replaceIgnoringIndent(content, pattern, replacement);
-        if (normalized !== content) { content = normalized; matched = true; }
-    }
-    if (!matched) {
-        const lines = content.split('\n');
-        const pLines = pattern.split('\n').map(l => l.trim()).filter(l => l.length > 0);
-        let found = false;
-        for (let i = 0; i < lines.length && !found; i++) {
-            const trimmed = lines[i].trim();
-            if (!trimmed) continue;
-            for (const p of pLines) {
-                if (p && trimmed.includes(p)) {
-                    lines[i] = lines[i].replace(p, replacement.trim());
-                    found = true;
-                    break;
-                }
-            }
-        }
-        if (found) { content = lines.join('\n'); matched = true; }
-    }
-    return { content, matched };
-}
-
-async function executeAgentTool(name, args) {
-    switch (name) {
-        case 'read_file': {
-            const full = resolveSafePath(args.caminho || '');
-            if (!full || !fs.existsSync(full)) return 'Erro: arquivo não encontrado';
-            const content = stripBOM(fs.readFileSync(full, 'utf-8')).slice(0, 50000);
-            // Retorna o conteúdo limpo, como o opencode — sem o bloco de
-            // diagnóstico que inflava o contexto e fazia o modelo ficar
-            // "analisando" em vez de corrigir. A validação acontece no
-            // write_file/analyzer_validate, não a cada leitura.
-            return content;
-        }
-        case 'write_file': {
-            const full = resolveSafePath(args.caminho || '');
-            if (!full) return 'Erro: caminho inválido';
-            const dir = path.dirname(full);
-            if (!fs.existsSync(dir)) fs.mkdirSync(dir, { recursive: true });
-            const cleanContent = stripBOM(args.conteudo || '');
-            fs.writeFileSync(full, cleanContent, 'utf-8');
-            const ext = path.extname(args.caminho).toLowerCase();
-            let result = `Arquivo ${args.caminho} salvo (${cleanContent.length} bytes)`;
-            if (['.js', '.ts', '.jsx', '.tsx', '.py', '.go', '.rs', '.c', '.cpp', '.h'].includes(ext)) {
-                try {
-                    const validation = analyzer.validateCode(cleanContent, args.caminho, PROJECT_ROOT);
-                    const errs = validation.errors.filter(e => e.severity === 'error');
-                    const warns = validation.errors.filter(e => e.severity === 'warning');
-                    if (errs.length > 0) result += `\n⚠️ ${errs.length} erro(s): ${errs.slice(0, 5).map(e => `Ln ${e.line}: ${e.message}`).join('; ')}`;
-                    if (warns.length > 0) result += `\n💡 ${warns.length} aviso(s): ${warns.slice(0, 3).map(e => `Ln ${e.line}: ${e.message}`).join('; ')}`;
-                    if (validation.errors.length === 0) result += ' ✅ Validação OK';
-                } catch (e) {}
-            }
-            try {
-                const testResult = runQuickTest(args.caminho);
-                if (testResult) result += '\n' + testResult;
-            } catch (e) {}
-            return result;
-        }
-        case 'delete_file': {
-            const full = resolveSafePath(args.caminho || '');
-            if (!full || !fs.existsSync(full)) return 'Erro: arquivo não encontrado';
-            fs.unlinkSync(full);
-            return `Arquivo ${args.caminho} removido`;
-        }
-        case 'list_files': {
-            const dir = args.diretorio || '';
-            const safeDir = resolveSafePath(dir);
-            if (!safeDir) return 'Erro: diretório inválido (fora do projeto)';
-            const items = listDirectory(safeDir);
-            return items.map(i => `${i.isDirectory ? '📂' : '📄'} ${i.name}`).join('\n') || '(vazio)';
-        }
-        case 'search_code': {
-            const dir = args.diretorio || '';
-            const basePath = resolveSafePath(dir);
-            if (!basePath) return 'Erro: diretório inválido';
-            const pattern = args.padrao || '';
-            if (!pattern) return 'Erro: padrão vazio';
-            const results = [];
-            try {
-                const allFiles = getAllFiles(basePath, { n: 0 });
-                // Padrão "gi" é stateful (flag g guarda lastIndex entre test()).
-                // Reinspeita a regex para cada linha, senão test() pula resultados
-                // e o search_code volta "Nenhum resultado" para padrões que existem.
-                const re = new RegExp(pattern, 'gi');
-                // Padrões com [\s\S] indicam busca multiline (trechos de código
-                // multi-linha). Esses precisam rodar contra o arquivo inteiro,
-                // não linha a linha.
-                const multiline = /\[\\s\\S\]/.test(pattern);
-                for (const file of allFiles.slice(0, 200)) {
-                    try {
-                        // getAllFiles devolve caminho relativo à raiz do projeto.
-                        // Sem o join abaixo o readFileSync falha (path relativo ao
-                        // cwd) e o search_code voltava "Nenhum resultado" sempre.
-                        const abs = path.isAbsolute(file) ? file : path.join(PROJECT_ROOT, file);
-                        const content = fs.readFileSync(abs, 'utf-8');
-                        if (multiline) {
-                            re.lastIndex = 0;
-                            const m = re.exec(content);
-                            if (m) {
-                                const ln = content.slice(0, m.index).split('\n').length;
-                                results.push(`${path.relative(PROJECT_ROOT, abs)}:${ln}: ${m[0].trim().slice(0, 200)}`);
-                                if (results.length >= 30) break;
-                            }
-                            continue;
-                        }
-                        const lines = content.split('\n');
-                        for (let i = 0; i < lines.length; i++) {
-                            re.lastIndex = 0;
-                            if (re.test(lines[i])) {
-                                // Contexto de 2 linhas antes/depois (estilo rg -C 2):
-                                // sem isso o modelo via só a linha do match e perdia a
-                                // cadeia de chamadas (ex.: via "innerHTML" mas não o
-                                // "Seguranca.sanitizarHtml" na linha de cima).
-                                const ctxLines = [];
-                                const start = Math.max(0, i - 2);
-                                const end = Math.min(lines.length, i + 3);
-                                for (let j = start; j < end; j++) {
-                                    const marker = j === i ? ' >>>' : '    ';
-                                    ctxLines.push(String(j + 1).padStart(4) + marker + ' ' + lines[j].slice(0, 140));
-                                }
-                                results.push(`${path.relative(PROJECT_ROOT, abs)}:${i + 1}:\n${ctxLines.join('\n')}`);
-                                if (results.length >= 30) break;
-                            }
-                        }
-                    } catch (e) {}
-                    if (results.length >= 30) break;
-                }
-            } catch (e) { return 'Erro ao buscar: ' + e.message; }
-            return results.join('\n') || 'Nenhum resultado encontrado';
-        }
-        case 'exec_command': {
-            const cmd = args.comando || '';
-            const validationError = validateAgentCommand(cmd);
-            if (validationError) return `Erro: ${validationError}`;
-            try {
-                if (agentStreamCallback) {
-                    agentStreamCallback('Sistema', `$ ${cmd}\n`);
-                    const chunks = [];
-                    const child = require('child_process').spawn(cmd, [], { cwd: PROJECT_ROOT, shell: true, stdio: ['ignore', 'pipe', 'pipe'] });
-                    registerChildProcess(child);
-                    const killTimer = setTimeout(() => killChildTree(child), 30000);
-                    child.stdout.on('data', (d) => {
-                        const text = d.toString();
-                        chunks.push(text);
-                        agentStreamCallback('Sistema', text);
-                    });
-                    child.stderr.on('data', (d) => {
-                        const text = d.toString();
-                        chunks.push(text);
-                        agentStreamCallback('Sistema', text);
-                    });
-                    const code = await new Promise((resolve) => {
-                        child.on('close', (c) => { clearTimeout(killTimer); resolve(c); });
-                        child.on('error', () => { clearTimeout(killTimer); resolve(-1); });
-                    });
-                    const output = chunks.join('').slice(0, 10000);
-                    return code === 0 ? (output || '(sem saída)') : `Erro (código ${code}): ${output.slice(0, 2000)}`;
-                } else {
-                    const result = require('child_process').execSync(cmd, { cwd: PROJECT_ROOT, timeout: 30000, encoding: 'utf-8', maxBuffer: 1024 * 1024 });
-                    return result.slice(0, 10000) || '(sem saída)';
-                }
-            } catch (e) {
-                return `Erro (código ${e.status}): ${(e.stderr || e.message || '').slice(0, 2000)}`;
-            }
-        }
-        case 'generate_tests': {
-            const full = resolveSafePath(args.caminho || '');
-            if (!full || !fs.existsSync(full)) return 'Erro: arquivo não encontrado';
-            const content = fs.readFileSync(full, 'utf-8');
-            const ext = path.extname(args.caminho).toLowerCase();
-            const testPath = getTestFilePath(args.caminho);
-            if (fs.existsSync(path.join(PROJECT_ROOT, testPath))) return `Arquivo de teste já existe: ${testPath}`;
-            const testPrompt = buildTestPrompt(args.caminho, content, ext);
-            const provider = 'gemini';
-            try {
-                const testCode = await callAI(provider, testPrompt, null, null);
-                const cleanCode = testCode.replace(/```[\w]*\n?/g, '').replace(/```/g, '').trim();
-                if (!cleanCode || cleanCode.length < 20) return 'Erro: IA não gerou código de teste';
-                const testFull = path.join(PROJECT_ROOT, testPath);
-                const testDir = path.dirname(testFull);
-                if (!fs.existsSync(testDir)) fs.mkdirSync(testDir, { recursive: true });
-                fs.writeFileSync(testFull, cleanCode, 'utf-8');
-                const testResult = runQuickTest(args.caminho);
-                return `✅ Teste criado: ${testPath}\n${testResult || 'Teste executado'}`;
-            } catch (e) {
-                return `Erro ao gerar testes: ${e.message}`;
-            }
-        }
-        case 'git_publish': {
-            try {
-                const status = await runGit(['status', '--porcelain'], PROJECT_ROOT);
-                if (status.code !== 0) return 'Erro: git não encontrado ou projeto não é repositório';
-                const hasChanges = status.output.trim().length > 0;
-                const tag = nextVersion(await latestVersionTag());
-                const commitMsg = args.mensagem || `🔖 versão ${tag}`;
-                if (hasChanges) {
-                    await runGit(['add', '-A'], PROJECT_ROOT);
-                    await runGit(['commit', '-m', commitMsg], PROJECT_ROOT);
-                }
-                await runGit(['tag', '-a', tag, '-m', `Release ${tag}`], PROJECT_ROOT);
-                await runGit(['push', 'origin', 'HEAD', '--follow-tags'], PROJECT_ROOT);
-                return `✅ Release ${tag} publicada! ${hasChanges ? '(com alterações commitadas)' : '(sem novas alterações)'}`;
-            } catch (e) {
-                return `Erro ao publicar: ${e.message}`;
-            }
-        }
-        case 'git_status': {
-            try { const r = await runGit(['status'], PROJECT_ROOT); return r.output.trim() || '(working tree limpa)'; } catch (e) { return `Erro: ${e.message}`; }
-        }
-        case 'git_diff': {
-            try { const r = await runGit(['diff'], PROJECT_ROOT); return r.output.slice(0, 5000).trim() || '(sem alterações)'; } catch (e) { return `Erro: ${e.message}`; }
-        }
-        case 'git_log': {
-            try { const r = await runGit(['log', '--oneline', '-10'], PROJECT_ROOT); return r.output.trim() || '(sem commits)'; } catch (e) { return `Erro: ${e.message}`; }
-        }
-        case 'git_commit': {
-            try { await runGit(['add', '-A'], PROJECT_ROOT); const r = await runGit(['commit', '-m', args.mensagem || 'commit'], PROJECT_ROOT); return r.output.trim(); } catch (e) { return `Erro: ${e.message}`; }
-        }
-        case 'git_push': {
-            try { const r = await runGit(['push'], PROJECT_ROOT); return r.output.trim(); } catch (e) { return `Erro: ${e.message}`; }
-        }
-        case 'git_pull': {
-            try { const r = await runGit(['pull'], PROJECT_ROOT); return r.output.trim(); } catch (e) { return `Erro: ${e.message}`; }
-        }
-        case 'git_branch': {
-            try { const r = await runGit(['branch', '-a'], PROJECT_ROOT); return r.output.trim(); } catch (e) { return `Erro: ${e.message}`; }
-        }
-        case 'git_stash': {
-            try { const r = await runGit(['stash', args.acao || 'push'], PROJECT_ROOT); return r.output.trim() || 'ok'; } catch (e) { return `Erro: ${e.message}`; }
-        }
-        case 'file_rename': {
-            const src = resolveSafePath(args.origem || '');
-            const dst = resolveSafePath(args.destino || '');
-            if (!src || !dst) return 'Erro: caminho inválido';
-            if (!fs.existsSync(src)) return 'Erro: arquivo origem não encontrado';
-            try { fs.renameSync(src, dst); return `Renomeado: ${args.origem} → ${args.destino}`; } catch (e) { return `Erro: ${e.message}`; }
-        }
-        case 'file_mkdir': {
-            const dir = resolveSafePath(args.caminho || '');
-            if (!dir) return 'Erro: caminho inválido';
-            try { fs.mkdirSync(dir, { recursive: true }); return `Diretório criado: ${args.caminho}`; } catch (e) { return `Erro: ${e.message}`; }
-        }
-        case 'analyzer_validate': {
-            const f = resolveSafePath(args.caminho || '');
-            if (!f || !fs.existsSync(f)) return 'Erro: arquivo não encontrado';
-            try { const content = fs.readFileSync(f, 'utf-8'); const v = analyzer.validateCode(content, args.caminho, PROJECT_ROOT); return v.errors.length ? v.errors.slice(0, 20).map(e => `Ln ${e.line}: [${e.severity}] ${e.message}`).join('\n') : '✅ Nenhum erro encontrado'; } catch (e) { return `Erro: ${e.message}`; }
-        }
-        case 'analyzer_symbols': {
-            const f = resolveSafePath(args.caminho || '');
-            if (!f || !fs.existsSync(f)) return 'Erro: arquivo não encontrado';
-            try { const content = fs.readFileSync(f, 'utf-8'); const ext = path.extname(args.caminho).toLowerCase(); let sym = []; if (['.js','.ts','.jsx','.tsx'].includes(ext)) sym = analyzer.getTSSymbols(args.caminho, PROJECT_ROOT); else if (ext === '.py') sym = analyzer.getPythonSymbols(args.caminho, PROJECT_ROOT); else if (ext === '.go') sym = analyzer.getGoSymbols(args.caminho, PROJECT_ROOT); return sym.map(s => `${s.kind} ${s.name} (ln ${s.line})`).join('\n') || '(nenhum símbolo)'; } catch (e) { return `Erro: ${e.message}`; }
-        }
-        case 'test_run': {
-            try { const result = runner.runCommandSync ? runner.runCommandSync('npm test', { cwd: PROJECT_ROOT, timeoutMs: 60000 }) : await runner.runCommand({ command: 'npm test', cwd: PROJECT_ROOT, timeoutMs: 60000 }); const r = result.stdout || result.output || ''; return r.slice(0, 5000).trim() || '(sem saída)'; } catch (e) { return `Erro: ${e.message}`; }
-        }
-        case 'snapshot_create': {
-            try { const label = args.rotulo || `snapshot-${Date.now()}`; const snapDir = path.join(PROJECT_ROOT, BACKUP_DIR_NAME, 'snapshots', label); if (fs.existsSync(snapDir)) return 'Erro: snapshot já existe com esse rótulo'; fs.mkdirSync(snapDir, { recursive: true }); copyDirContents(PROJECT_ROOT, snapDir, new Set(['node_modules', '.git', 'dist', 'build', BACKUP_DIR_NAME])); return `✅ Snapshot '${label}' criado`; } catch (e) { return `Erro: ${e.message}`; }
-        }
-        case 'snapshot_list': {
-            try { const snapDir = path.join(PROJECT_ROOT, BACKUP_DIR_NAME, 'snapshots'); if (!fs.existsSync(snapDir)) return '(nenhum snapshot)'; return fs.readdirSync(snapDir).map(d => { const stat = fs.statSync(path.join(snapDir, d)); return `${d} (${stat.mtime.toISOString().slice(0, 10)})`; }).join('\n') || '(nenhum snapshot)'; } catch (e) { return `Erro: ${e.message}`; }
-        }
-        case 'snapshot_restore': {
-            try { const label = args.rotulo; if (!label) return 'Erro: informe o rótulo do snapshot'; const snapDir = path.join(PROJECT_ROOT, BACKUP_DIR_NAME, 'snapshots', label); if (!fs.existsSync(snapDir)) return 'Erro: snapshot não encontrado'; restoreSnapshot(label); return `✅ Projeto restaurado para snapshot '${label}'`; } catch (e) { return `Erro: ${e.message}`; }
-        }
-        case 'debug_start': {
-            try { const f = resolveSafePath(args.arquivo || ''); if (!f || !fs.existsSync(f)) return 'Erro: arquivo não encontrado'; if (debuggerRunner.isRunning()) return 'Erro: já existe debug ativo'; await debuggerRunner.startDebug({ file: f, onEvent: () => {} }); return `✅ Debug iniciado: ${args.arquivo}`; } catch (e) { return `Erro: ${e.message}`; }
-        }
-        case 'debug_stop': {
-            try { const r = debuggerRunner.stopDebug(); return r ? '✅ Debug parado' : 'Nenhum debug ativo'; } catch (e) { return `Erro: ${e.message}`; }
-        }
-        case 'debug_step': {
-            try { if (!debuggerRunner.isRunning()) return 'Erro: nenhum debug ativo'; const r = await debuggerRunner.stepOver(); return JSON.stringify(r); } catch (e) { return `Erro: ${e.message}`; }
-        }
-        case 'debug_resume': {
-            try { if (!debuggerRunner.isRunning()) return 'Erro: nenhum debug ativo'; const r = await debuggerRunner.resume(); return JSON.stringify(r); } catch (e) { return `Erro: ${e.message}`; }
-        }
-        case 'ssh_exec': {
-            try { if (!remote.isConnected()) return 'Erro: nenhuma conexão SSH ativa'; const r = await remote.execRemote(args.comando || ''); return r || '(sem saída)'; } catch (e) { return `Erro: ${e.message}`; }
-        }
-        case 'ssh_status': {
-            try { return JSON.stringify(remote.getStatus()); } catch (e) { return 'Desconectado'; }
-        }
-        case 'docker_run': {
-            const fullCmd = `docker ${String(args.comando || 'ps').trim()}`;
-            const validationError = validateAgentCommand(fullCmd);
-            if (validationError) return `Erro: ${validationError}`;
-            try { const r = await runner.runCommand({ command: fullCmd, cwd: PROJECT_ROOT, timeoutMs: 30000 }); return (r.stdout || r.output || '').slice(0, 3000).trim() || '(sem saída)'; } catch (e) { return `Erro: ${e.message}`; }
-        }
-        case 'undo': {
-            try { const r = await undoLastChange(); return r || 'Nada para desfazer'; } catch (e) { return `Erro: ${e.message}`; }
-        }
-        case 'redo': {
-            try { const r = await redoLastChange(); return r || 'Nada para refazer'; } catch (e) { return `Erro: ${e.message}`; }
-        }
-        case 'search_replace': {
-            try {
-                const base = resolveSafePath(args.caminho || '');
-                const pattern = stripBOM(args.padrao || '');
-                const replacement = args.substituto || '';
-                if (!pattern) return 'Erro: informe o padrão';
-                const files = base && fs.existsSync(base) ? (fs.statSync(base).isDirectory() ? getAllFiles(base, { n: 0 }).slice(0, 50) : [base]) : getAllFiles(PROJECT_ROOT, { n: 0 }).slice(0, 50);
-                let count = 0;
-                for (const f of files) {
-                    if (!fs.statSync(f).isFile()) continue;
-                    const content = stripBOM(fs.readFileSync(f, 'utf-8'));
-                    const before = content;
-                    const { content: newContent, matched } = replaceInContent(content, pattern, replacement);
-                    if (matched && newContent !== before) {
-                        backupFromContent(path.relative(PROJECT_ROOT, f), before);
-                        fs.writeFileSync(f, newContent, 'utf-8');
-                        count++;
-                    }
-                }
-                return count > 0 ? `${count} arquivo(s) alterado(s)` : 'Nenhum arquivo alterado (padrão não encontrado em nenhum arquivo). Tente usar write_file para reescrever o arquivo inteiro.';
-            } catch (e) { return `Erro: ${e.message}`; }
-        }
-        case 'apply_patch': {
-            try {
-                const full = resolveSafePath(args.file_path || args.caminho || '');
-                if (!full || !fs.existsSync(full)) return 'Erro: arquivo não encontrado';
-                const oldStr = stripBOM(args.old_string || '');
-                const newStr = args.new_string || '';
-                if (!oldStr) return 'Erro: informe old_string';
-                const content = stripBOM(fs.readFileSync(full, 'utf-8'));
-                const { content: newContent, matched } = replaceInContent(content, oldStr, newStr);
-                if (!matched || newContent === content) {
-                    return 'Erro: old_string não encontrado no arquivo. Releia o trecho exato com read_file e tente novamente, ou use write_file para reescrever o arquivo inteiro.';
-                }
-                backupFromContent(path.relative(PROJECT_ROOT, full), content);
-                fs.writeFileSync(full, newContent, 'utf-8');
-                invalidateProjectCache();
-                return 'Patch aplicado com sucesso.';
-            } catch (e) { return `Erro: ${e.message}`; }
-        }
-        case 'task': {
-            const descricao = args.descricao || args.task || '';
-            if (!descricao) return 'Erro: descrição da subtarefa vazia';
-            const subProvider = _currentAgentProvider || 'gemini';
-            const subSignal = _currentAgentSignal || null;
-            const subPrompt = `Você é um subagente de investigação. Execute APENAS esta subtarefa e retorne um resumo conciso do resultado.\n\nSUBTAREFA: ${descricao}\n\nUse as ferramentas de leitura (read_file, search_code, list_files, analyzer_symbols) para investigar. NÃO modifique arquivos.`;
-            try {
-                const summary = await runAgentLoop(subPrompt, null, subSignal, 'plan', [], subProvider);
-                return summary ? `Subagente concluído: ${summary.slice(0, 2000)}` : 'Subagente concluído sem resumo';
-            } catch (e) {
-                return `Erro no subagente: ${e.message}`;
-            }
-        }
-        case 'parallel_task': {
-            const lista = Array.isArray(args.tarefas) ? args.tarefas : [];
-            const subProvider = _currentAgentProvider || 'gemini';
-            const subSignal = _currentAgentSignal || null;
-            const tasks = lista.slice(0, 3).map(d => String(d || '').trim()).filter(Boolean);
-            if (!tasks.length) return 'Erro: informe uma lista de subtarefas';
-            const runOne = async (descricao) => {
-                const subPrompt = `Você é um subagente de investigação. Execute APENAS esta subtarefa e retorne um resumo conciso (máximo 150 palavras).\n\nSUBTAREFA: ${descricao}\n\nUse as ferramentas de leitura (read_file, search_code, list_files, analyzer_symbols) para investigar. NÃO modifique arquivos.`;
-                try {
-                    const summary = await runAgentLoop(subPrompt, null, subSignal, 'plan', [], subProvider);
-                    return `[${descricao.slice(0, 60)}] ${summary ? String(summary).slice(0, 1200) : 'sem resumo'}`;
-                } catch (e) {
-                    return `[${descricao.slice(0, 60)}] Erro: ${e.message}`;
-                }
-            };
-            const results = await Promise.all(tasks.map(runOne));
-            return `Subagentes paralelos concluídos (${results.length}):\n\n${results.join('\n\n')}`;
-        }
-        case 'parallel_write': {
-            const lista = Array.isArray(args.tarefas) ? args.tarefas : [];
-            const subProvider = _currentAgentProvider || 'gemini';
-            const subSignal = _currentAgentSignal || null;
-            const seenFiles = new Set();
-            const tasks = [];
-            for (const t of lista.slice(0, 3)) {
-                const caminho = String((t && t.caminho) || '').trim();
-                const descricao = String((t && t.descricao) || '').trim();
-                if (!caminho || !descricao || seenFiles.has(caminho)) continue;
-                seenFiles.add(caminho);
-                tasks.push({ caminho, descricao });
-            }
-            if (!tasks.length) return 'Erro: informe uma lista de { caminho, descricao } (arquivos distintos)';
-            const runOne = async ({ caminho, descricao }) => {
-                const subPrompt = `Você é um subagente de edição. Modifique APENAS o arquivo "${caminho}" conforme a tarefa. Leia o arquivo (read_file) e aplique a mudança com apply_patch (edição cirúrgica) ou write_file (reescrita). NÃO altere NENHUM outro arquivo.\n\nTAREFA: ${descricao}\n\nAo final, responda em 1 linha o que foi alterado.`;
-                try {
-                    const summary = await runAgentLoop(subPrompt, null, subSignal, 'write_subagent', [], subProvider);
-                    return `[${caminho}] ${summary ? String(summary).slice(0, 800) : 'sem resumo'}`;
-                } catch (e) {
-                    return `[${caminho}] Erro: ${e.message}`;
-                }
-            };
-            const results = await Promise.all(tasks.map(runOne));
-            invalidateProjectCache();
-            analyzer.invalidateIndex();
-            return `Edição paralela concluída (${results.length}):\n\n${results.join('\n\n')}`;
-        }
-        case 'question': {
-            const pergunta = args.pergunta || args.question || '';
-            if (!pergunta) return 'Erro: pergunta vazia';
-            const response = await requestUserInteraction('question', { pergunta }, _currentAgentSignal || null);
-            if (!response || !response.resposta) {
-                // Sem resposta: pausa a tarefa em vez de o agente inventar uma
-                // direção e prosseguir. Aborta o sinal para encerrar o loop e
-                // sinaliza ao stream handler para mostrar "aguardando resposta".
-                _awaitingUserAnswer = true;
-                if (_currentAgentSignal) { try { _currentAgentSignal.abort(); } catch (e) {} }
-                throw new Error('Pergunta sem resposta — tarefa pausada aguardando o usuário.');
-            }
-            return `Resposta do usuário: ${response.resposta}`;
-        }
-        case 'todo': {
-            const tarefas = Array.isArray(args.tarefas) ? args.tarefas : [];
-            _agentTodos = tarefas.map((t, i) => {
-                const titulo = typeof t === 'string' ? t : (t.titulo || t.title || 'Tarefa ' + (i + 1));
-                const status = typeof t === 'string' ? 'pending' : (t.status || 'pending');
-                return { titulo, status };
-            });
-            const list = _agentTodos.map((t, i) => `${i + 1}. [${t.status}] ${t.titulo}`).join('\n');
-            if (agentStreamCallback) agentStreamCallback('todo', JSON.stringify(_agentTodos));
-            return `Plano de tarefas atualizado:\n${list || '(vazio)'}`;
-        }
-        default: {
-            if (name === 'browser_content') {
-                try { return await executeBrowserTool(name, {}); } catch (e) { return `Erro Browser: ${e.message}`; }
-            }
-            if (name.startsWith('mcp_')) {
-                try { return await mcpManager.executeTool(name, args); }
-                catch (e) { return `Erro MCP: ${e.message}`; }
-            }
-            if (name.startsWith('browser_')) {
-                try { return await executeBrowserTool(name, args); }
-                catch (e) { return `Erro Browser: ${e.message}`; }
-            }
-            return 'Erro: ferramenta desconhecida';
-        }
-    }
-}
-
-function getAllToolDeclarations() {
-    const builtin = Object.values(TOOL_SCHEMAS);
-    const mcpTools = mcpManager.getAllTools().map(t => ({
-        name: t.name,
-        description: t.description,
-        parameters: { type: 'object', properties: t.parameters || {}, required: Object.keys(t.parameters || {}) }
-    }));
-    return [...builtin, ...mcpTools];
-}
-
-// Ferramentas avançadas/raras, escondidas em tarefas simples: menos tokens no
-// schema (custo) e menos chance de o agente escolher uma ferramenta inadequada.
-const ADVANCED_TOOLS = new Set(['generate_tests', 'browser_navigate', 'browser_screenshot', 'browser_click', 'browser_type', 'browser_evaluate', 'browser_console', 'browser_content', 'git_publish', 'git_push', 'git_pull', 'git_branch', 'git_log', 'git_stash', 'snapshot_create', 'snapshot_list', 'snapshot_restore', 'debug_start', 'debug_stop', 'debug_step', 'debug_resume', 'ssh_exec', 'ssh_status', 'docker_run', 'task', 'parallel_task', 'parallel_write']);
-
-function getAgentToolsForMode(mode) {
-    const allTools = getAllToolDeclarations();
-    if (mode === 'review' || mode === 'plan') {
-        return allTools.filter(t => !['write_file', 'apply_patch', 'delete_file', 'search_replace', 'file_rename', 'exec_command', 'git_commit', 'git_push', 'git_publish', 'docker_run', 'ssh_exec', 'undo', 'redo', 'snapshot_restore', 'browser_navigate', 'browser_click', 'browser_type', 'task', 'parallel_task', 'parallel_write'].includes(t.name));
-    }
-    if (mode === 'write_subagent') {
-        return allTools.filter(t => ['read_file', 'list_files', 'search_code', 'analyzer_symbols', 'analyzer_validate', 'apply_patch', 'write_file', 'search_replace'].includes(t.name));
-    }
-    if (_currentTaskComplexity === 'simple') {
-        return allTools.filter(t => !ADVANCED_TOOLS.has(t.name));
-    }
-    return allTools;
-}
 
 function getQualityRules() {
     const projectRules = loadProjectRules();
@@ -3160,71 +2391,7 @@ function getLanguageQualityRules() {
     }
 }
 
-const AGENT_BEHAVIOR_RULES = `
-REGRAS DE EXECUÇÃO:
-- AÇÃO DIRETA: aja como o opencode. Após 1-2 leituras para entender, EDITE o arquivo (apply_patch para mudanças pontuais, write_file para novos/reescritas). Não fique lendo arquivo após arquivo sem modificar nada.
-- AUTO-CORREÇÃO: após cada write_file ou search_replace, SE o resultado do validador mostrar ERROS REAIS (não avisos de escopo como "pode não estar definido neste escopo", que são falsos positivos), corrija-os NO MESMO ARQUIVO antes de seguir para outro. Máximo ~3 tentativas por arquivo.
-- VERIFICAÇÃO FINAL: antes de concluir, releia os arquivos alterados (read_file), valide a sintaxe e, se houver testes no projeto, rode test_run. Corrija erros reais antes de finalizar.
-- EDIÇÃO CIRÚRGICA: prefira apply_patch para alterações pontuais em arquivos existentes. Use write_file apenas para arquivos novos ou reescritas completas necessárias.
-- NÃO EXECUTE SERVIDORES/NPM INSTALL/DEPENDÊNCIAS: evite comandos que não terminam (ex.: node app.js, npm run dev, servidores). Use exec_command apenas para validação rápida (testes, lint, sintaxe) e sempre com fim definido.
-- CONVERGÊNCIA: você SÓ deve finalizar sem modificar nada se a tarefa for uma pergunta ou se concluir com certeza que nenhuma mudança é necessária. Para tarefas de correção/melhoria, você DEVE aplicar a alteração.
-- AMBIGUIDADE: se o pedido for genuinamente ambíguo e houver 2+ direções válidas, use a ferramenta question para perguntar ao usuário ANTES de implementar.${LANGUAGE_RULE}`;
-
-function getAgentSystemPrompt(task) {
-    const fileTree = getFileTree('', '', { n: 0 }).slice(0, 1500);
-    let imageNote = '';
-    if (_pendingImages && _pendingImages.length) {
-        imageNote = `\n🖼️ ${_pendingImages.length} imagem(ns) anexada(s). Analise para entender o estado da UI.`;
-    }
-    return `Você é um agente de desenvolvimento no Aedificator Codex IDE. Seja direto, conciso e acionável.
-
-${LANGUAGE_RULE}
-
-${getQualityRules()}
-
-DIRETÓRIO: ${PROJECT_ROOT}
-${fileTree ? 'ESTRUTURA:\n' + fileTree : ''}${imageNote}
-${getMemoryContext()}
-TAREFA: ${task}
-
-COMPORTAMENTO:
-- TRABALHE INCREMENTALMENTE: 1-2 arquivos por vez, valide, depois prossiga.
-- Use search_code para evitar duplicar funções já existentes.
-- Após concluir, responda em 1-2 linhas com o que foi feito.
-${AGENT_BEHAVIOR_RULES}`;
-}
-
-function getDeepSeekAgentPrompt(task) {
-    const fileTree = getFileTree('', '', { n: 0 }).slice(0, 1200);
-    let imageNote = '';
-    if (_pendingImages && _pendingImages.length) {
-        imageNote = `\n⚠️ O usuário anexou ${_pendingImages.length} imagem(ns). O DeepSeek NÃO suporta visão — use apenas as instruções textuais.`;
-    }
-    return `Você é um agente de desenvolvimento no Aedificator Codex IDE. Seja direto e conciso, como o opencode.
-
-${LANGUAGE_RULE}
-
-1. DIRETÓRIO: ${PROJECT_ROOT}
-${fileTree ? 'ESTRUTURA:\n' + fileTree : '(pasta vazia)'}
-${getMemoryContext()}
-2. TAREFA: ${task}
-
-3. COMPORTAMENTO (IMPORTANTE — siga rigorosamente):
-- Aja como o opencode: leia o arquivo relevante UMA vez, identifique o problema, e EDITE imediatamente com apply_patch (edição cirúrgica) ou write_file (arquivo novo/reescrita).
-- NÃO fique lendo vários arquivos antes de agir. Máximo 2-3 leituras totais.
-- NÃO use exec_command para ls/dir/cat/type/npm/npx/node -e. Use read_file/search_code.
-- Depois de editar, releia o arquivo (read_file) para confirmar que a mudança ficou correta.
-- 1 arquivo por vez. Escreva, veja os erros, corrija. Depois faça o próximo.
-- Ao finalizar, responda em 1-2 linhas o que foi alterado.
-
-4. COMO ACHAR A CAUSA RAIZ (leia isto antes de explorar):
-- A causa quase nunca está no primeiro arquivo que você lê. Está no que o código CHAMA.
-- Se uma função/objeto chamado não for nativo do browser (ex.: Seguranca, Utils, Store, State, Modal, Toast), USE search_code para achar a DEFINIÇÃO e leia esse arquivo UMA vez. Ex.: se o render monta HTML e você vê "conteudo.innerHTML = html", procure quem SANITIZA/transforma esse html antes (ex.: "sanitizar", "escape", "filtrar").
-- Para bugs de UI (botão/clique/modal não funciona), use search_code com o nome da função chamada no onclick (ex.: "abrirModal") para ver onde o handler é definido e o que ele faz, incluindo o que pode remover/transformar o HTML.
-- Se houver reprodução possível no browser (browser_navigate/evaluate/console), use-a para ver o estado real do DOM (ex.: um atributo onclick ausente) — é a prova mais rápida da causa.
-- Só aplique a correção quando você tiver uma explicação concreta do porquê (linha + mecanismo). Nunca corrija "no chute".
-${AGENT_BEHAVIOR_RULES}`;
-}
+// AGENT_BEHAVIOR_RULES, getAgentSystemPrompt e getDeepSeekAgentPrompt agora vivem em ./ai/prompts.js
 
 // =============================================
 //  AGENT LOOP UNIFICADO — adapter de provider + ferramentas
@@ -3232,347 +2399,6 @@ ${AGENT_BEHAVIOR_RULES}`;
 
 // Formato canônico de mensagem:
 //   { role: 'system' | 'user' | 'assistant' | 'tool', content, tool_calls?, tool_call_id?, name? }
-
-function geminiContentsFromCanonical(messages) {
-    const contents = [];
-    let systemText = '';
-    let systemApplied = false;
-    let firstUser = true;
-    for (const m of messages) {
-        if (m.role === 'system') { systemText += (systemText ? '\n' : '') + m.content; continue; }
-        if (m.role === 'assistant') {
-            const parts = [];
-            if (m.content) parts.push({ text: m.content });
-            for (const tc of (m.tool_calls || [])) {
-                const part = { functionCall: { name: tc.name, args: tc.args } };
-                if (tc.thought_signature) part.thoughtSignature = tc.thought_signature;
-                parts.push(part);
-            }
-            contents.push({ role: 'model', parts: parts.length ? parts : [{ text: '' }] });
-        } else if (m.role === 'tool') {
-            contents.push({ role: 'user', parts: [{ functionResponse: { name: m.name, response: { result: String(m.content).slice(0, toolResultMax()) } } }] });
-        } else {
-            const parts = [];
-            if (systemText && !systemApplied) { parts.push({ text: systemText }); systemApplied = true; }
-            if (firstUser && _pendingImages && _pendingImages.length) {
-                for (const img of _pendingImages) {
-                    if (img.dataUrl) {
-                        const match = img.dataUrl.match(/^data:(image\/\w+);base64,(.+)/);
-                        if (match) parts.push({ inlineData: { mimeType: match[1], data: match[2] } });
-                    }
-                }
-                clearPendingImages();
-            }
-            firstUser = false;
-            parts.push({ text: m.content });
-            contents.push({ role: 'user', parts });
-        }
-    }
-    return contents;
-}
-
-async function fetchGeminiStreamRaw(url, body, onChunk, signal) {
-    const response = await fetchWithTimeout(url, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body
-    }, 120000, signal);
-    if (!response.ok) {
-        const err = await response.text();
-        const hint = getProviderErrorHint(response.status, err, 'gemini');
-        const msg = hint || `Gemini HTTP ${response.status}: ${err.slice(0, 300)}`;
-        logError('gemini-api', msg, err.slice(0, 500));
-        throw new Error(msg);
-    }
-    const reader = response.body.getReader();
-    const decoder = new TextDecoder();
-    let fullText = '';
-    let buffer = '';
-    let usage = null;
-    while (true) {
-        if (signal && signal.aborted) {
-            const err = new Error('Tarefa cancelada');
-            err.name = 'AbortError';
-            throw err;
-        }
-        const { done, value } = await reader.read();
-        if (done) break;
-        const chunk = decoder.decode(value, { stream: true });
-        fullText += chunk;
-        buffer += chunk;
-        // Captura o uso de tokens do último chunk (cumulativo) para o custo.
-        const lines = buffer.split('\n');
-        buffer = lines.pop();
-        for (const line of lines) {
-            const trimmed = line.trim();
-            if (!trimmed.startsWith('data: ')) continue;
-            try {
-                const json = JSON.parse(trimmed.slice(6));
-                if (json.usageMetadata) usage = json.usageMetadata;
-            } catch (e) {}
-        }
-    }
-    if (buffer.trim().startsWith('data: ')) {
-        try {
-            const json = JSON.parse(buffer.trim().slice(6));
-            if (json.usageMetadata) usage = json.usageMetadata;
-        } catch (e) {}
-    }
-    return { text: fullText, usage };
-}
-
-function parseGeminiAgentResponse(rawText) {
-    const toolCalls = [];
-    let text = '';
-    const lines = rawText.split('\n');
-    for (const line of lines) {
-        if (!line.startsWith('data: ')) continue;
-        try {
-            const json = JSON.parse(line.slice(6));
-            const candidate = json.candidates?.[0];
-            if (!candidate) continue;
-            const parts = candidate.content?.parts || [];
-            for (const part of parts) {
-                if (part.functionCall) {
-                    const tc = { id: 'gem_' + Date.now() + '_' + toolCalls.length, name: part.functionCall.name, args: part.functionCall.args || {} };
-                    const ts = part.thoughtSignature || part.thought_signature || part.functionCall.thoughtSignature || part.functionCall.thought_signature;
-                    if (ts) tc.thought_signature = ts;
-                    toolCalls.push(tc);
-                }
-                if (part.text) text += part.text;
-            }
-        } catch (e) {}
-    }
-    return { text, toolCalls };
-}
-
-async function callAgentGemini(messages, tools, signal) {
-    const geminiKey = config.gemini.apiKey;
-    if (!geminiKey) throw new Error('Chave Gemini não configurada');
-    const model = _currentTaskModel || config.gemini.model || 'gemini-3.5-flash';
-    const url = new URL(`https://generativelanguage.googleapis.com/v1beta/models/${model}:streamGenerateContent?alt=sse&key=${geminiKey}`);
-    const toolDeclarations = tools.map(t => ({ name: t.name, description: t.description, parameters: t.parameters }));
-    const body = JSON.stringify({
-        contents: geminiContentsFromCanonical(messages),
-        tools: [{ functionDeclarations: toolDeclarations }],
-        toolConfig: { functionCallingConfig: { mode: 'AUTO' } }
-    });
-    const raw = await retryWithBackoff(
-        () => fetchGeminiStreamRaw(url, body, null, signal),
-        { maxRetries: 1, baseDelay: 2000, signal }
-    );
-    if (raw.usage) {
-        const cacheHit = raw.usage.cachedContentTokenCount || 0;
-        trackTokens('gemini', raw.usage.promptTokenCount || 0, raw.usage.candidatesTokenCount || 0, cacheHit > 0, model, cacheHit);
-    }
-    return parseGeminiAgentResponse(raw.text);
-}
-
-function openAIMessagesFromCanonical(messages, allowImages) {
-    const out = [];
-    let firstUser = true;
-    for (const m of messages) {
-        if (m.role === 'system') { out.push({ role: 'system', content: m.content }); continue; }
-        if (m.role === 'assistant') {
-            const entry = { role: 'assistant', content: m.content || null };
-            if (m.tool_calls && m.tool_calls.length) {
-                entry.tool_calls = m.tool_calls.map(tc => ({ id: tc.id, type: 'function', function: { name: tc.name, arguments: JSON.stringify(tc.args) } }));
-            }
-            out.push(entry);
-        } else if (m.role === 'tool') {
-            out.push({ role: 'tool', tool_call_id: m.tool_call_id, content: String(m.content).slice(0, toolResultMax()) });
-        } else {
-            if (firstUser && allowImages) {
-                firstUser = false;
-                const images = getImagePartsForOpenAI();
-                if (images) {
-                    out.push({ role: 'user', content: [...images, { type: 'text', text: m.content }] });
-                    clearPendingImages();
-                    continue;
-                }
-            }
-            firstUser = false;
-            out.push({ role: 'user', content: m.content });
-        }
-    }
-
-    // Sanitização: descarta tool messages órfãos (sem um "assistant" com
-    // tool_calls antes). A API OpenAI/DeepSeek rejeita com HTTP 400 se um "tool"
-    // não for resposta a uma chamada de ferramenta anterior.
-    const cleaned = [];
-    let expectingTool = false;
-    for (const m of out) {
-        if (m.role === 'assistant' && m.tool_calls && m.tool_calls.length) {
-            expectingTool = true;
-            cleaned.push(m);
-        } else if (m.role === 'tool') {
-            if (expectingTool) cleaned.push(m);
-        } else {
-            expectingTool = false;
-            cleaned.push(m);
-        }
-    }
-    return cleaned;
-}
-
-async function callAgentOpenAICompatible(provider, messages, tools, signal, onChunk) {
-    const apiKey = provider === 'deepseek' ? config.deepseek.apiKey : config.openai.apiKey;
-    if (!apiKey) throw new Error(`Chave ${provider} não configurada`);
-    const baseUrl = provider === 'deepseek'
-        ? 'https://api.deepseek.com/chat/completions'
-        : 'https://api.openai.com/v1/chat/completions';
-    const model = provider === 'deepseek' ? (_currentTaskModel || config.deepseek.model || 'deepseek-v4-flash') : (_currentTaskModel || config.openai.model || 'gpt-4o');
-
-    const toolDefs = tools.map(t => ({ type: 'function', function: { name: t.name, description: t.description, parameters: t.parameters } }));
-    const body = { model, messages: openAIMessagesFromCanonical(messages, provider !== 'deepseek'), tools: toolDefs, tool_choice: 'auto', max_tokens: 8192 };
-
-    // Timeout por tentativa: uma API que não responde não pode travar a tarefa
-    // em "Executando" por tempo indeterminado (o watchdog é o último recurso).
-    // 180s POR TENTATIVA: tool-calling (reasoning + múltiplas tool calls com
-    // contexto grande) pode ultrapassar 120s, causando "This operation was
-    // aborted" e fallback desnecessário para outro provider. O timer é recriado
-    // a cada tentativa — se fosse compartilhado, o retry herdaria o tempo já
-    // gasto e abortaria imediatamente após a primeira tentativa demorada.
-    const API_TIMEOUT_MS = 180000;
-    const baseSignal = signal;
-
-    let response;
-    try {
-        response = await retryWithBackoff(
-            () => {
-                // Cria o timeout FRESCO por tentativa (o sinal externo é imutável).
-                const attemptSignal = baseSignal && typeof baseSignal.aborted === 'boolean' && typeof AbortSignal.any === 'function'
-                    ? AbortSignal.any([baseSignal, AbortSignal.timeout(API_TIMEOUT_MS)])
-                    : baseSignal;
-                return fetch(baseUrl, {
-                    method: 'POST',
-                    headers: { 'Content-Type': 'application/json', 'Authorization': `Bearer ${apiKey}` },
-                    body: safeJsonStringify(body),
-                    signal: attemptSignal
-                });
-            },
-            {
-                maxRetries: 1,
-                baseDelay: 2000,
-                onRetry: (attempt, max, delay) => {
-                    if (onChunk) onChunk('Sistema', `⏳ Retry ${attempt}/${max}... aguardando ${delay}s\n`);
-                },
-                signal: baseSignal
-            }
-        );
-    } catch (fetchErr) {
-        const hint = getProviderErrorHint(0, fetchErr.message, provider);
-        const msg = hint ? hint : `❌ ${provider} indisponível: ${fetchErr.message.slice(0, 150)}`;
-        if (onChunk) onChunk('Sistema', msg + '\n');
-        throw new Error(msg);
-    }
-    if (!response.ok) {
-        const errorBody = await response.text().catch(() => '');
-        const hint = getProviderErrorHint(response.status, errorBody, provider);
-        throw new Error(hint || `${provider} HTTP ${response.status}: ${errorBody.slice(0, 200)}`);
-    }
-
-    const data = await response.json();
-    if (data.usage) {
-const model = provider === 'deepseek' ? (_currentTaskModel || config.deepseek.model || 'deepseek-v4-flash') : (_currentTaskModel || config.openai.model || 'gpt-4o');
-        const cacheHit = provider === 'deepseek'
-            ? (data.usage.prompt_cache_hit_tokens || data.usage.prompt_tokens_details?.cached_tokens || 0)
-            : 0;
-        trackTokens(provider, data.usage.prompt_tokens || 0, data.usage.completion_tokens || 0, cacheHit > 0, model, cacheHit);
-    }
-    const msg = data.choices?.[0]?.message;
-    if (!msg) return { text: 'Sem resposta', toolCalls: [] };
-    const toolCalls = (msg.tool_calls || []).map(tc => {
-        let args = {};
-        try {
-            args = JSON.parse(tc.function.arguments || '{}');
-        } catch (e) {
-            logError('tool-args', `JSON inválido nos argumentos de ${tc.function.name}`, e.message.slice(0, 200));
-        }
-        return { id: tc.id, name: tc.function.name, args };
-    });
-    return { text: msg.content || '', toolCalls };
-}
-
-function claudeMessagesFromCanonical(messages) {
-    const out = [];
-    let systemText = '';
-    let systemApplied = false;
-    let firstUser = true;
-    for (const m of messages) {
-        if (m.role === 'system') { systemText += (systemText ? '\n' : '') + m.content; continue; }
-        if (m.role === 'assistant') {
-            const blocks = [];
-            if (m.content) blocks.push({ type: 'text', text: m.content });
-            for (const tc of (m.tool_calls || [])) blocks.push({ type: 'tool_use', id: tc.id, name: tc.name, input: tc.args });
-            out.push({ role: 'assistant', content: blocks.length ? blocks : [{ type: 'text', text: '' }] });
-        } else if (m.role === 'tool') {
-            out.push({ role: 'user', content: [{ type: 'tool_result', tool_use_id: m.tool_call_id, content: String(m.content).slice(0, toolResultMax()) }] });
-        } else {
-            let text = m.content;
-            if (systemText && !systemApplied) { text = systemText + '\n\n' + text; systemApplied = true; }
-            if (firstUser) {
-                firstUser = false;
-                const images = getImagePartsForClaude();
-                if (images && images.length) {
-                    out.push({ role: 'user', content: [...images, { type: 'text', text }] });
-                    clearPendingImages();
-                    continue;
-                }
-            }
-            out.push({ role: 'user', content: text });
-        }
-    }
-    return out;
-}
-
-async function callAgentClaude(messages, tools, signal) {
-    const apiKey = config.claude.apiKey;
-    if (!apiKey) throw new Error('Chave Claude não configurada');
-    const model = _currentTaskModel || config.claude.model || 'claude-sonnet-5';
-    const toolDefs = tools.map(t => ({ name: t.name, description: t.description, input_schema: t.parameters }));
-
-    const response = await fetchWithTimeout('https://api.anthropic.com/v1/messages', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json', 'x-api-key': apiKey, 'anthropic-version': '2023-06-01' },
-        body: safeJsonStringify({ model, max_tokens: 4096, messages: claudeMessagesFromCanonical(messages), tools: toolDefs })
-    }, 180000, signal);
-    if (!response.ok) {
-        const errorBody = await response.text().catch(() => '');
-        const hint = getProviderErrorHint(response.status, errorBody, 'claude');
-        throw new Error(hint || `Claude HTTP ${response.status}: ${errorBody.slice(0, 300)}`);
-    }
-
-    const data = await response.json();
-    if (data.usage) {
-        const cacheHit = data.usage.cache_read_input_tokens || 0;
-        trackTokens('claude', data.usage.input_tokens || 0, data.usage.output_tokens || 0, cacheHit > 0, model, cacheHit);
-    }
-    const content = data.content || [];
-    let text = '';
-    const toolCalls = [];
-    for (const block of content) {
-        if (block.type === 'text') text += block.text;
-        if (block.type === 'tool_use') toolCalls.push({ id: block.id, name: block.name, args: block.input || {} });
-    }
-    return { text, toolCalls };
-}
-
-async function callAgentProvider(provider, messages, tools, signal, onChunk) {
-    if (provider === 'gemini') return await callAgentGemini(messages, tools, signal);
-    if (provider === 'deepseek' || provider === 'openai') return await callAgentOpenAICompatible(provider, messages, tools, signal, onChunk);
-    if (provider === 'claude') return await callAgentClaude(messages, tools, signal);
-    throw new Error(`Modo agente não suportado para ${provider}`);
-}
-
-function getConfiguredProviders() {
-    const providers = [];
-    if (config.gemini?.apiKey) providers.push('gemini');
-    if (config.deepseek?.apiKey) providers.push('deepseek');
-    if (config.openai?.apiKey) providers.push('openai');
-    if (config.claude?.apiKey) providers.push('claude');
-    return providers;
-}
 
 function isNetworkError(err) {
     const m = String((err && err.message) || '').toLowerCase();
@@ -3594,30 +2420,6 @@ function isFallbackEligibleError(err) {
     if (isNetworkError(err)) return true;
     const m = String((err && err.message) || '').toLowerCase();
     return /esgotad|insufficient|quota|billing|credit|balance|rate ?limit|too many requests|exhausted|payment required|overloaded|service unavailable|\b402\b|\b429\b|\b500\b|\b502\b|\b503\b|\b504\b/i.test(m);
-}
-
-async function callAgentProviderWithFallback(primary, messages, tools, signal, onChunk, activeProviderRef) {
-    const candidates = [primary, ...getConfiguredProviders().filter(p => p !== primary)];
-    let lastErr = null;
-    for (const candidate of candidates) {
-        try {
-            const result = await callAgentProvider(candidate, messages, tools, signal, onChunk);
-            if (candidate !== primary) {
-                if (onChunk) onChunk('Sistema', `🔁 Provider ${candidate} assumiu (fallback automático).\n`);
-                if (activeProviderRef) activeProviderRef.value = candidate;
-                _currentAgentProvider = candidate;
-            }
-            return result;
-        } catch (err) {
-            lastErr = err;
-            const eligible = isFallbackEligibleError(err);
-            const isLast = candidate === candidates[candidates.length - 1];
-            if (isLast) break;
-            if (onChunk) onChunk('Sistema', `⚠️ ${candidate} falhou (${err.message.slice(0, 100)}). Tentando ${candidates[candidates.length - 1]}...\n`);
-            if (!eligible) break;
-        }
-    }
-    throw lastErr || new Error('Todos os providers falharam');
 }
 
 // =============================================
@@ -3705,6 +2507,27 @@ async function maybeCompactMessages(provider, messages, signal) {
     const older = messages.slice(systemMsg ? 1 : 0, keepFrom);
     const recent = messages.slice(keepFrom);
 
+    // Recolhe as ferramentas de escrita executadas nas mensagens antigas para
+    // preservar as decisões críticas (quais arquivos foram alterados) no resumo.
+    const arquivosAlterados = [];
+    for (const m of older) {
+        if (m.role === 'tool' && m.content) {
+            const c = String(m.content);
+            const m2 = c.match(/Arquivo\s+(\S+)\s+salvo|(.+?)\s+salvo\s+\(\d+ bytes\)/);
+            if (m2) arquivosAlterados.push(m2[1] || m2[2]);
+        }
+        if (m.role === 'assistant' && m.tool_calls) {
+            for (const tc of m.tool_calls) {
+                if (tc.function && ['write_file', 'apply_patch', 'search_replace', 'delete_file', 'file_rename'].includes(tc.function.name)) {
+                    const args = tc.function.arguments || '';
+                    const caminho = args.match(/caminho["']?\s*:\s*["']([^"']+)/);
+                    if (caminho) arquivosAlterados.push(caminho[1]);
+                }
+            }
+        }
+    }
+    const arquivosUnicos = [...new Set(arquivosAlterados)].slice(0, 10);
+
     let summary = '';
     try {
         const convText = older.map(m => {
@@ -3712,14 +2535,19 @@ async function maybeCompactMessages(provider, messages, signal) {
             if (m.role === 'tool') return `[tool ${m.name}: ${(m.content || '').slice(0, 150)}]`;
             return `Usuário: ${(m.content || '').slice(0, 300)}`;
         }).join('\n');
-        summary = await callAI(provider, `Resuma de forma concisa o progresso da conversa abaixo (arquivos alterados, decisões, próximos passos). Máximo 300 palavras.\n\n${convText.slice(0, toolResultMax())}`, null, signal);
+        const extra = arquivosUnicos.length ? `\n\nARQUIVOS JÁ ALTERADOS (não altere sem necessidade): ${arquivosUnicos.join(', ')}` : '';
+        summary = await callAI(provider, `Resuma de forma concisa o progresso da conversa abaixo (arquivos alterados, decisões, próximos passos). Máximo 300 palavras.${extra}\n\n${convText.slice(0, toolResultMax())}`, null, signal);
     } catch (e) {
         summary = '';
     }
 
     const rebuilt = [];
     if (systemMsg) rebuilt.push(systemMsg);
-    rebuilt.push({ role: 'user', content: summary ? `RESUMO DA CONVERSA ANTERIOR (compactado automaticamente):\n${summary}` : 'Conversa anterior omitida para economizar contexto.' });
+    // Se a compactação por IA falhou, ao menos preserva a lista de arquivos alterados.
+    const fallback = arquivosUnicos.length
+        ? `Conversa anterior omitida. Arquivos já alterados: ${arquivosUnicos.join(', ')}.`
+        : 'Conversa anterior omitida para economizar contexto.';
+    rebuilt.push({ role: 'user', content: summary ? `RESUMO DA CONVERSA ANTERIOR (compactado automaticamente):\n${summary}` : fallback });
     rebuilt.push(...recent);
     messages.length = 0;
     messages.push(...rebuilt);
@@ -3738,191 +2566,8 @@ function hasRealWriteErrors(resultStr) {
 }
 
 // =============================================
-async function runAgentLoop(task, onChunk, signal, mode, history, provider) {
-    const systemPrompt = provider === 'deepseek' ? getDeepSeekAgentPrompt(task) : getAgentSystemPrompt(task);
-    const tools = getAgentToolsForMode(mode);
-    const maxIterations = 20;
-
-    const messages = [{ role: 'system', content: systemPrompt }, { role: 'user', content: task }];
-    const prevProvider = _currentAgentProvider;
-    const prevSignal = _currentAgentSignal;
-    const prevTodos = _agentTodos;
-    _currentAgentProvider = provider;
-    _currentAgentSignal = signal;
-    _agentTodos = [];
-
-    const loopStartSnapshot = snapshotProjectFiles();
-    const activeProvider = { value: provider };
-    let noActionCount = 0;
-    // Ferramentas que efetivamente alteram o projeto. Tool calls de leitura/
-    // busca/browser/execução não contam como ação — se o agente fizer muitas
-    // delas sem nunca escrever, entramos num loop de exploração infinito.
-    const WRITE_TOOLS = new Set(['write_file', 'apply_patch', 'search_replace', 'delete_file', 'file_rename', 'file_mkdir', 'undo', 'redo', 'git_commit', 'git_push', 'git_publish', 'git_stash', 'snapshot_create', 'docker_run', 'ssh_exec']);
-    const MAX_NO_WRITE_TOOLCALLS = 8;
-    let noWriteCount = 0;
-    let stoppedEarly = false;
-    // Rastreia quantas vezes cada arquivo foi lido: reler o mesmo arquivo várias
-    // vezes é sinal de que a causa não está nele, mas no que ele chama.
-    const arquivosLidos = new Map();
-
-    try {
-        let iteration = 0;
-        while (iteration < maxIterations) {
-            if (signal && signal.aborted) {
-                const err = new Error('Tarefa cancelada');
-                err.name = 'AbortError';
-                throw err;
-            }
-            iteration++;
-            if (iteration >= maxIterations - 1 && onChunk) onChunk('Sistema', `⚠️ Iteração ${iteration}/${maxIterations} — finalize a tarefa.\n`);
-
-            const thoughtStart = Date.now();
-            const { text, toolCalls } = await callAgentProviderWithFallback(activeProvider.value, messages, tools, signal, onChunk, activeProvider);
-            const elapsed = ((Date.now() - thoughtStart) / 1000).toFixed(1);
-
-            if (text && onChunk) onChunk('Assistente', text);
-            if (toolCalls.length === 0) {
-                // O agente devolveu texto sem executar NENHUMA ferramenta. Isso é
-                // legítimo para perguntas/consultas, mas se a tarefa pede uma
-                // implementação e o texto parece indecisão/plano ("vou", "posso",
-                // "preciso", "poderia", "sugiro"...), NÃO desistimos — forçamos a
-                // execução por até 2 tentativas antes de concluir.
-                const looksLikeActionTask = /(faça|crie|implemente|adicione|corrija|melhore|modifique|ajuste|refatore|escreva|altere|cria|implementar|melhorar|corrigir|adicionar)/i.test(task);
-                const looksHesitant = /(^|\s)(vou|posso|poderia|preciso|devo|sugiro|planejo|vamos|pretendo|poderíamos|poderia|analisar|pensar|estudar)\b/i.test(text || '') || /(\?\s*$)|(escolha|prefere|qual opção|sugest[ãa]o)/i.test(text || '');
-                if (looksLikeActionTask && looksHesitant && noActionCount < 2) {
-                    noActionCount++;
-                    messages.push({
-                        role: 'user',
-                        content: 'NÃO responda com plano ou pergunta. A tarefa é de IMPLEMENTAÇÃO: use as ferramentas write_file / search_replace / exec_command AGORA para fazer as alterações no código. Se precisar explorar, faça NO MÁXIMO 1 leitura e depois altere.'
-                    });
-                    continue;
-                }
-                return text || 'Agente concluído';
-            }
-            if (onChunk) onChunk('Sistema', `+ Thought: ${elapsed}s\n`);
-
-            messages.push({ role: 'assistant', content: text, tool_calls: toolCalls });
-
-            // Auto-correção NÃO pode ser inserida entre tool calls: a API OpenAI/DeepSeek
-            // exige que mensagens "tool" sigam imediatamente um "assistant" com tool_calls.
-            // A instrução é acumulada e enviada como "user" DEPOIS de todos os tool results.
-            let autoCorrectPending = false;
-
-            for (const tc of toolCalls) {
-                if (onChunk) onChunk('Sistema', `🔧 ${tc.name}(${Object.values(tc.args).join(', ').slice(0, 60)})\n`);
-                const decision = await checkToolPermission(tc.name, tc.args, signal);
-                let result;
-                let toolError = false;
-                let resultStr = '';
-                if (decision === 'deny') {
-                    result = 'Permissão negada pelo usuário.';
-                    toolError = true;
-                    if (onChunk) onChunk('Sistema', '  ⛔ negado pelo usuário\n');
-                } else {
-                    if (onChunk) onChunk('activity', JSON.stringify({
-                        ev: 'tool_start', id: tc.id, tool: tc.name,
-                        label: buildToolLabel(tc.name, tc.args), icon: getToolIcon(tc.name),
-                        file: tc.args.filePath || tc.args.path || tc.args.file || tc.args.caminho || '',
-                        code: (tc.name === 'write_file' || tc.name === 'search_replace' || tc.name === 'apply_patch')
-                            ? String(tc.args.content || tc.args.code || tc.args.newContent || tc.args.new_string || '').slice(0, 4000)
-                            : ''
-                    }));
-                    const toolStart = Date.now();
-                    try {
-                        result = await executeAgentTool(tc.name, tc.args);
-                    } catch (toolErr) {
-                        result = `Erro: ${toolErr.message}`;
-                        toolError = true;
-                        if (onChunk) onChunk('Sistema', `  ⚠️ falhou: ${toolErr.message.slice(0, 80)}\n`);
-                    }
-                    const toolElapsed = ((Date.now() - toolStart) / 1000).toFixed(1);
-                    resultStr = String(result);
-                    if (!toolError) {
-                        const preview = resultStr.length > 120 ? resultStr.slice(0, 120).replace(/\n/g, ' ') + '...' : resultStr.replace(/\n/g, ' ');
-                        if (tc.name === 'read_file' || tc.name === 'list_files' || tc.name === 'search_code' || tc.name === 'exec_command') {
-                            if (onChunk) onChunk('Sistema', `  → ${resultStr.length} bytes · ${toolElapsed}s\n`);
-                        } else if (onChunk && resultStr.length) {
-                            onChunk('Sistema', `  → ${preview} · ${toolElapsed}s\n`);
-                        }
-                    }
-                    if (onChunk) onChunk('activity', JSON.stringify({ ev: 'tool_end', id: tc.id, isError: toolError, error: toolError ? (resultStr || 'Erro desconhecido').slice(0, 120) : undefined }));
-                }
-                messages.push({ role: 'tool', tool_call_id: tc.id, name: tc.name, content: truncateToolResult(tc.name, result) });
-
-                // Conta tool calls sem efeito de escrita. Ferramentas de leitura/
-                // busca/browser/execução não alteram o projeto — se acumularem sem
-                // nenhuma escrita, forçamos o agente a agir (ver check abaixo).
-                if (WRITE_TOOLS.has(tc.name) && !toolError) {
-                    noWriteCount = 0;
-                } else if (tc.name !== 'question' && tc.name !== 'todo') {
-                    noWriteCount++;
-                }
-
-                // Marca releitura do mesmo arquivo (sinal de causa em outro lugar).
-                if (tc.name === 'read_file' && tc.args && tc.args.caminho) {
-                    arquivosLidos.set(tc.args.caminho, (arquivosLidos.get(tc.args.caminho) || 0) + 1);
-                }
-
-                const toolResultStr = String(result);
-                if ((tc.name === 'write_file' || tc.name === 'search_replace' || tc.name === 'apply_patch') && !toolError && hasRealWriteErrors(toolResultStr)) {
-                    autoCorrectPending = true;
-                    if (onChunk) onChunk('Sistema', '⚠️ Auto-correção: há erros reais no arquivo. Corrija antes de prosseguir.\n');
-                }
-            }
-
-            // Quebra o loop de exploração: após N tool calls sem NENHUMA escrita,
-            // injeta uma ordem clara para aplicar a correção agora. O agente
-            // tende a ler/buscar sem nunca escrever — isso o força a convergir.
-            if (noWriteCount >= MAX_NO_WRITE_TOOLCALLS) {
-                const feitas = noWriteCount;
-                noWriteCount = 0;
-                // Se o agente JÁ escreveu arquivos e agora só está verificando
-                // (browser/lendo) sem novas escritas, não há mais o que forçar —
-                // conclui em vez de ficar preso até a iteração 20.
-                if (diffSnapshots(loopStartSnapshot, snapshotProjectFiles()).length > 0) {
-                    stoppedEarly = true;
-                    break;
-                }
-                const relidos = Array.from(arquivosLidos.entries()).filter(([, n]) => n >= 2).map(([f]) => f);
-                if (onChunk) onChunk('Sistema', `⚠️ ${feitas} chamadas de leitura/busca sem alterar arquivos. Forçando ação...\n`);
-                const dicaReleitura = relidos.length
-                    ? `Você já leu ${relidos.join(', ')} mais de uma vez. Se a causa não está aí, ela provavelmente está em um arquivo que esse código CHAMA (ex.: uma função de sanitização, validação ou filtro de HTML/dados). Siga a cadeia: leia UMA vez o arquivo da função chamada e aplique a correção nele.`
-                    : '';
-                messages.push({
-                    role: 'user',
-                    content: `⚠️ [AÇÃO OBRIGATÓRIA] Você fez ${feitas} chamadas de leitura/busca sem alterar nenhum arquivo.
-1. Se você JÁ identificou a causa raiz, aplique a correção AGORA com apply_patch (mudança pontual) ou write_file (arquivo novo/reescrita).
-2. ${dicaReleitura ? dicaReleitura : 'Se ainda não tem certeza da causa, faça NO MÁXIMO 1 leitura adicional FOCADA no arquivo mais provável e aplique a correção imediatamente depois.'}
-NÃO é permitido continuar lendo/buscando/reproduzindo no browser até você alterar ao menos um arquivo.`
-                });
-            }
-
-            if (autoCorrectPending) {
-                messages.push({
-                    role: 'user',
-                    content: '⚠️ [Auto-correção] A validação do arquivo acima acusou erros REAIS (não avisos de escopo). Corrija-os AGORA no mesmo arquivo antes de prosseguir. IGNORE "pode não estar definido neste escopo" — são falsos positivos.'
-                });
-            }
-
-            await maybeCompactMessages(provider, messages, signal);
-        }
-        const loopChanges = diffSnapshots(loopStartSnapshot, snapshotProjectFiles());
-        if (loopChanges.length > 0) {
-            const fileList = loopChanges.slice(0, 8).map(c => `${c.file} (${c.action})`).join(', ');
-            return stoppedEarly
-                ? `${loopChanges.length} arquivo(s) alterado(s): ${fileList}${loopChanges.length > 8 ? '...' : ''}`
-                : `Limite de iterações atingido — ${loopChanges.length} arquivo(s) alterado(s): ${fileList}${loopChanges.length > 8 ? '...' : ''}`;
-        }
-        return stoppedEarly
-            ? 'Concluído'
-            : 'Limite de iterações atingido sem alterações de arquivos — o pedido pode ser amplo demais; separe em tarefas menores ou use o modo Direto.';
-    } finally {
-        _currentAgentProvider = prevProvider;
-        _currentAgentSignal = prevSignal;
-        _agentTodos = prevTodos;
-    }
-}
-
+// runAgentLoop agora vive em ./ai/loop.js
+// =============================================
 function runQuickTest(filePath) {
     try {
         const ext = path.extname(filePath).toLowerCase();
@@ -3968,6 +2613,35 @@ function runQuickTest(filePath) {
         }
         return null;
     }
+}
+
+// Valida os arquivos alterados após o loop do agente, retornando os erros REAIS
+// de sintaxe/validação. Permite que o loop force uma rodada de correção antes de
+// entregar código quebrado — comportamento próximo do opencode, que valida o que
+// escreveu. Ignora avisos de escopo ("pode não estar definido neste escopo").
+function validateChangedFiles(changedFiles) {
+    const errors = [];
+    for (const file of changedFiles) {
+        const full = path.join(PROJECT_ROOT, file);
+        if (!fs.existsSync(full)) continue;
+        const ext = path.extname(file).toLowerCase();
+        if (!['.js', '.ts', '.jsx', '.tsx', '.py', '.go', '.rs', '.c', '.cpp', '.h'].includes(ext)) continue;
+        try {
+            const content = fs.readFileSync(full, 'utf-8');
+            const result = analyzer.validateCode(content, file, PROJECT_ROOT);
+            const real = (result.errors || []).filter(e => e.severity === 'error');
+            if (real.length) {
+                errors.push({
+                    file,
+                    detail: real.slice(0, 5).map(e => `Ln ${e.line}: ${e.message}`).join('; ')
+                });
+            }
+        } catch (e) {
+            // Arquivos binários ou com encoding não-UTF8 podem falhar a leitura;
+            // não bloquear a conclusão por causa disso.
+        }
+    }
+    return errors;
 }
 
 function findTestFile(sourcePath, prefix, suffix) {
@@ -4493,19 +3167,6 @@ function formatRelevantFiles(files) {
     ).join('');
 }
 
-function stripAccents(s) {
-    return (s || '').normalize('NFD').replace(/[\u0300-\u036f]/g, '');
-}
-
-function classifyIntent(message) {
-    const m = stripAccents((message || '').toLowerCase()).trim();
-    if (/(^|\s)(o que e|o que|como funciona|explique|qual a diferenca|defina|conceito|significado|por que|porque|what is|whats|how does|how do|explain|what'?s the difference|define|meaning|why|quem|who|quando|when|onde|where|que es|cual es|diferencia)\b/i.test(m)) return 'question';
-    if (/^(o que|como|qual|quais|por que|quando|onde|quem|what|how|why|when|where|which|who|que|cual|cuales|cuando|donde|porque)\b/i.test(m)) return 'question';
-    if (m.endsWith('?') && !/(crie|criar|cria|faca|fazer|implemente|implementar|corrija|corrigir|arrume|arrumar|adicione|adicionar|mude|mudar|altere|alterar|delete|deletar|remova|remover|refatore|refatorar|escreva|escrever|build|code|codigo|arquivo|file|funcao|function|componente|component|roda|rode|execute|executar|teste|testar|create|make|fix|add|remove|rename|update|refactor|write|implement|change|modify|crea|crear|corrige|anade|agregar|elimina|renombra|actualiza|refactoriza|escribe|implementa)\b/i.test(m)) return 'question';
-    if (m.length < 15 && m.endsWith('?')) return 'question';
-    return 'task';
-}
-
 let agentStreamCallback = null;
 let _pendingImages = null;
 let _activeChildProcesses = [];
@@ -4767,57 +3428,7 @@ MÉTODO (siga esta ordem):
     }
 }
 
-function classifyRequest(message) {
-    const m = (message || '').trim();
-    const mLower = stripAccents(m).toLowerCase();
-
-    const intent = classifyIntent(message);
-
-    if (intent === 'question') return { route: 'answer', reason: 'Pergunta detectada' };
-
-    const simplePatterns = [
-        /^(corrig(a|ir)|arrum(a|ar)|consert(a|ar)|fix|correg(i|ir)|arregla(r)?)\s/i,
-        /^(adicione|adicionar|acrescent(a|ar)|inclu(a|ir)|add)\s.+\s(no|na|em|ao|to|in|into|on|a|en)\s/i,
-        /^(remova|remover|delete|deletar|apag(a|ar)|exclu(a|ir)|remove|elimina(r)?|borra(r)?)\s/i,
-        /^(renomei(a|ar)|renomear|mova|mover|move|rename)\s/i,
-        /^(troque|trocar|altere|alterar|mude|mudar|substitua|substituir|replace|change)\s.+\s(por|para|with|for|to)\s/i,
-        /^(crie|criar|faca|fazer|implemente|implementar|create|make|implement|crea(r)?|crear|implementa(r)?)\s.+\s(com|usando|que|with|using|that)\s/i,
-        /^(execute|executar|rode|rodar|teste|testar|run|test|ejecuta(r)?|ejecutar|prueba(r)?)\s/i,
-        /^(atualize|atualizar|refatore|refatorar|update|refactor|actualiza(r)?|actualizar|refactoriza(r)?)\s\w+\s/i,
-        /^(formate|formatar|lint|organize|organizar|format|organiza(r)?)\s/i,
-        /^(adicione|adicionar|coloque|colocar|ponha|pôr|add|put|agrega(r)?)\s.+\s(no|na|antes|depois|após|to|in|before|after|en|antes|despues)\s/i,
-        /^(extraia|extrair|separe|separar|divida|dividir|extract|split)\s/i,
-        /^(converta|converter|transforme|transformar|convert|transform)\s/i,
-    ];
-
-    for (const pattern of simplePatterns) {
-        if (pattern.test(mLower)) return { route: 'direct', reason: 'Tarefa específica detectada' };
-    }
-
-    const complexSignals = [
-        /\?/g,
-        /\b(ou|ou então|alternativa|opção|opções|escolha|escolher|qual|como|or|option|options|choice|choose|which|how|o|opcion|opciones|eleccion|elegir|cual)\b/gi,
-        /\b(qualquer|tanto faz|decida|decidir|sugira|sugerir|recomende|recomendar|any|either|decide|suggest|recommend|cualquiera|da igual|decidir|sugiere|recomienda)\b/gi,
-        /\b(melhorar|melhore|aprimorar|aprimore|otimizar|otimize|improve|enhance|optimize|optimise|mejorar|optimizar)\b/gi,
-    ];
-    let complexityScore = 0;
-    for (const sig of complexSignals) {
-        const matches = mLower.match(sig);
-        if (matches) complexityScore += matches.length;
-    }
-
-    if (mLower.length < 30) complexityScore += 3;
-    if (/(melhorar|improve|mejorar)/.test(mLower) && !/(arquivo|funcao|file|function|archivo)/.test(mLower)) complexityScore += 2;
-    if (mLower.split(/\s+/).length > 40) complexityScore -= 2;
-
-    if (complexityScore >= 3) return { route: 'options', reason: 'Pedido complexo/aberto — gerar opções' };
-
-    if (mLower.length > 100 || mLower.split(',').length > 3 || mLower.split(';').length > 2) {
-        return { route: 'direct', reason: 'Múltiplas tarefas específicas' };
-    }
-
-    return { route: 'direct', reason: 'Tarefa direta padrão' };
-}
+// classifyRequest / classifyIntent / stripAccents agora vivem em ./ai/classify.js
 
 async function analyzeTask(message, onChunk, signal, mode = 'cowork', history = [], provider = 'gemini', explorationContext = '') {
     const intent = classifyIntent(message);
@@ -5041,10 +3652,16 @@ async function executePlan(plan, onChunk, signal) {
         if (onChunk) onChunk('file-status', JSON.stringify([payload]));
     }
 
+    const actualModified = modifications.filter(m => m.status !== 'skipped').length;
+    const skippedCount = modifications.filter(m => m.status === 'skipped').length;
     if (cancelled) {
         result += `\n⏹️ **Tarefa cancelada** (${modifications.length} arquivo(s) processado(s)).\n`;
     } else {
-        result += `\n✅ **${modifications.length} arquivo(s) processado(s)!**\n`;
+        if (skippedCount > 0) {
+            result += `\n✅ **${actualModified} arquivo(s) processado(s)!** (${skippedCount} pulado(s) por falta de conteúdo)\n`;
+        } else {
+            result += `\n✅ **${actualModified} arquivo(s) processado(s)!**\n`;
+        }
     }
 
     if (modifications.length > 0) {
@@ -5125,6 +3742,7 @@ app.post('/api/config', (req, res) => {
 
     try {
         saveConfigToFile();
+        syncOpenCodeProviderAuth();
         res.json({ success: true, message: 'Configuração salva!' });
     } catch (e) {
         res.status(500).json({ error: e.message });
@@ -5298,20 +3916,29 @@ app.get('/api/models/opencode', async (req, res) => {
 // ===== LISTAR TODOS OS MODELOS OPEncode (sem filtro free) =====
 app.get('/api/models/opencode-all', async (req, res) => {
     try {
-        const models = await listOpenCodeModels(true);
-        res.json({ success: true, models });
+        // Modelos de provedor DIRETO (usam a chave do usuário no auth.json do
+        // opencode): lista REAL obtida via `opencode models <provider>` para cada
+        // provedor configurado (google, deepseek, anthropic, openai). Isso inclui
+        // TODOS os modelos disponíveis de cada provedor, não uma lista fixa.
+        // Modelos de provedor DIRETO e do gateway opencode (Zen) são obtidos em
+        // PARALELO: cada um é um spawn do CLI (~3s de boot), e em série dobraria o
+        // tempo de espera do seletor.
+        const [directModels, opencodeModels] = await Promise.all([
+            listAllProviderModels(),
+            listOpenCodeModels(true).catch(() => [])
+        ]);
+        const all = [...directModels, ...opencodeModels];
+        all.sort((a, b) => (a.name || '').localeCompare(b.name || '', 'pt-BR'));
+        res.json({ success: true, models: all });
     } catch (e) {
+        // Fallback: se a listagem dinâmica falhar, retorna alguns modelos conhecidos.
         res.json({
             success: true,
             models: [
-                { id: 'opencode/anthropic/claude-sonnet-4-6', name: 'Claude Sonnet 4', provider: 'Anthropic', free: true },
-                { id: 'opencode/anthropic/claude-haiku-4-5', name: 'Claude Haiku 4.5', provider: 'Anthropic', free: true },
-                { id: 'opencode/deepseek/deepseek-v4-pro', name: 'DeepSeek V4 Pro', provider: 'DeepSeek', free: false },
-                { id: 'opencode/deepseek/deepseek-chat', name: 'DeepSeek Chat', provider: 'DeepSeek', free: true },
-                { id: 'opencode/openai/gpt-5.2', name: 'GPT-5.2', provider: 'OpenAI', free: false },
-                { id: 'opencode/openai/gpt-4.1', name: 'GPT-4.1', provider: 'OpenAI', free: false },
-                { id: 'opencode/gemini/gemini-3.0-flash', name: 'Gemini 3.0 Flash', provider: 'Gemini', free: true },
-                { id: 'opencode/gemini/gemini-3.0-pro', name: 'Gemini 3.0 Pro', provider: 'Gemini', free: false }
+                { id: 'google/gemini-3.5-flash', name: 'Gemini 3.5 Flash', provider: 'Google (sua chave)', free: false },
+                { id: 'deepseek/deepseek-v4-pro', name: 'DeepSeek V4 Pro', provider: 'DeepSeek (sua chave)', free: false },
+                { id: 'anthropic/claude-sonnet-4-6', name: 'Claude Sonnet 4', provider: 'Anthropic (sua chave)', free: false },
+                { id: 'openai/gpt-4o', name: 'GPT-4o', provider: 'OpenAI (sua chave)', free: false }
             ]
         });
     }
@@ -7980,14 +6607,23 @@ app.post('/api/explorer/list', (req, res) => {
 });
 
 app.post('/api/chat', async (req, res) => {
-    const { message, projectPath } = req.body;
+    const { message, projectPath, provider = 'gemini' } = req.body;
     try {
         if (projectPath) {
             setProjectRoot(projectPath);
         }
         const plan = await analyzeTask(message, null);
-        const response = await executePlan(plan, null);
-        res.json({ success: true, response });
+        // Formato B (arquivos sem conteúdo) não pode ser executado por executePlan,
+        // que pularia tudo ("sem conteúdo no plano"). Roteia para o agente, que gera
+        // o conteúdo e aplica as mudanças, retornando o resultado textual.
+        if (isFormatoB(plan)) {
+            const implTask = `Solicitação do usuário: "${message}"\n\nPlano de alterações:\n${(plan.arquivos || []).map(a => `- ${(a.acao || 'modificar').toUpperCase()} ${a.caminho}: ${a.explicacao || ''}`).join('\n')}\n\nImplemente este plano nos arquivos usando apply_patch ou write_file. NÃO responda com texto: aplique as mudanças e retorne o resultado.`;
+            const agentResult = await runAgentLoop(implTask, null, null, 'agent', [], provider);
+            res.json({ success: true, response: agentResult ? agentResult.slice(0, 500) : 'Plano aplicado' });
+        } else {
+            const response = await executePlan(plan, null);
+            res.json({ success: true, response });
+        }
     } catch (error) {
         res.status(500).json({ error: error.message });
     }
@@ -8195,6 +6831,7 @@ wss.on('connection', (ws, req) => {
     // um erro ao cliente — a UI nunca fica presa em "Enviando.../Executando".
     let taskWatchdogFired = false;
     let taskWatchdogTimer = null;
+    let taskKeepaliveTimer = null;
     const TASK_WATCHDOG_MS = 8 * 60 * 1000;
     function armTaskWatchdog() {
         taskWatchdogFired = false;
@@ -8206,9 +6843,46 @@ wss.on('connection', (ws, req) => {
                 try { streamController.abort(); } catch (e) {}
             }
         }, TASK_WATCHDOG_MS);
+        armTaskKeepalive();
     }
     function clearTaskWatchdog() {
         if (taskWatchdogTimer) { clearTimeout(taskWatchdogTimer); taskWatchdogTimer = null; }
+        clearTaskKeepalive();
+    }
+    // Keepalive de aplicação durante a tarefa: o modelo pode ficar "pensando"
+    // por minutos sem emitir chunk nem tool call (ex.: DeepSeek/opencode), período
+    // em que o backend não envia nada. Sem isso, o watchdog de silêncio do frontend
+    // (script.js:5341, 20s) conclui a tarefa como se o backend tivesse pendurado,
+    // derrubando a UI sem mensagem final. Uma mensagem leve de "progresso" renova
+    // o lastBackendActivity do frontend sem interferir no conteúdo exibido.
+    function armTaskKeepalive() {
+        clearTaskKeepalive();
+        taskKeepaliveTimer = setInterval(() => {
+            try {
+                if (ws && ws.readyState === ws.OPEN) {
+                    ws.send(JSON.stringify({ type: 'progress', message: '⏳ trabalhando...' }));
+                }
+            } catch (e) {}
+        }, 10000);
+    }
+    function clearTaskKeepalive() {
+        if (taskKeepaliveTimer) { clearInterval(taskKeepaliveTimer); taskKeepaliveTimer = null; }
+    }
+    // Modo Opções no provedor opencode: quando o opencode respondeu em texto livre
+    // (análise, relatório de bugs) sem um JSON de opções, converte essa resposta em
+    // opções clicáveis de fallback. Ao clicar, o handler 'execute' reexecuta o opencode
+    // com a instrução de implementar a opção escolhida. Sem isto, o usuário só via
+    // "📄 0 arquivo(s)" sem nenhuma opção para escolher.
+    function sendOpencodeOptionsApproval(ocFullResponse, task) {
+        const fallback = buildFallbackSugestoes(task, ocFullResponse);
+        const planId = crypto.randomBytes(8).toString('hex');
+        pendingPlan = { id: planId, plan: fallback, controller: streamController, task, provider: 'opencode' };
+        ws.send(JSON.stringify({
+            type: 'approval', planId,
+            resumo: fallback.resumo,
+            total: fallback.sugestoes.length,
+            sugestoes: fallback.sugestoes.map(s => ({ id: s.id, titulo: s.titulo, descricao: s.descricao, impacto: s.impacto || 'médio', arquivos: [] }))
+        }));
     }
 
     ws.on('message', async (message) => {
@@ -8319,12 +6993,19 @@ wss.on('connection', (ws, req) => {
                         ws.send(JSON.stringify({ type: 'done', summary: answer ? answer.slice(0, 200).trim() : 'Respondido ✅', command: task }));
                         return;
                     }
-                    // 'direct' e 'options' → execução direta do agente (estilo opencode),
-                    // sem o fluxo de opções/aprovação que travava tarefas abertas.
-                    effectiveMode = 'agent';
-                    effectiveReviewMode = false;
-                    if (onChunk) onChunk('Sistema', `📋 Modo: 🚀 Direto\n`);
-                    data.reviewMode = false;
+                    // 'direct' → execução direta do agente (estilo opencode).
+                    // 'options' → gerar opções/sugestões e deixar o usuário escolher
+                    // antes de aplicar (fluxo analyzeTask → sugestões → aprovação).
+                    if (classification.route === 'options') {
+                        effectiveMode = 'clarify';
+                        effectiveReviewMode = false;
+                        if (onChunk) onChunk('Sistema', `📋 Modo: 💡 Opções\n`);
+                    } else {
+                        effectiveMode = 'agent';
+                        effectiveReviewMode = false;
+                        if (onChunk) onChunk('Sistema', `📋 Modo: 🚀 Direto\n`);
+                        data.reviewMode = false;
+                    }
                 }
 
                 if (effectiveMode === 'agent') {
@@ -8332,12 +7013,25 @@ wss.on('connection', (ws, req) => {
                     if (onChunk) onChunk('Sistema', label + ' — executando...\n');
 
                     const projectCtx = `ESTRUTURA DO PROJETO:\n${getProjectCache()}`;
-                    const agentTaskWithCtx = `${projectCtx}${LANGUAGE_RULE}\n\nTAREFA: ${task}`;
+                    // Contexto relevante à tarefa: os arquivos mais prováveis de
+                    // conter a mudança entram com conteúdo no prompt, reduzindo a
+                    // exploração (o agente lê menos arquivos e converge mais cedo).
+                    let relevantBlock = '';
+                    try {
+                        const relevant = await getRelevantFileContents(task, provider);
+                        const entries = Object.entries(relevant || {}).slice(0, 8);
+                        if (entries.length) {
+                            relevantBlock = '\n\nARQUIVOS RELEVANTES (leia estes primeiro):\n' +
+                                entries.map(([f, c]) => `### ${f}\n${String(c).slice(0, 4000)}`).join('\n\n');
+                        }
+                    } catch (e) {}
+                    const agentTaskWithCtx = `${projectCtx}${LANGUAGE_RULE}${relevantBlock}\n\nTAREFA: ${task}`;
 
                     const agentBeforeContents = snapshotProjectContents();
                     const agentBefore = snapshotProjectFiles();
 
                     let agentResult = '';
+                    let agentChanges = [];
                     if (provider === 'opencode') {
                         await callOpenCode(agentTaskWithCtx, (agent, text) => {
                             const chunk = (text !== undefined && text !== null) ? text : (agent || '');
@@ -8350,11 +7044,29 @@ wss.on('connection', (ws, req) => {
                         }, streamController.signal, null, (toolEvent) => {
                             if (onChunk) onChunk('activity', JSON.stringify(toolEvent));
                         });
+                        agentChanges = diffSnapshots(agentBefore, snapshotProjectFiles());
                     } else {
-                        agentResult = await runAgentLoop(agentTaskWithCtx, onChunk, streamController.signal, mode, Array.isArray(history) ? history : [], provider);
+                        // Retry com mudança de estratégia: se o agente estourar o teto sem
+                        // produzir alterações, re-executamos com uma instrução mais direta e
+                        // focada (estilo opencode), até 2 vezes, antes de reportar falha.
+                        let retryCount = 0;
+                        const MAX_AGENT_RETRIES = 2;
+                        const runOnce = async () => {
+                            const result = await runAgentLoop(agentTaskWithCtx, onChunk, streamController.signal, mode, Array.isArray(history) ? history : [], provider);
+                            const changes = diffSnapshots(agentBefore, snapshotProjectFiles());
+                            const failedToConverge = /Limite de iterações atingido sem alterações/i.test(result || '');
+                            if (failedToConverge && retryCount < MAX_AGENT_RETRIES && !streamController.signal.aborted) {
+                                retryCount++;
+                                if (onChunk) onChunk('Sistema', `⚠️ Agente não convergiu na tentativa ${retryCount}. Re-executando com foco mais direto...\n`);
+                                // Tenta de novo com instrução de convergência reforçada no início da tarefa.
+                                return await runOnce();
+                            }
+                            return { result, changes };
+                        };
+                        const { result: agResult, changes: agChanges } = await runOnce();
+                        agentResult = agResult;
+                        agentChanges = agChanges;
                     }
-
-                    const agentChanges = diffSnapshots(agentBefore, snapshotProjectFiles());
 
                     if (agentChanges.length > 0) {
                         const applied = await applyAgentChanges({
@@ -8384,7 +7096,7 @@ wss.on('connection', (ws, req) => {
                 }
 
                 if (provider === 'opencode' || (model && model.startsWith('opencode/'))) {
-                    const openPrompt = buildOpenCodePrompt(task, mode, Array.isArray(history) ? history : []);
+                    const openPrompt = buildOpenCodePrompt(task, mode, Array.isArray(history) ? history : [], effectiveMode === 'clarify');
                     const beforeContents = snapshotProjectContents();
                     const before = snapshotProjectFiles();
                     let ocFullResponse = '';
@@ -8418,7 +7130,7 @@ wss.on('connection', (ws, req) => {
                         if (applied.pending) return;
                         const ocSummary = ocFullResponse.replace(/\n+/g, ' ').slice(0, 150).trim() || `opencode: ${changes.length} arquivo(s) alterado(s)`;
                         ws.send(JSON.stringify({ type: 'done', summary: ocSummary, modifiedFiles: changes.map(c => c.file), command: task }));
-                    } else if (/(opção|opções|escolha|qual|Opção \d|recomendada|implementar\?|pergunta|dúvida|qual usar|prefere)/i.test(ocFullResponse)) {
+                    } else if (effectiveMode === 'clarify' || /(opção|opções|escolha|qual|Opção \d|recomendada|implementar\?|pergunta|dúvida|qual usar|prefere)/i.test(ocFullResponse)) {
                         const parsed = extractJson(ocFullResponse);
                         if (parsed && (parsed.sugestoes || parsed.arquivos)) {
                             const plan = parsed;
@@ -8445,6 +7157,11 @@ wss.on('connection', (ws, req) => {
                                     total: textOptions.length,
                                     sugestoes: textOptions.map(s => ({ id: s.id, titulo: s.titulo, descricao: s.descricao, impacto: s.impacto || 'médio', arquivos: [] }))
                                 }));
+                            } else if (effectiveMode === 'clarify') {
+                                // Modo Opções: garante que o usuário SEMPRE receba opções
+                                // clicáveis, mesmo quando o opencode respondeu em texto
+                                // livre (análise/bugs) sem JSON de opções.
+                                sendOpencodeOptionsApproval(ocFullResponse, task);
                             } else {
                                 const ocSummary = (ocFullResponse || '').replace(/\n+/g, ' ').slice(0, 120).trim() || 'opencode respondeu';
                                 ws.send(JSON.stringify({ type: 'done', summary: ocSummary, command: task }));
@@ -8596,17 +7313,26 @@ wss.on('connection', (ws, req) => {
 
                 if (hasArquivos && !hasSugestoes) {
                     try {
-                        let filesToExecute = plan.arquivos || [];
-                        await executePlan({ resumo: plan.resumo || '', arquivos: filesToExecute }, onChunk, streamController.signal);
+                        const filesToExecute = plan.arquivos || [];
+                        // Formato B vem SEM conteúdo (o analyzeTask instrui "NUNCA
+                        // inclua conteúdo"). executePlan pularia tudo ("sem conteúdo
+                        // no plano"). Em vez disso, roteia para o agente, que gera o
+                        // conteúdo e aplica as mudanças de verdade.
+                        const planLines = filesToExecute.map(a => `- ${(a.acao || 'modificar').toUpperCase()} ${a.caminho}: ${a.explicacao || ''}`).join('\n');
+                        const implTask = `Solicitação do usuário: "${task}"\n\nPlano de alterações:\n${planLines}\n\nImplemente este plano nos arquivos usando apply_patch (edição cirúrgica) ou write_file (arquivo novo/reescrita). NÃO responda com texto: aplique as mudanças e depois valide.`;
+                        if (onChunk) onChunk('Sistema', '🔨 Executando alterações com agente...\n');
+                        const beforeSnap = snapshotProjectFiles();
+                        const agentResult = await runAgentLoop(implTask, onChunk, streamController.signal, 'agent', [], provider);
+                        const changes = diffSnapshots(beforeSnap, snapshotProjectFiles());
                         ws.send(JSON.stringify({ type: 'refresh' }));
-                        const modifiedFiles = (filesToExecute || []).filter(f => f.acao !== 'deletar').map(f => f.caminho);
+                        const modifiedFiles = changes.filter(c => c.action !== 'deletar').map(c => c.file);
                         if (modifiedFiles.length) {
                             const result = await runPostExecutionDiagnostics(modifiedFiles, plan.resumo);
                             if (result && result.rolledBack) ws.send(JSON.stringify({ type: 'rollback', message: 'Alteracoes revertidas devido a erros' }));
                         }
-                        ws.send(JSON.stringify({ type: 'done', summary: plan.resumo || 'Alterações aplicadas', modifiedFiles, command: pendingPlan.task || '' }));
+                        ws.send(JSON.stringify({ type: 'done', summary: agentResult ? agentResult.slice(0, 200) : (plan.resumo || 'Alterações aplicadas'), modifiedFiles, command: task }));
                     } catch (e) {
-                        logError('plan-execute', e.message, pendingPlan?.task || '');
+                        logError('plan-execute', e.message, task || '');
                         ws.send(JSON.stringify({ type: 'error', content: '❌ ' + (e.message || 'Erro na execução') }));
                     } finally {
                         streamController = null;
@@ -8693,6 +7419,7 @@ wss.on('connection', (ws, req) => {
                 _lastProjectSnapshot = null;
                 _lastProjectFileList = null;
                 _awaitingUserAnswer = false;
+                clearTaskKeepalive();
             }
             return;
         }
@@ -8829,8 +7556,33 @@ wss.on('connection', (ws, req) => {
                             }
                         }
                     }
-                } else {
+} else {
                     filesToExecute = data.arquivos || plan.arquivos || [];
+                    // Formato B (arquivos sem conteúdo) também não pode cair no executePlan,
+                    // que pularia tudo. Roteia para o agente, que gera o conteúdo e aplica.
+                    // Verificamos se algum arquivo vem sem conteúdo — se tiver, também
+                    // roteamos para o agente ao invés de cair no executePlan.
+                    const filesWithoutContent = filesToExecute.filter(a => a.conteudo == null || a.conteudo === '');
+                    const hasFilesWithoutContent = filesWithoutContent.length > 0;
+
+                    if (isFormatoB(plan) || hasFilesWithoutContent) {
+                        if (hasFilesWithoutContent && onChunk) {
+                            onChunk('Sistema', `⚠️ ${filesWithoutContent.length} arquivo(s) sem conteúdo no plano — roteando para agente gerar o código.\n`);
+                        }
+                        if (onChunk) onChunk('Sistema', '🔨 Executando alterações com agente...\n');
+                        const planLines = filesToExecute.map(a => `- ${(a.acao || 'modificar').toUpperCase()} ${a.caminho}: ${a.explicacao || ''}`).join('\n');
+                        const implTask = `Solicitação do usuário: "${task}"\n\nPlano de alterações:\n${planLines}\n\nImplemente este plano nos arquivos usando apply_patch ou write_file. NÃO responda com texto: aplique as mudanças e retorne o resultado.`;
+                        const beforeSnap = snapshotProjectFiles();
+                        const agentResult = await runAgentLoop(implTask, onChunk, controller.signal, 'agent', [], provider);
+                        const changes = diffSnapshots(beforeSnap, snapshotProjectFiles());
+                        const modifiedFiles = changes.filter(c => c.action !== 'deletar').map(c => c.file);
+                        if (modifiedFiles.length) {
+                            const result = await runPostExecutionDiagnostics(modifiedFiles, plan.resumo);
+                            if (result && result.rolledBack) ws.send(JSON.stringify({ type: 'rollback', message: 'Alteracoes revertidas devido a erros' }));
+                        }
+                        ws.send(JSON.stringify({ type: 'done', summary: agentResult ? agentResult.slice(0, 200) : (plan.resumo || 'Alterações aplicadas'), modifiedFiles, command: task }));
+                        return;
+                    }
                     if (data.nota && onChunk) onChunk('Sistema', `📝 Nota: ${data.nota}\n`);
                 }
                 await executePlan({ resumo: plan.resumo || '', arquivos: filesToExecute }, onChunk, controller.signal);
@@ -8878,7 +7630,7 @@ module.exports = { app, server, resolveSafePath, extractJson, setProjectRoot, wr
 readFileContent, listBackups, analyzeTask, executePlan, executeAgentTool, parseJsonC, buildOpenCodePrompt, 
 snapshotProjectFiles, diffSnapshots, computeDiff, parseRemoteUrl, nextVersion, detectRepo, latestVersionTag, runner, formatCode, 
 pushUndoState, undoStack, redoStack, trackTokens, calcCost, getModelPrice, getUsageReport, tokenUsage, listDirectory, 
-getAllFiles };
+getAllFiles, logError, getProviderErrorHint, backupRelativePath, backupFromContent, backupFileBeforeChange, validateAgentCommand, safeValidate: analyzer.safeValidate };
 
 // =============================================
 let mcpConfigs = [];
@@ -8911,6 +7663,92 @@ async function initMcp() {
 
 function getMcpTools() { return mcpManager.getAllTools(); }
 async function executeMcpTool(name, args) { return await mcpManager.executeTool(name, args); }
+
+// =============================================
+//  INJEÇÃO DO CONTEXTO DE FERRAMENTAS
+//  Quebra o acoplamento circular: executeAgentTool vive em ai/tools.js, mas
+//  precisa de funções/estado definidos aqui. Os getters refletem o valor atual
+//  no momento de cada chamada (PROJECT_ROOT pode mudar via setProjectRoot).
+// =============================================
+setToolContext({
+    resolveSafePath,
+    get projectRoot() { return PROJECT_ROOT; },
+    runQuickTest,
+    listDirectory,
+    getAllFiles,
+    validateAgentCommand,
+    get agentStreamCallback() { return agentStreamCallback; },
+    registerChildProcess,
+    killChildTree,
+    getTestFilePath,
+    buildTestPrompt,
+    callAI,
+    runGit,
+    nextVersion,
+    latestVersionTag,
+    BACKUP_DIR_NAME,
+    copyDirContents,
+    restoreSnapshot,
+    undoLastChange,
+    redoLastChange,
+    backupFromContent,
+    invalidateProjectCache,
+    runAgentLoop,
+    requestUserInteraction,
+    mcpManager,
+    get currentAgentProvider() { return _currentAgentProvider; },
+    get currentAgentSignal() { return _currentAgentSignal; },
+    get agentTodos() { return _agentTodos; },
+    set agentTodos(v) { _agentTodos = v; },
+    get awaitingUserAnswer() { return _awaitingUserAnswer; },
+    set awaitingUserAnswer(v) { _awaitingUserAnswer = v; }
+});
+
+// Injeção do contexto dos adaptadores de provedor (Gemini/OpenAI/DeepSeek/Claude).
+setProvidersContext({
+    get config() { return config; },
+    get currentTaskModel() { return _currentTaskModel; },
+    get currentAgentProvider() { return _currentAgentProvider; },
+    set currentAgentProvider(v) { _currentAgentProvider = v; },
+    get pendingImages() { return _pendingImages; },
+    toolResultMax,
+    safeJsonStringify,
+    getProviderErrorHint,
+    logError,
+    trackTokens,
+    fetchWithTimeout,
+    retryWithBackoff,
+    getImagePartsForOpenAI,
+    getImagePartsForClaude,
+    clearPendingImages,
+    isFallbackEligibleError
+});
+
+// Injeção do contexto do loop do agente.
+setLoopContext({
+    getFileTree,
+    getQualityRules,
+    getMemoryContext,
+    get projectRoot() { return PROJECT_ROOT; },
+    get pendingImages() { return _pendingImages; },
+    get currentTaskComplexity() { return _currentTaskComplexity; },
+    snapshotProjectFiles,
+    checkToolPermission,
+    buildToolLabel,
+    getToolIcon,
+    truncateToolResult,
+    hasRealWriteErrors,
+    diffSnapshots,
+    maybeCompactMessages,
+    validateChangedFiles,
+    mcpManager,
+    get currentAgentProvider() { return _currentAgentProvider; },
+    set currentAgentProvider(v) { _currentAgentProvider = v; },
+    get currentAgentSignal() { return _currentAgentSignal; },
+    set currentAgentSignal(v) { _currentAgentSignal = v; },
+    get agentTodos() { return _agentTodos; },
+    set agentTodos(v) { _agentTodos = v; }
+});
 
 // =============================================
 //  INICIAR SERVIDOR (APENAS SE EXECUTADO DIRETO)

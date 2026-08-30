@@ -56,6 +56,10 @@
       {
         "from": "build/icon.ico",
         "to": "build/icon.ico"
+      },
+      {
+        "from": "node_modules/opencode-ai/bin/opencode.exe",
+        "to": "opencode/bin/opencode.exe"
       }
     ],
     "asar": true,
@@ -116,6 +120,7 @@
     "marked": "^18.0.9",
     "merge-descriptors": "^2.0.0",
     "monaco-editor": "^0.56.0",
+    "opencode-ai": "^1.18.23",
     "puppeteer-core": "^25.5.0",
     "ws": "^8.21.1"
   }

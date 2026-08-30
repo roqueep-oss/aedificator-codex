@@ -16,6 +16,7 @@ let wsReconnectDelay = 1000;
 // segundo plano. Isso garante que o chat nunca fique preso em "Enviando...".
 let taskConcluded = false;
 let concludedTaskFiles = [];
+let reportCardShown = false;
 let concludeTimer = null;
 let maxTaskTimer = null;
 let noProgressTimer = null;
@@ -39,6 +40,7 @@ let agentStatusFinalized = false;
 let chatSaveTimer = null;
 let pickerCurrentPath = '';
 let pickerRoots = [];
+let pickerMode = 'select';
 let pendingApproval = null;
 let autoExecTimer = null;
 let autoExecCountdown = null;
@@ -647,10 +649,30 @@ document.addEventListener('DOMContentLoaded', () => {
     });
 
     modelSelect.addEventListener('change', function(e) {
-        currentModel = e.target.value;
+        // Opção de modelo personalizado: pede o id ao usuário para usar qualquer
+        // modelo que sua chave acessa, mesmo que não esteja no catálogo listado.
+        if (e.target.value === '__custom_model__') {
+            var customId = prompt('Digite o id do modelo com o prefixo do provedor (ex.: google/gemini-3.0-pro, deepseek/deepseek-chat, anthropic/claude-opus-5, openai/gpt-4o):', '');
+            if (customId && customId.trim()) {
+                customId = customId.trim();
+                // Adiciona a opção escolhida ao seletor e a seleciona.
+                var opt = new Option('✏️ ' + customId, customId);
+                e.target.insertBefore(opt, e.target.options[e.target.options.length - 1]);
+                e.target.value = customId;
+                currentModel = customId;
+            } else {
+                // Cancela: volta ao primeiro modelo disponível.
+                if (e.target.options.length > 1) e.target.selectedIndex = 0;
+                currentModel = e.target.value;
+            }
+        } else {
+            currentModel = e.target.value;
+        }
         updateProviderIndicator(providerSelect.value);
         refreshUsage();
-        showToast('Modelo: ' + e.target.options[e.target.selectedIndex].text);
+        if (e.target.value !== '__custom_model__') {
+            showToast('Modelo: ' + e.target.options[e.target.selectedIndex].text);
+        }
     });
 
     // Inicializa com DeepSeek (padrão)
@@ -703,6 +725,9 @@ document.addEventListener('DOMContentLoaded', () => {
     });
     document.getElementById('pickerSelectBtn').addEventListener('click', pickerSelect);
     document.getElementById('pickerCancelBtn').addEventListener('click', closeFolderPicker);
+
+    safeOn('newProjectBrowseBtn', 'click', browseNewProjectParent);
+    safeOn('newProjectCreateBtn', 'click', createNewProjectFromModal);
 
     document.getElementById('recentSelect').addEventListener('change', (e) => {
         if (e.target.value) {
@@ -1227,15 +1252,15 @@ function handleWsMessage(data) {
         // logo (pós-execução de testes/commit demorada ou pendurada), concluímos
         // mesmo assim para liberar o chat. As mensagens de teste/rollback continuam
         // chegando normalmente depois.
-        // Nota: não depende de isStreaming — o estado pode ficar inconsistente
-        // entre sessões do multi-agente; file-status por si só já significa que o
-        // agente terminou de modificar os arquivos.
+        // Nota: o timeout é generoso (60s) para NÃO marcar "Concluído" enquanto
+        // testes/diagnósticos de pós-execução ainda rodam — só conclui sozinho
+        // quando o backend realmente parou de responder por muito tempo.
         if (!taskConcluded) {
             if (concludeTimer) clearTimeout(concludeTimer);
             concludeTimer = setTimeout(function() {
                 concludeTimer = null;
                 if (!taskConcluded) forceConcludeTask();
-            }, 20000);
+            }, 60000);
         }
         return;
     }
@@ -1526,13 +1551,14 @@ function handleWsMessage(data) {
     if (data.type === 'done') {
         if (concludeTimer) { clearTimeout(concludeTimer); concludeTimer = null; }
         // endTask SEMPRE roda: concluir o chat/atividade nunca pode ser pulado.
-        // O card só é renderizado uma vez (se já houve auto-conclusão, evita duplicado).
-        if (!taskConcluded) {
-            taskConcluded = true;
+        // O card é renderizado uma única vez — mesmo que um forceConcludeTask
+        // (watchdog) já tenha marcado taskConcluded, o 'done' real traz a
+        // contagem correta de arquivos e deve prevalecer.
+        if (!reportCardShown) {
+            reportCardShown = true;
             try { showReportCard(data); } catch (e) { console.error('showReportCard error:', e); }
-        } else {
-            taskConcluded = true;
         }
+        taskConcluded = true;
         endTask('✅ Tarefa concluída!');
         try { updateUndoRedoButtons(); } catch (e) { console.error('updateUndoRedoButtons error:', e); }
         attachedFiles = [];
@@ -1578,8 +1604,14 @@ function forceConcludeTask() {
     var resumo = concludedTaskFiles.length
         ? concludedTaskFiles.length + ' arquivo(s) alterado(s)'
         : 'Alterações aplicadas';
-    var data = { type: 'done', summary: resumo, modifiedFiles: concludedTaskFiles.slice() };
-    try { showReportCard(data); } catch (e) {}
+    // Só renderiza o card se JÁ há arquivos rastreados. Sem arquivos, exibir
+    // "0 arquivo(s)" confundiria o usuário (o 'done' real pode ainda estar a
+    // caminho com a contagem correta) — nesse caso apenas encerra com toast.
+    if (concludedTaskFiles.length > 0 && !reportCardShown) {
+        reportCardShown = true;
+        var data = { type: 'done', summary: resumo, modifiedFiles: concludedTaskFiles.slice() };
+        try { showReportCard(data); } catch (e) {}
+    }
     endTask('✅ ' + resumo);
     // Garantia extra: libera o botão/cancelamento mesmo que o endTask falhe
     // por estado inconsistente (multi-agente).
@@ -1781,8 +1813,58 @@ function newProject() {
     xhr.send(JSON.stringify({ path: caminhoCompleto }));
 }
 
-async function createNewProject() { selectFolder(); }
-function browseNewProjectParent() { selectFolder(); }
+async function createNewProject() { openNewProjectModal(); }
+
+function openNewProjectModal() {
+    const modal = document.getElementById('newProjectModal');
+    if (!modal) return;
+    const nameInput = document.getElementById('newProjectName');
+    const parentInput = document.getElementById('newProjectParent');
+    if (nameInput) nameInput.value = '';
+    if (parentInput) parentInput.value = currentProjectPath || '';
+    modal.style.display = 'flex';
+    if (nameInput) nameInput.focus();
+}
+
+function browseNewProjectParent() {
+    const modal = document.getElementById('newProjectModal');
+    if (modal) modal.style.display = 'none';
+    pickerMode = 'newProjectParent';
+    openFolderPicker();
+}
+
+async function createNewProjectFromModal() {
+    const nameInput = document.getElementById('newProjectName');
+    const parentInput = document.getElementById('newProjectParent');
+    const nome = (nameInput && nameInput.value ? nameInput.value : '').trim();
+    const pasta = (parentInput && parentInput.value ? parentInput.value : '').trim();
+
+    if (!nome) { showToast('❌ Informe o nome do projeto'); return; }
+    if (!pasta) { showToast('❌ Informe a pasta onde criar'); return; }
+
+    const pastaNormalizada = pasta.replace(/\\/g, '/').replace(/\/+$/, '');
+    const caminhoCompleto = pastaNormalizada + '/' + nome;
+
+    showToast('⏳ Criando projeto...');
+
+    try {
+        const res = await apiFetch('/api/project/create', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ path: caminhoCompleto })
+        });
+        const data = await res.json();
+        if (data.success) {
+            document.getElementById('newProjectModal').style.display = 'none';
+            showToast('✅ Projeto criado: ' + nome);
+            await applySelectedFolder(data.path);
+        } else {
+            showToast('❌ ' + (data.error || 'Erro ao criar'));
+        }
+    } catch (e) {
+        showToast('❌ Erro de conexão com o backend');
+    }
+}
 
 // =============================================
 //  EXPLORADOR DE PASTAS (SELEÇÃO DA RAIZ)
@@ -1900,11 +1982,24 @@ function pickerGoUp() {
 function pickerSelect() {
     if (!pickerCurrentPath) return;
     closeFolderPicker();
+    if (pickerMode === 'newProjectParent') {
+        pickerMode = 'select';
+        const parentInput = document.getElementById('newProjectParent');
+        if (parentInput) parentInput.value = pickerCurrentPath;
+        const modal = document.getElementById('newProjectModal');
+        if (modal) modal.style.display = 'flex';
+        return;
+    }
     applySelectedFolder(pickerCurrentPath);
 }
 
 function closeFolderPicker() {
     document.getElementById('folderPickerModal').style.display = 'none';
+    if (pickerMode === 'newProjectParent') {
+        pickerMode = 'select';
+        const modal = document.getElementById('newProjectModal');
+        if (modal) modal.style.display = 'flex';
+    }
 }
 
 // =============================================
@@ -4979,6 +5074,7 @@ function sendMessage() {
     closeApprovalModal();
     taskConcluded = false;
     concludedTaskFiles = [];
+    reportCardShown = false;
     window._lastDiagnosticsErrors = [];
     if (concludeTimer) { clearTimeout(concludeTimer); concludeTimer = null; }
     if (noProgressTimer) { clearTimeout(noProgressTimer); noProgressTimer = null; }
@@ -5282,6 +5378,10 @@ function upsertActivity(id, patch) {
         item = { id, kind: 'processo', icon: '⚙️', label: '', file: '', status: 'running', start: Date.now(), startTs: Date.now(), end: null, error: '' };
         activityItems.push(item);
     }
+    // Ao voltar para 'running' (ex.: arquivo reeditado, novo teste), limpa o
+    // 'end' anterior. Sem isso, um item recém-concluído que é reutilizado
+    // apareceria como "Concluído" mesmo ainda estando em execução.
+    if (patch.status === 'running' && patch.end === undefined) patch.end = null;
     Object.assign(item, patch);
     renderActivity();
     return item;
@@ -5460,7 +5560,6 @@ function buildActivityItemEl(item) {
     const div = document.createElement('div');
     div.className = `act-item ${item.status}`;
     let statusText = item.status === 'running' ? 'Executando' : item.status === 'success' ? 'Concluído' : item.status === 'error' ? 'Erro' : item.status === 'cancelled' ? 'Cancelado' : '—';
-    if (item.status === 'running' && item.end) statusText = 'Concluído';
     let html = `
         <div class="act-top">
             <span class="act-icon">${item.icon}</span>
@@ -6412,8 +6511,8 @@ var PROVIDER_MODELS = {
         { value: 'gemini-2-flash-lite', label: 'Gemini 2 Flash Lite' }
     ],
     deepseek: [
-        { value: 'deepseek-v4-flash', label: 'DeepSeek V4 Flash' },
         { value: 'deepseek-v4-pro', label: 'DeepSeek V4 Pro' },
+        { value: 'deepseek-v4-flash', label: 'DeepSeek V4 Flash' },
         { value: 'deepseek-coder', label: 'DeepSeek Coder' },
         { value: 'deepseek-chat', label: 'DeepSeek Chat' },
         { value: 'deepseek-reasoner', label: 'DeepSeek Reasoner' }
@@ -6466,6 +6565,11 @@ function updateModelOptions(provider) {
         for (var k = 0; k < models.length; k++) {
             select.appendChild(new Option(models[k].label, models[k].value));
         }
+    }
+    // No provedor opencode, oferece uma opção para digitar QUALQUER id de modelo
+    // (a chave do usuário pode acessar modelos que não estão no catálogo listado).
+    if (provider === 'opencode') {
+        select.appendChild(new Option('✏️ Outro modelo (digitar id)...', '__custom_model__'));
     }
     // Força seleção do primeiro modelo
     if (select.options.length) select.selectedIndex = 0;
@@ -7504,6 +7608,7 @@ const MENU_ITEMS = {
         { label: 'Debug Go', action: 'debugGo', shortcut: '', desc: 'Depurar .go com dlv' },
         { separator: true },
         { label: 'Docker', action: 'openDockerModal', shortcut: '', desc: 'Gerenciar containers: build, run, stop, logs' },
+        { label: 'SSH Remoto', action: 'openSSH', shortcut: 'Ctrl+Shift+R', desc: 'Conectar e executar comandos em servidor remoto' },
     ],
     config: [
         { label: 'Chaves API', action: 'openConfigModal', shortcut: 'Ctrl+,', desc: 'Google, DeepSeek, OpenAI, Anthropic, opencode + editor' },
@@ -7512,10 +7617,15 @@ const MENU_ITEMS = {
         { label: 'Exportar Configs', action: 'exportSettings', shortcut: '', desc: 'Salvar como .aedificator-settings.json' },
         { label: 'Importar Configs', action: 'importSettings', shortcut: '', desc: 'Restaurar do .aedificator-settings.json' },
         { label: 'Atalhos Customizados', action: 'openKeybindingsModal', shortcut: '', desc: 'Editar .aedificator-keybindings.json' },
+        { separator: true },
+        { label: 'Preços e Cotação', action: 'openPricingModal', shortcut: '', desc: 'Custo por token de cada modelo e cotação USD/BRL' },
     ],
     utils: [
         { label: 'Snapshots', action: 'openSnapshotModal', shortcut: '', desc: 'Criar e restaurar snapshots do projeto' },
         { label: 'Backup / Restaurar', action: 'openBackupModal', shortcut: '', desc: 'Backups automáticos com 10 versões' },
+        { separator: true },
+        { label: 'Dashboard de Custos IA', action: 'openCostDashboard', shortcut: '', desc: 'Gastos e tokens por provedor' },
+        { label: 'Logs de Erro', action: 'openLogsModal', shortcut: '', desc: 'Ver erros e avisos do backend' },
     ],
     help: [
         { label: 'Manual de Funções', action: 'openHelpModal', shortcut: 'F1', desc: 'Abrir este manual' },
@@ -7635,6 +7745,10 @@ function executeMenuAction(action) {
         case 'debugPython': debugPythonStart(); break;
         case 'debugGo': debugGoStart(); break;
         case 'openDockerModal': openDockerModal(); break;
+        case 'openSSH': switchActivityBar('ssh'); break;
+        case 'openCostDashboard': openCostDashboard(); break;
+        case 'openLogsModal': openLogsModal(); break;
+        case 'openPricingModal': openPricingModal(); break;
         case 'toggleGitOnly': toggleGitOnly(); break;
         case 'exportSettings': exportSettingsToFile(); break;
         case 'importSettings': importSettingsFromFile(); break;
@@ -7716,6 +7830,12 @@ function openHelpModal() {
             <h3 style="color:#58a6ff;">🔧 Menu Ferramentas</h3>
             ${menuToHtml('tools')}
 
+            <h3 style="color:#58a6ff;">⚙️ Menu Configurações</h3>
+            ${menuToHtml('config')}
+
+            <h3 style="color:#58a6ff;">📦 Menu Utilitários</h3>
+            ${menuToHtml('utils')}
+
             <h3 style="color:#58a6ff;">🖱️ Explorador de Arquivos</h3>
             <table style="width:100%;border-collapse:collapse;margin-bottom:12px;">
             <tr><td style="padding:2px 8px;color:#79c0ff;">Clique</td><td>Abrir arquivo no editor</td></tr>
@@ -7734,8 +7854,11 @@ function openHelpModal() {
             <h3 style="color:#58a6ff;">🤖 Chat de IA</h3>
             <table style="width:100%;border-collapse:collapse;margin-bottom:12px;">
             <tr><td style="padding:2px 8px;color:#79c0ff;">/run comando</td><td>Executar comando no terminal</td></tr>
-            <tr><td style="padding:2px 8px;color:#79c0ff;">Seletor de modelo</td><td>Gemini / DeepSeek / opencode</td></tr>
-            <tr><td style="padding:2px 8px;color:#79c0ff;">Seletor de modo</td><td>Equipe / Esclarecer / Código / Arquitetura</td></tr>
+            <tr><td style="padding:2px 8px;color:#79c0ff;">Seletor de modelo</td><td>Gemini / DeepSeek / OpenAI / Claude / opencode</td></tr>
+            <tr><td style="padding:2px 8px;color:#79c0ff;">Seletor de modo</td><td>Agente / Equipe / Esclarecer / Código / Arquitetura</td></tr>
+            <tr><td style="padding:2px 8px;color:#79c0ff;">Modo Smart / Auto</td><td>Classifica o pedido e escolhe automaticamente: opções (💡), execução direta ou resposta</td></tr>
+            <tr><td style="padding:2px 8px;color:#79c0ff;">Modo 💡 Opções</td><td>Analisa o código e apresenta opções para você escolher antes de executar</td></tr>
+            <tr><td style="padding:2px 8px;color:#79c0ff;">/model &lt;provedor&gt; &lt;modelo&gt;</td><td>Trocar provider/modelo pelo chat</td></tr>
             </table>
 
         </div>
