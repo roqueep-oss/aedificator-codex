@@ -2,6 +2,9 @@
 //  AEDIFICATOR CODEX - COM EXPLORADOR NATIVO
 //  VERSÃO COMPLETA COM TODAS AS MELHORIAS
 // =============================================
+// Funções chamadas por handlers DOM (index.html e onclick dinâmico) —
+// mantidas como globais de script clássico.
+/* exported copyMsgContent, refreshAiPrices, newProject, shareChat, reloadActiveTab, switchCenterTab, clearTaskLog, applyInlineDiff, rejectInlineDiff, openFileAtLine, browserStartDrag, compareSelectedFiles, applyReplaceInSearch, runFindReplacePreview, applyFindReplacePreview, newTerminalSession, bottomTerminalSend, runSidebarSearch, sidebarGitCommit, sidebarGitPush, sidebarGitPull, sidebarGitDiff, sidebarDockerCmd, sidebarSshConnect, sidebarSshDisconnect, sidebarSshExec, dockerQuick, saveKeybindings, fixErrorsWithAI */
 
 let BACKEND_URL = 'http://localhost:3001';
 let WS_URL = 'ws://localhost:3001';
@@ -43,7 +46,6 @@ let pickerRoots = [];
 let pickerMode = 'select';
 let pendingApproval = null;
 let autoExecTimer = null;
-let autoExecCountdown = null;
 let isRunning = false;
 let runController = null;
 let runStreamed = false;
@@ -51,7 +53,6 @@ let searchTimer = null;
 let editorTabs = [];        // { path, content, loaded, dirty, isImage, imageUrl }
 let activeTabPath = null;
 let activityItems = [];     // { id, kind, icon, label, file, status, start, end, error, startTs }
-let activitySeq = 0;
 let actTaskId = null;
 let repoInfo = null;
 let lastBackendActivity = Date.now();
@@ -68,7 +69,7 @@ let splitActive = false;
 let debugActive = false;
 let debugBreakpoints = [];
 let debugDecorations = [];
-let debugPausedLine = null;
+let _debugPausedLine = null;
 
 const LANG_MAP = {
     'js':'javascript','mjs':'javascript','cjs':'javascript',
@@ -107,7 +108,6 @@ function showMonaco() {
 const CHAT_HISTORY_KEY = 'aedificator_chat_history';
 const RECENT_PROJECTS_KEY = 'aedificator_recent_projects';
 const THEME_KEY = 'aedificator_theme';
-const OPENCODE_KEY = 'aedificator_use_opencode';
 const TASK_LOG_KEY = 'aedificator_task_log';
 
 // =============================================
@@ -496,7 +496,6 @@ function showInlineEditPrompt(editor) {
 function showAIQuickFix(editor, markers) {
     const code = editor.getValue();
     const errorText = markers.map(function(m) { return 'Ln ' + m.startLineNumber + ': ' + m.message; }).join('\n');
-    const sel = editor.getSelection();
 
     const overlay = document.createElement('div');
     overlay.style.cssText = 'position:fixed;top:0;left:0;width:100%;height:100%;background:rgba(0,0,0,0.2);display:flex;align-items:flex-start;justify-content:center;z-index:6000;';
@@ -1418,7 +1417,7 @@ function handleWsMessage(data) {
 
     if (data.type === 'debug-ended') {
         debugActive = false;
-        debugPausedLine = null;
+        _debugPausedLine = null;
         clearDebugDecorations();
         updateDebugUI();
         showToast('⏹️ Debug encerrado');
@@ -1426,7 +1425,7 @@ function handleWsMessage(data) {
     }
 
     if (data.type === 'debug-paused') {
-        debugPausedLine = data.line;
+        _debugPausedLine = data.line;
         const filename = data.filename || '';
         if (filename && activeTabPath && activeTabPath.replace(/\\/g,'/') !== filename.replace(/\\/g,'/') && !filename.startsWith('file://')) {
             openFile(filename);
@@ -2941,22 +2940,6 @@ function runTerminalCommand(command) {
     })();
 }
 
-function addCommandOutput(text) {
-    const container = document.getElementById('messages');
-    const div = document.createElement('div');
-    div.className = 'message agent';
-    div.innerHTML = `
-        <div class="msg-header">
-            <span class="agent-badge">🖥️ Terminal</span>
-        </div>
-        <div class="cmd-output">${escapeHtml(text)}</div>
-    `;
-    container.appendChild(div);
-    container.scrollTop = container.scrollHeight;
-    scheduleSaveChatHistory();
-    return div.querySelector('.cmd-output');
-}
-
 // =============================================
 //  LIMPAR / EXPORTAR / SHARE / UNDO / REDO CHAT
 // =============================================
@@ -4094,17 +4077,6 @@ function initMonacoSplit() {
     });
 }
 
-function openFileRight(filePath) {
-    if (!splitActive) {
-        openFile(filePath);
-        return;
-    }
-    const existing = editorTabsRight.find(t => t.path === filePath);
-    if (existing) { activateTabRight(filePath); return; }
-    editorTabsRight.push({ path: filePath, content: '', loaded: false, dirty: false });
-    activateTabRight(filePath);
-}
-
 async function loadTabRight(filePath) {
     const tab = editorTabsRight.find(t => t.path === filePath);
     if (!tab || tab.loaded) return;
@@ -4461,7 +4433,7 @@ function clearDebugDecorations() {
         monacoEditor.deltaDecorations(debugDecorations, []);
         debugDecorations = [];
     }
-    debugPausedLine = null;
+    _debugPausedLine = null;
 }
 
 function highlightDebugLine(line) {
@@ -4663,7 +4635,6 @@ function showApprovalModal(data) {
     list.innerHTML = '';
 
     if (hasSugestoes) {
-        const agentName = 'Assistente - Escolha uma opção';
         const container = document.getElementById('messages');
         const div = document.createElement('div');
         div.className = 'message agent';
@@ -4927,24 +4898,6 @@ function disposeAllApprovalDiffs() {
         try { entry.diffEditor.dispose(); } catch (e) {}
     }
     fileDiffEditors = [];
-}
-
-function startAutoExecCountdown() {
-    stopAutoExecCountdown();
-    const el = document.getElementById('approvalAutoMsg');
-    el.style.display = 'block';
-    autoExecCountdown = 5;
-    el.textContent = `⚡ Executando automaticamente em ${autoExecCountdown}s...`;
-    autoExecTimer = setInterval(() => {
-        autoExecCountdown--;
-        if (autoExecCountdown <= 0) {
-            stopAutoExecCountdown();
-            el.style.display = 'none';
-            executePendingPlan();
-        } else {
-            el.textContent = `⚡ Executando automaticamente em ${autoExecCountdown}s...`;
-        }
-    }, 1000);
 }
 
 function stopAutoExecCountdown() {
@@ -5351,11 +5304,11 @@ setInterval(function() {
             forceConcludeTask();
         }
     } else if (taskDone || backendSilent) {
-        var hadStuck = false;
+        var _hadStuck = false;
         for (const item of activityItems) {
             if (item.status === 'running' && !item.end) {
                 setActivityStatus(item.id, 'success');
-                hadStuck = true;
+                _hadStuck = true;
             }
         }
         // A tarefa terminou (ou o backend está mudo): mesmo sem item preso, a
@@ -5487,7 +5440,7 @@ function clearPipeline() {
 
 let terminalLines = [];
 let terminalBlockStart = 0;
-let terminalToolStarts = {};
+let _terminalToolStarts = {};
 
 function terminalAdd(type, text, meta) {
     if (!meta) meta = {};
@@ -5552,7 +5505,7 @@ function renderTerminal() {
 function clearTerminal() {
     terminalLines = [];
     terminalBlockStart = 0;
-    terminalToolStarts = {};
+    _terminalToolStarts = {};
     renderTerminal();
 }
 
@@ -6575,46 +6528,6 @@ function updateModelOptions(provider) {
     if (select.options.length) select.selectedIndex = 0;
 }
 
-function initOpenCodeToggle() {
-    const toggle = document.getElementById('ocToggle');
-    let enabled = true;
-    try { enabled = localStorage.getItem(OPENCODE_KEY) !== '0'; } catch (e) {}
-    toggle.checked = enabled;
-    applyOpenCodeToggle(enabled);
-
-    toggle.addEventListener('change', () => {
-        const checked = toggle.checked;
-        try { localStorage.setItem(OPENCODE_KEY, checked ? '1' : '0'); } catch (e) {}
-        applyOpenCodeToggle(checked);
-        showToast(checked ? '🟣 opencode ativado' : '🟣 opencode desativado');
-    });
-}
-
-function applyOpenCodeToggle(enabled) {
-    var wrap = document.getElementById('ocToggleWrap');
-    var select = document.getElementById('modelSelect');
-    if (wrap) wrap.classList.toggle('off', !enabled);
-
-    var ocOpts = select.querySelectorAll('option[value^="opencode/"]');
-    for (var i = 0; i < ocOpts.length; i++) {
-        ocOpts[i].disabled = !enabled;
-    }
-    var ocGroups = select.querySelectorAll('#ocFreeGroup, #ocGoGroup');
-    for (var j = 0; j < ocGroups.length; j++) {
-        ocGroups[j].disabled = !enabled;
-        ocGroups[j].style.opacity = enabled ? '1' : '0.5';
-    }
-
-    // Keep the static "opencode" option always enabled as fallback
-    var staticOc = select.querySelector('option[value="opencode"]:not([value="opencode/"])');
-    if (staticOc) staticOc.disabled = false;
-
-    if (!enabled && select.value.startsWith('opencode/')) {
-        select.value = 'opencode';
-        currentModel = 'opencode';
-    }
-}
-
 // =============================================
 //  TEMA CLARO/ESCURO
 // =============================================
@@ -6650,7 +6563,6 @@ function applyTheme(theme) {
 }
 
 function toggleTheme() {
-    var isLight = document.body.classList.contains('theme-light');
     var currentTheme = 'dark';
     try { currentTheme = localStorage.getItem(THEME_KEY) || 'auto'; } catch (e) {}
     var resolved = resolveTheme(currentTheme);
@@ -6806,10 +6718,6 @@ function linkifyFilePaths(html) {
             : 'onclick="openReferencedFile(\'' + escapeHtml(path) + '\')"';
         return '<span class="chat-file-link" ' + onClick + ' title="Abrir ' + escapeHtml(path) + '">' + match + '</span>';
     });
-}
-
-function highlightCode(code, lang) {
-    return escapeHtml(code);
 }
 
 function colorizeCodeBlocks(container) {
@@ -7996,7 +7904,6 @@ async function provideAIInlineCompletions(model, position, context, token) {
     const provider = document.getElementById('providerSelect')?.value || 'gemini';
     if (provider === 'opencode') return { items: [] };
 
-    const word = model.getWordUntilPosition(position);
     const prefix = model.getValueInRange({
         startLineNumber: 1, startColumn: 1,
         endLineNumber: position.lineNumber, endColumn: position.column
@@ -8353,71 +8260,6 @@ async function aedApplyGutterDecorations() {
 }
 
 // =============================================
-//  GIT BLAME CODELENS
-// =============================================
-let _aedBlameCache = null;
-let _aedBlameCacheTs = 0;
-let _aedBlameFile = null;
-
-async function provideGitBlameCodeLenses(model) {
-    if (!currentProjectPath || !activeTabPath) return { lenses: [], dispose: () => {} };
-    try {
-        const now = Date.now();
-        if (_aedBlameFile !== activeTabPath || !_aedBlameCache || now - _aedBlameCacheTs > 15000) {
-            const res = await apiFetch('/api/git/blame', {
-                method: 'POST', headers: { 'Content-Type': 'application/json' },
-                body: JSON.stringify({ file: activeTabPath })
-            });
-            const data = await res.json();
-            if (data.success && data.lines && data.lines.length) {
-                _aedBlameCache = data.lines;
-                _aedBlameCacheTs = now;
-                _aedBlameFile = activeTabPath;
-            } else {
-                return { lenses: [], dispose: () => {} };
-            }
-        }
-        if (!_aedBlameCache || !_aedBlameCache.length) return { lenses: [], dispose: () => {} };
-        const lenses = [];
-        let lastBlame = null;
-        let blockStart = 1;
-        for (const b of _aedBlameCache) {
-            if (lastBlame && b.author === lastBlame.author && b.date === lastBlame.date) continue;
-            if (lastBlame && b.line > 1) {
-                lenses.push({
-                    range: { startLineNumber: blockStart, startColumn: 1, endLineNumber: lastBlame.line, endColumn: 1 },
-                    id: 'blame_' + blockStart
-                });
-            }
-            lastBlame = b;
-            blockStart = b.line;
-        }
-        if (lastBlame) {
-            lenses.push({
-                range: { startLineNumber: blockStart, startColumn: 1, endLineNumber: _aedBlameCache[_aedBlameCache.length - 1].line, endColumn: 1 },
-                id: 'blame_' + blockStart
-            });
-        }
-        return { lenses, dispose: () => {} };
-    } catch (e) {
-        return { lenses: [], dispose: () => {} };
-    }
-}
-
-function resolveGitBlameCodeLens(codeLens) {
-    if (!_aedBlameCache) return codeLens;
-    const firstLine = codeLens.range.startLineNumber;
-    const blame = _aedBlameCache.find(b => b.line === firstLine);
-    if (blame && blame.author) {
-        codeLens.command = {
-            id: 'noop',
-            title: `${blame.author} · ${blame.date} · ${blame.hash.substring(0, 7)}` + (blame.content ? ' · ' + blame.content.substring(0, 40) : '')
-        };
-    }
-    return codeLens;
-}
-
-// =============================================
 //  TERMINAL COM MÚLTIPLAS SESSÕES
 // =============================================
 let terminalSessions = [{ id: 'default', name: 'bash', output: '' }];
@@ -8452,45 +8294,9 @@ function newTerminalSession() {
     }
 }
 
-function closeTerminalSession(sessionId) {
-    if (terminalSessions.length <= 1) return;
-    terminalSessions = terminalSessions.filter(s => s.id !== sessionId);
-    const tabEl = document.querySelector(`.terminal-tab[data-session-id="${sessionId}"]`);
-    if (tabEl) tabEl.remove();
-    if (activeTerminalSessionId === sessionId) {
-        const first = terminalSessions[0];
-        activeTerminalSessionId = first.id;
-        switchTerminalTab(first.id);
-    }
-}
-
 function updateTerminalOutput(text) {
     const session = terminalSessions.find(s => s.id === activeTerminalSessionId);
     if (session) session.output += text;
-}
-
-// =============================================
-//  MULTI-ROOT WORKSPACE
-// =============================================
-let workspaceFolders = [];
-if (currentProjectPath) workspaceFolders = [currentProjectPath];
-
-function addWorkspaceFolder(folderPath) {
-    if (!folderPath) return;
-    const normalized = folderPath.replace(/\\/g, '/').replace(/\/+$/, '');
-    if (!workspaceFolders.includes(normalized)) {
-        workspaceFolders.push(normalized);
-        showToast('📁 Pasta adicionada ao workspace: ' + normalized.split('/').pop());
-    }
-}
-
-function removeWorkspaceFolder(folderPath) {
-    workspaceFolders = workspaceFolders.filter(f => f !== folderPath.replace(/\\/g, '/').replace(/\/+$/, ''));
-    showToast('🗑️ Pasta removida do workspace');
-}
-
-function getWorkspaceFolders() {
-    return workspaceFolders.length ? workspaceFolders : (currentProjectPath ? [currentProjectPath] : []);
 }
 
 // =============================================
@@ -8570,7 +8376,6 @@ function provideAedRenameLocation(model, position) {
 async function provideAedReferenceCodeLenses(model) {
     if (!currentProjectPath || !activeTabPath) return { lenses: [], dispose: () => {} };
     const text = model.getValue();
-    const lines = text.split('\n');
     const lenses = [];
     const exportedSymbols = [];
     const funcRegex = /(?:export\s+)?(?:async\s+)?function\s+(\w+)/g;
@@ -9273,11 +9078,11 @@ function populateCommandPalette() {
 function filterPalette(q) {
     var results = document.getElementById('commandPaletteResults');
     if (!results) return;
-    var anyVisible = false;
+    var _anyVisible = false;
     results.querySelectorAll('.cp-item').forEach(function(el) {
         var visible = !q || el.dataset.label.indexOf(q) >= 0;
         el.style.display = visible ? 'flex' : 'none';
-        if (visible) anyVisible = true;
+        if (visible) _anyVisible = true;
     });
     results.querySelectorAll('.cp-category').forEach(function(cat) {
         var next = cat;
@@ -9307,7 +9112,6 @@ function navigatePalette(results) {
 //  STATUS BAR
 // =============================================
 function updateStatusBar() {
-    var sel = document.getElementById('statusCursor');
     var langEl = document.getElementById('statusLang');
     var backendEl = document.getElementById('statusBackend');
     var projectEl = document.getElementById('statusProject');
@@ -9381,82 +9185,6 @@ document.addEventListener('keydown', function(e) {
 // =============================================
 //  OPEnCODE MODEL BROWSER — modal para escolher modelo
 // =============================================
-function openOpenCodeModelBrowser() {
-    var existing = document.getElementById('ocModelBrowser');
-    if (existing) { existing.style.display = 'flex'; return; }
-
-    var models = PROVIDER_MODELS.opencode || [];
-    if (!models.length && window._ocModels) {
-        var all = [];
-        for (var i = 0; i < window._ocModels.free.length; i++) all.push(window._ocModels.free[i]);
-        for (var j = 0; j < window._ocModels.go.length; j++) all.push(window._ocModels.go[j]);
-        models = all.map(function(m) {
-            return { value: m.id, label: (m.provider ? m.provider + ' · ' : '') + (m.name || m.id) };
-        });
-    }
-
-    if (!models.length) {
-        showToast('Modelos opencode nao carregados. Verifique a chave API.');
-        return;
-    }
-
-    var html = '';
-    var currentProvider = '';
-    var isWide = models.length > 20;
-
-    for (var k = 0; k < models.length; k++) {
-        var m = models[k];
-        // Extrai provider do label se possivel (Go models tem "Go · nome" no label)
-        var label = m.label.replace(/^[🟣💎]\s*/u, '');
-        var provider = '';
-        var parts = label.split(' · ');
-        if (parts.length > 1) { provider = parts[0]; label = parts.slice(1).join(' · '); }
-
-        if (isWide) {
-            html += '<div class="oc-model-item" data-value="' + escapeHtml(m.value) + '" data-label="' + escapeHtml(label) + '" style="padding:6px 12px;cursor:pointer;display:flex;align-items:center;gap:8px;border-bottom:1px solid #21262d;font-size:12px;">' +
-                '<span style="color:#8b949e;font-size:10px;width:70px;text-align:right;flex-shrink:0;">' + escapeHtml(provider) + '</span>' +
-                '<span style="color:#e6edf3;flex:1;">' + escapeHtml(label) + '</span></div>';
-        } else {
-            if (provider && provider !== currentProvider) {
-                currentProvider = provider;
-                html += '<div style="padding:6px 12px;color:#8b949e;font-size:10px;text-transform:uppercase;letter-spacing:1px;border-bottom:1px solid #30363d;">' + escapeHtml(provider) + '</div>';
-            }
-            html += '<div class="oc-model-item" data-value="' + escapeHtml(m.value) + '" style="padding:6px 12px;cursor:pointer;font-size:13px;color:#e6edf3;border-bottom:1px solid #21262d;">' +
-                escapeHtml(label) + '</div>';
-        }
-    }
-
-    var modal = document.createElement('div');
-    modal.id = 'ocModelBrowser';
-    modal.style.cssText = 'display:flex;position:fixed;top:0;left:0;width:100%;height:100%;background:rgba(0,0,0,0.7);z-index:5000;align-items:center;justify-content:center;backdrop-filter:blur(4px);';
-    modal.innerHTML = '<div class="modal-content" style="background:#161b22;border:1px solid #30363d;border-radius:12px;padding:20px;max-width:' + (isWide ? '600' : '420') + 'px;width:90%;max-height:80vh;display:flex;flex-direction:column;">' +
-        '<div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:12px;">' +
-            '<h2 style="color:#e6edf3;margin:0;font-size:16px;">🟣 Escolha o modelo opencode</h2>' +
-            '<button class="btn-close-modal" onclick="document.getElementById(\'ocModelBrowser\').remove()">X</button></div>' +
-        '<div style="flex:1;overflow-y:auto;background:#0d1117;border:1px solid #30363d;border-radius:8px;">' + html + '</div>' +
-        '<p style="color:#8b949e;font-size:10px;margin-top:8px;">' + models.length + ' modelos disponiveis | Selecione um para usar com opencode</p>' +
-        '</div>';
-    document.body.appendChild(modal);
-
-    modal.querySelectorAll('.oc-model-item').forEach(function(el) {
-        el.addEventListener('click', function() {
-            var val = el.dataset.value;
-            var label = el.dataset.label || el.textContent;
-            currentModel = val;
-            // Atualiza o model select
-            var sel = document.getElementById('modelSelect');
-            for (var i = 0; i < sel.options.length; i++) {
-                if (sel.options[i].value === val) { sel.selectedIndex = i; break; }
-            }
-            showToast('opencode: ' + label);
-            modal.remove();
-        });
-        el.addEventListener('mouseenter', function() { el.style.background = '#1f6feb'; el.style.color = '#fff'; });
-        el.addEventListener('mouseleave', function() { el.style.background = ''; el.style.color = ''; });
-    });
-
-    modal.addEventListener('click', function(e) { if (e.target === modal) modal.remove(); });
-}
 window._lastDiagnosticsErrors = [];
 
 function fixErrorsWithAI() {

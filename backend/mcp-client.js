@@ -1,5 +1,4 @@
 const { spawn } = require('child_process');
-const path = require('path');
 
 class McpClient {
     constructor(serverConfig) {
@@ -128,7 +127,7 @@ class McpManager {
     }
 
     async executeTool(fullName, args) {
-        for (const [serverName, { client, tools }] of this.clients) {
+        for (const [, { client, tools }] of this.clients) {
             const tool = tools.find(t => t.name === fullName);
             if (tool) return await client.callTool(tool.originalName, args);
         }

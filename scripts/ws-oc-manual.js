@@ -1,7 +1,6 @@
 const WebSocket = require('ws');
 const url = 'ws://localhost:3001';
 const ws = new WebSocket(url);
-let full = '';
 ws.on('open', () => {
     ws.send(JSON.stringify({
         type: 'stream',
@@ -15,7 +14,7 @@ ws.on('open', () => {
 });
 ws.on('message', (data) => {
     const msg = JSON.parse(data);
-    if (msg.type === 'chunk') { full += msg.content; process.stdout.write(msg.content); }
+    if (msg.type === 'chunk') { process.stdout.write(msg.content); }
     else if (msg.type === 'refresh') console.log('\n[REFRESH]');
     else if (msg.type === 'done') { console.log('\n[DONE]'); process.exit(0); }
     else if (msg.type === 'error') { console.log('\n[ERROR]', msg.content); process.exit(1); }

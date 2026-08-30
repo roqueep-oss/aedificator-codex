@@ -223,7 +223,7 @@ function _withValidation(fn) {
             if (result && typeof result === 'object') errors.push(...result);
         } catch (e) {
             // Fallback para validação básica se a específica falhar
-            try { const basic = basicSyntaxCheck('', 'file'); /* fallback básico */ } catch (_) {}
+            try { basicSyntaxCheck('', 'file'); } catch (_) {}
             errors.push({ type: 'file', line: 1, column: 1, message: 'Validação falhou: ' + (e.message || String(e)), severity: 'error' });
         }
         return errors;
@@ -421,7 +421,6 @@ function checkImports(code, idx, filePath) {
     const errors = [];
     const importRegex = /(?:import\s+\{([^}]+)\}\s+from\s+['"]([^'"]+)['"]|import\s+(\w+)\s+from\s+['"]([^'"]+)['"]|const\s+\{([^}]+)\}\s*=\s*require\s*\(\s*['"]([^'"]+)['"]|const\s+(\w+)\s*=\s*require\s*\(\s*['"]([^'"]+)['"])/g;
     let m;
-    const lines = code.split('\n');
 
     while ((m = importRegex.exec(code)) !== null) {
         const namedStr = m[1] || m[5] || '';
@@ -437,7 +436,7 @@ function checkImports(code, idx, filePath) {
         for (const name of importNames) {
             if (!name || name.length < 2) continue;
             let found = false;
-            for (const [relPath, parsed] of Object.entries(idx.files)) {
+for (const [relPath, parsed] of Object.entries(idx.files)) {
                 if (relPath.includes(name) || parsed.exports.includes(name)) {
                     found = true;
                     break;
@@ -533,7 +532,7 @@ function checkCallSignatures(code, idx) {
         const args = m[3].split(',').filter(a => a.trim());
         const lineNum = code.substring(0, m.index).split('\n').length;
 
-        for (const [relPath, parsed] of Object.entries(idx.files)) {
+        for (const [, parsed] of Object.entries(idx.files)) {
             const cls = parsed.classes.find(c => c === obj);
             if (!cls) continue;
             const func = parsed.functions.find(f => f.name === method);
@@ -879,7 +878,6 @@ function getGoSymbols(filePath, rootDir) {
         const fnRe = /func\s+(?:\([^)]*\s+\)\s+)?(\w+)\s*\(/g;
         const classRe = /type\s+(\w+)\s+struct/g;
         const varRe = /var\s+(\w+)\s+/g;
-        const lines = content.split('\n');
         let m;
         while ((m = fnRe.exec(content)) !== null) {
             const before = content.substring(0, m.index);
@@ -1099,7 +1097,6 @@ function validateWithJavac(filePath, rootDir) {
             for (const line of out.split('\n')) {
                 const m = line.match(/^(.+?):(\d+):\s*(error|warning):\s*(.+)/);
                 if (m) {
-                    const colMatch = m[1].includes(':') ? null : null;
                     errors.push({ type: 'java', line: parseInt(m[2]) || 1, column: 1, message: m[4], severity: m[3] === 'error' ? 'error' : 'warning' });
                 }
             }
@@ -1857,7 +1854,7 @@ function parsePhpcsOutput(out) {
     const errors = [];
     try {
         const data = JSON.parse(out);
-        for (const [file, result] of Object.entries(data.files || {})) {
+        for (const [, result] of Object.entries(data.files || {})) {
             for (const msg of result.messages || []) {
                 errors.push({ type: 'phpcs', line: msg.line || 1, column: msg.column || 1, message: msg.message, severity: msg.type === 'ERROR' ? 'error' : 'warning', rule: msg.source });
             }
@@ -2194,8 +2191,7 @@ function detectGodClass(content, lines) {
 
         const methodRe = /(?:def\s+|function\s+|func\s+|fn\s+|public\s|private\s|protected\s)/g;
         let methodCount = 0;
-        let methodMatch;
-        while ((methodMatch = methodRe.exec(afterClass)) !== null) methodCount++;
+        while (methodRe.exec(afterClass) !== null) methodCount++;
 
         let braceDepth = 0;
         let classEnd = classStart;

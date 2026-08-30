@@ -1,4 +1,3 @@
-const { pathToFileURL } = require('url');
 const fs = require('fs');
 
 // O opencode usa browser real (Playwright) para ver o console e os erros de

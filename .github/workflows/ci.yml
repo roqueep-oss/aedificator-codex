@@ -46,6 +46,18 @@ jobs:
         env:
           WIN_CSC_LINK: ${{ secrets.WIN_CSC_LINK }}
 
+      - name: Check Windows code signing
+        if: runner.os == 'Windows'
+        shell: bash
+        run: |
+          if [ -z "$WIN_CSC_LINK" ]; then
+            echo "::warning::Instalador Windows NÃO será assinado. Configure os secrets WIN_CSC_LINK e WIN_CSC_KEY_PASSWORD (SmartScreen bloqueará o instalador)."
+          else
+            echo "Instalador Windows será assinado."
+          fi
+        env:
+          WIN_CSC_LINK: ${{ secrets.WIN_CSC_LINK }}
+
       - name: Build
         shell: bash
         run: |

@@ -10,10 +10,7 @@ process.env.PROJECT_ROOT = PROJECT_ROOT;
 
 const {
     setProjectRoot,
-    executeAgentTool,
-    readFileContent,
-    writeFileContent,
-    resolveSafePath
+    executeAgentTool
 } = require('../backend/server');
 
 setProjectRoot(PROJECT_ROOT);

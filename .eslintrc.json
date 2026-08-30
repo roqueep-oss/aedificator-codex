@@ -11,11 +11,11 @@
   },
   "parserOptions": {
     "ecmaVersion": 2022,
-    "sourceType": "module"
+    "sourceType": "script"
   },
   "extends": "eslint:recommended",
   "rules": {
-    "no-unused-vars": ["warn", { "argsIgnorePattern": "^_", "varsIgnorePattern": "^_" }],
+    "no-unused-vars": ["warn", { "args": "none", "argsIgnorePattern": "^_", "varsIgnorePattern": "^_" }],
     "no-console": "off",
     "no-constant-condition": ["error", { "checkLoops": false }],
     "no-empty": ["error", { "allowEmptyCatch": true }],
@@ -28,5 +28,15 @@
     ".aedificator-codex-ide-backup/",
     "frontend/vendor/",
     "*.min.js"
+  ],
+  "overrides": [
+    {
+      "files": ["frontend/script.js", "frontend/multi-agent.js"],
+      "env": { "node": false },
+      "globals": {
+        "require": "readonly",
+        "define": "readonly"
+      }
+    }
   ]
 }

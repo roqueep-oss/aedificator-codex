@@ -772,7 +772,7 @@ async function executeAgentTool(name, args) {
             case 'analyzer_symbols': {
                 const f = resolveSafePath(args.caminho || '');
                 if (!f || !fs.existsSync(f)) return 'Erro: arquivo não encontrado';
-                try { const content = fs.readFileSync(f, 'utf-8'); const ext = path.extname(args.caminho).toLowerCase(); let sym = []; if (['.js','.ts','.jsx','.tsx'].includes(ext)) sym = analyzer.getTSSymbols(args.caminho, PROJECT_ROOT); else if (ext === '.py') sym = analyzer.getPythonSymbols(args.caminho, PROJECT_ROOT); else if (ext === '.go') sym = analyzer.getGoSymbols(args.caminho, PROJECT_ROOT); return sym.map(s => `${s.kind} ${s.name} (ln ${s.line})`).join('\n') || '(nenhum símbolo)'; } catch (e) { return `Erro: ${e.message}`; }
+                try { const ext = path.extname(args.caminho).toLowerCase(); let sym = []; if (['.js','.ts','.jsx','.tsx'].includes(ext)) sym = analyzer.getTSSymbols(args.caminho, PROJECT_ROOT); else if (ext === '.py') sym = analyzer.getPythonSymbols(args.caminho, PROJECT_ROOT); else if (ext === '.go') sym = analyzer.getGoSymbols(args.caminho, PROJECT_ROOT); return sym.map(s => `${s.kind} ${s.name} (ln ${s.line})`).join('\n') || '(nenhum símbolo)'; } catch (e) { return `Erro: ${e.message}`; }
             }
             case 'test_run': {
                 try { const result = runner.runCommandSync ? runner.runCommandSync('npm test', { cwd: PROJECT_ROOT, timeoutMs: 60000 }) : await runner.runCommand({ command: 'npm test', cwd: PROJECT_ROOT, timeoutMs: 60000 }); const r = result.stdout || result.output || ''; return r.slice(0, 5000).trim() || '(sem saída)'; } catch (e) { return `Erro: ${e.message}`; }

@@ -134,3 +134,32 @@ Ao rodar um comando, o app publica a versão atual do `package.json` nos serviç
 | `npm run version:major` | Incrementa versão (major) e publica nos dois |
 
 > Dica: `npm version` também cria a tag Git e o commit de versão. Após rodar um comando `version:*`, use `git push` (e `git push --tags`) para enviar a tag/commit ao repositório.
+
+## Assinatura de código (Windows)
+
+Instaladores Windows **sem assinatura** disparam o aviso do **SmartScreen** ("editor desconhecido") e podem ser bloqueados. A assinatura também é **obrigatória** para o auto-update do electron-builder (a opção `win.verifyUpdateCodeSignature` do `package.json` exige binários assinados).
+
+### Como habilitar a assinatura no CI
+
+1. **Adquira um certificado** de assinatura de código (OV ou EV) em uma CA confiável (ex.: DigiCert, Sectigo, GlobalSign, SSL.com). O certificado precisa suportar **SignTool** (formato `.pfx` ou `.p12`).
+2. **Converta** o certificado para base64 (uma única linha):
+   ```powershell
+   [Convert]::ToBase64String([IO.File]::ReadAllBytes("certificado.pfx")) | Set-Content "cert_base64.txt" -NoNewline
+   ```
+3. **Configure os secrets** do repositório GitHub (`Settings → Secrets and variables → Actions`):
+   - `WIN_CSC_LINK` — o conteúdo base64 do `.pfx`.
+   - `WIN_CSC_KEY_PASSWORD` — a senha do certificado.
+4. No próximo build Windows, o workflow `.github/workflows/ci.yml` importa o certificado e o electron-builder assina o instalador. Sem os secrets, o CI continua buildando, mas **registra um aviso** de que o instalador não será assinado.
+
+### Testes locais (instaladores sem assinatura)
+
+Para buildar/testar localmente sem certificado (esperado que o SmartScreen alerte ao instalar):
+
+```
+npm run build:win
+```
+
+### Publicação e atualizações
+
+- **Instaladores**: publicados via GitHub/GitLab Releases (`scripts/publish.js`). Recomenda-se só publicar **releases oficiais** com builds assinados.
+- **Auto-update**: ainda **não** está implementado. Para ativá-lo será necessário adicionar a dependência `electron-updater`, publicar o `latest.yml` e manter `win.verifyUpdateCodeSignature: true` com builds assinados.

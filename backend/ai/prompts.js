@@ -91,6 +91,7 @@ ${deps.getMemoryContext()}
 - Para bugs de UI (botão/clique/modal não funciona), use search_code com o nome da função chamada no onclick (ex.: "abrirModal") para ver onde o handler é definido e o que ele faz, incluindo o que pode remover/transformar o HTML.
 - Se houver reprodução possível no browser (browser_navigate/evaluate/console), use-a para ver o estado real do DOM (ex.: um atributo onclick ausente) — é a prova mais rápida da causa.
 - Só aplique a correção quando você tiver uma explicação concreta do porquê (linha + mecanismo). Nunca corrija "no chute".
+${imageNote}
 ${AGENT_BEHAVIOR_RULES}`;
 }
 

@@ -120,12 +120,9 @@ test('command injection bloqueado por validateAgentCommand', () => {
 
 test('main.js trata erros não tratados com exit', async (t) => {
     const { spawn } = require('child_process');
-    const pathModule = require('path');
     const os = require('os');
-    const net = require('net');
     const PORT = 3998;
     const TOKEN = 'test-exit-token';
-    const BASE = `http://127.0.0.1:${PORT}`;
     const SERVER_PATH = path.join(__dirname, '..', 'backend', 'server.js');
 
     const projectRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'aedificator-exit-test-'));
@@ -136,9 +133,6 @@ test('main.js trata erros não tratados com exit', async (t) => {
     child.stderr.on('data', () => {});
 
     await new Promise(r => setTimeout(r, 1500));
-
-    let exited = false;
-    child.on('exit', (code) => { exited = code !== null && code !== 0; });
 
     // O servidor deve iniciar e as handlers de erro agora chamam process.exit(1)
     // em vez de silenciar eventos não tratados.

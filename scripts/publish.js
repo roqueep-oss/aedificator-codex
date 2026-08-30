@@ -281,7 +281,6 @@ const cleanup = () => {
 };
 process.on('exit', cleanup);
 
-const pkg = buildPkg;
 const neb = process.platform === 'win32' ? 'npx.cmd' : 'npx';
 const baseArgs = ['electron-builder', `--${platform}`];
 

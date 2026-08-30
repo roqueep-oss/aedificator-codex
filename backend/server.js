@@ -10,11 +10,11 @@ const { spawn } = require('child_process');
 require('dotenv').config({ path: path.join(__dirname, '.env') });
 const { McpManager } = require('./mcp-client');
 const mcpManager = new McpManager();
-const { browserClient, getBrowserStatus, executeBrowserTool } = require('./browser-client');
+const { getBrowserStatus } = require('./browser-client');
 const { stripAccents, classifyIntent, classifyRequest } = require('./ai/classify');
-const { LANGUAGE_RULE, MODE_INSTRUCTIONS, AGENT_BEHAVIOR_RULES, getAgentSystemPrompt, getDeepSeekAgentPrompt } = require('./ai/prompts');
-const { TOOL_SCHEMAS, AGENT_TOOLS, ADVANCED_TOOLS, stripBOM, normalizeLine, replaceIgnoringIndent, replaceInContent, getAllToolDeclarations, getAgentToolsForMode, setToolContext, executeAgentTool } = require('./ai/tools');
-const { callAgentProvider, callAgentProviderWithFallback, getConfiguredProviders, setProvidersContext } = require('./ai/providers');
+const { LANGUAGE_RULE, MODE_INSTRUCTIONS } = require('./ai/prompts');
+const { TOOL_SCHEMAS, stripBOM, setToolContext, executeAgentTool } = require('./ai/tools');
+const { callAgentProvider, getConfiguredProviders, setProvidersContext } = require('./ai/providers');
 const { runAgentLoop, setLoopContext } = require('./ai/loop');
 
 // ===== ENCODING UTF-8 (evita acentos corrompidos no console Windows) =====
@@ -194,7 +194,6 @@ function decryptSecret(stored) {
 
 // ===== PASTA PADRÃO DO PROJETO =====
 let PROJECT_ROOT = process.env.PROJECT_ROOT || path.join(__dirname, 'projects');
-let lastRepoInfo = null;
 
 if (!fs.existsSync(PROJECT_ROOT)) {
     console.log(`⚠️ Pasta não encontrada: ${PROJECT_ROOT}`);
@@ -214,7 +213,6 @@ function setProjectRoot(newPath) {
     const resolvedPath = path.resolve(newPath);
     if (fs.existsSync(resolvedPath)) {
         PROJECT_ROOT = resolvedPath;
-        lastRepoInfo = null;
         invalidateDeepseekCache();
         invalidateProjectCache();
         startFileWatcher();
@@ -780,25 +778,6 @@ function buildFallbackSugestoes(task, aiText) {
         .trim()
         .slice(0, 80);
 
-    function extractKeywords(text, maxLen) {
-        if (!text) return cleanTask.slice(0, maxLen);
-        const cleaned = text
-            .replace(/^(📋\s*|\*\*|__|#+\s*)/gm, '')
-            .replace(/\n{2,}/g, '. ')
-            .replace(/\n/g, ' ')
-            .replace(/\s{2,}/g, ' ')
-            .trim();
-        const sentences = cleaned.split(/[.!?]\s+/);
-        const meaningful = sentences.filter(s => s.length > 15 && !/^(aqui|segue|vamos|iremos|primeiro|antes|depois|então|assim|dessa|nesse|neste)/i.test(s));
-        if (meaningful.length >= 2) {
-            return meaningful.slice(0, 2).join('. ').slice(0, maxLen);
-        }
-        return cleaned.slice(0, maxLen);
-    }
-
-    const context = extractKeywords(aiText, 120);
-    const prefix = context && context !== cleanTask ? context + ' — ' : '';
-
     return {
         resumo: 'Como você quer implementar: ' + cleanTask + '?',
         sugestoes: [
@@ -1066,8 +1045,6 @@ function _errorHint(statusCode, errorBody, provider) {
 function getProviderErrorHint(statusCode, errorBody, provider) {
     return _errorHint(statusCode, errorBody, provider);
 }
-
-const RETRY_STATUSES = new Set([429, 500, 502, 503, 504]);
 
 async function fetchWithTimeout(url, options = {}, timeoutMs = 120000, externalSignal) {
     const timeoutController = new AbortController();
@@ -2065,7 +2042,7 @@ async function callDeepSeek(prompt, onChunk, signal, forcedModel) {
     const cachePrefix = getDeepseekCachePrefix();
     const model = forcedModel || _currentTaskModel || config.deepseek.model || 'deepseek-v4-flash';
     const url = 'https://api.deepseek.com/chat/completions';
-    const safePrompt = sanitizeForJson(prompt);
+    const safePrompt = sanitizeForJson(finalPrompt);
     const safeSystem = sanitizeForJson(cachePrefix);
     const bodyObj = {
         model,
@@ -2571,7 +2548,6 @@ function hasRealWriteErrors(resultStr) {
 function runQuickTest(filePath) {
     try {
         const ext = path.extname(filePath).toLowerCase();
-        const dir = path.dirname(path.join(PROJECT_ROOT, filePath));
         const name = path.basename(filePath, ext);
         let cmd = null;
         let timeout = 15000;
@@ -2780,25 +2756,6 @@ async function runAgentAndCapture(ws, task, onChunk, streamController, history, 
         } catch (e) {}
     }
     ws.send(JSON.stringify({ type: 'done', summary: summary || 'Agente concluído ✅', command: task }));
-}
-
-// =============================================
-//  AUTO-CORREÇÃO COM IA (loop de correção)
-// =============================================
-async function autoFixWithAI(filePath, code, errors, onChunk, signal) {
-    const errorText = errors.map(e => `Ln ${e.line}: ${e.message}`).join('\n');
-    const prompt = `O seguinte código para o arquivo ${filePath} tem erros:\n\n` +
-        `\`\`\`\n${code}\n\`\`\`\n\n` +
-        `ERROS:\n${errorText}\n\n` +
-        `Corrija APENAS os erros. Retorne SOMENTE o código completo corrigido em um bloco \`\`\`. Não adicione explicações.`;
-
-    try {
-        const response = await analyzeTask(prompt, onChunk, signal, 'code', [], 'gemini');
-        const codeMatch = response.match(/```[\w]*\n([\s\S]*?)```/);
-        if (codeMatch) return codeMatch[1].trim();
-        if (response.trim() && !response.includes('{')) return response.trim();
-    } catch (e) {}
-    return code;
 }
 
 // =============================================
@@ -3811,7 +3768,7 @@ app.get('/api/usage', (req, res) => {
 app.get('/api/usage/monthly', (req, res) => {
     const result = { months: [], total_brl: 0, providers: {} };
     const monthsSet = new Set();
-    for (const [p, data] of Object.entries(tokenUsage)) {
+    for (const [, data] of Object.entries(tokenUsage)) {
         if (!data.monthly) continue;
         for (const month of Object.keys(data.monthly)) monthsSet.add(month);
         if (data.models) {
@@ -4280,7 +4237,6 @@ pre{background:#161b22;padding:10px;border-radius:6px;overflow-x:auto;font-size:
 // Guarda cópias completas rotuladas em .aedificator-codex-ide-backup/snapshots/<rotulo>/,
 // ignorando pastas grandes (node_modules, .git, dist, build) e binários maiores que o limite.
 const SNAPSHOT_ROOT = () => path.join(PROJECT_ROOT, BACKUP_DIR_NAME, 'snapshots');
-const SNAPSHOT_MAX_FILE = 10 * 1024 * 1024; // 10 MB por arquivo
 
 function snapshotAll() {
     return snapshotProjectContents(); // Map relPath -> conteúdo (já filtra IGNORED_DIRS, binários e >3MB)
@@ -4842,7 +4798,7 @@ app.post('/api/analyzer/symbols', (req, res) => {
 });
 
 app.post('/api/analyzer/definition', (req, res) => {
-    const { file, symbol, wordUnderCursor } = req.body || {};
+    const { symbol, wordUnderCursor } = req.body || {};
     if (!PROJECT_ROOT) return res.status(400).json({ error: 'Nenhum projeto aberto' });
     const idx = analyzer.indexProject(PROJECT_ROOT);
     const searchName = symbol || wordUnderCursor || '';
@@ -4906,7 +4862,7 @@ app.post('/api/analyzer/references', (req, res) => {
 });
 
 app.post('/api/analyzer/completions', (req, res) => {
-    const { prefix, file } = req.body || {};
+    const { prefix } = req.body || {};
     if (!PROJECT_ROOT) return res.status(400).json({ error: 'Nenhum projeto aberto' });
     const searchPrefix = (prefix || '').toLowerCase();
     const idx = analyzer.indexProject(PROJECT_ROOT);
@@ -5076,7 +5032,6 @@ Código editado:`;
 });
 
 function getRelFilePaths(currentFile) {
-    const curDir = currentFile ? path.dirname(currentFile) : '';
     const items = [];
     try {
         const allFiles = getAllFiles(PROJECT_ROOT, { n: 30 });
@@ -5961,11 +5916,9 @@ function formatCode(language, code) {
         });
         
         let out = '';
-        let err = '';
         const timer = setTimeout(() => { try { child.kill(); } catch(e) {} }, 15000);
         
         child.stdout.on('data', (d) => { out += d.toString(); });
-        child.stderr.on('data', (d) => { err += d.toString(); });
         child.on('error', (e) => { clearTimeout(timer); try { resolve(basicFormat(language, code)); } catch(x) { resolve(code); } });
         child.on('close', (code) => {
             clearTimeout(timer);
@@ -6477,8 +6430,6 @@ async function detectRepo() {
 function nextVersion(current) {
     if (!current) return 'v1.0.0';
     const m = String(current).replace(/^v/, '').split('.');
-    const major = parseInt(m[0]) || 0;
-    const minor = parseInt(m[1]) || 0;
     const patch = parseInt(m[2]) || 0;
     m[2] = String(patch + 1);
     return 'v' + m[0] + '.' + m[1] + '.' + m[2];
@@ -6507,7 +6458,7 @@ app.post('/api/git/detect', async (req, res) => {
 });
 
 app.post('/api/git/publish', async (req, res) => {
-    const { bump = 'auto', message, useExisting } = req.body;
+    const { message, useExisting } = req.body;
     try {
         const status = await runGit(['status', '--porcelain'], PROJECT_ROOT);
         if (status.code !== 0) {
@@ -6917,9 +6868,6 @@ wss.on('connection', (ws, req) => {
                 streamController.abort();
                 streamController = null;
                 pendingPlan = null;
-                const msg = restoredCount > 0
-                    ? `⏹️ Tarefa cancelada — ${restoredCount} arquivo(s) restaurado(s)`
-                    : '⏹️ Tarefa cancelada';
                 ws.send(JSON.stringify({ type: 'cancelled', restoredCount, restoredFiles: restored.files }));
                 if (restoredCount > 0) ws.send(JSON.stringify({ type: 'refresh' }));
             }
@@ -6950,7 +6898,7 @@ wss.on('connection', (ws, req) => {
         }
 
         if (data.type === 'stream') {
-            const { message: task, projectPath, mode, history } = data;
+            const { message: task, projectPath, history } = data;
 
             if (projectPath) {
                 setProjectRoot(projectPath);
@@ -6970,7 +6918,6 @@ wss.on('connection', (ws, req) => {
                 const model = data.model || 'gemini-3.5-flash';
                 const provider = data.provider || 'gemini';
                 const mode = data.mode || 'cowork';
-                const reviewMode = data.reviewMode === true;
                 // Modelo escolhido no seletor do chat: usado por TODOS os provedores
                 // nas chamadas abaixo (agente, exploração, análise, respostas).
                 _currentTaskModel = model;
@@ -6980,7 +6927,6 @@ wss.on('connection', (ws, req) => {
                 if (data.images && data.images.length) setPendingImages(data.images);
 
                 let effectiveMode = mode;
-                let effectiveReviewMode = reviewMode;
                 if (mode === 'auto' || mode === 'smart') {
                     const classification = classifyRequest(task);
                     console.log(`[smart] ${classification.route}: ${classification.reason} | "${task.slice(0, 80)}"`);
@@ -6998,11 +6944,9 @@ wss.on('connection', (ws, req) => {
                     // antes de aplicar (fluxo analyzeTask → sugestões → aprovação).
                     if (classification.route === 'options') {
                         effectiveMode = 'clarify';
-                        effectiveReviewMode = false;
                         if (onChunk) onChunk('Sistema', `📋 Modo: 💡 Opções\n`);
                     } else {
                         effectiveMode = 'agent';
-                        effectiveReviewMode = false;
                         if (onChunk) onChunk('Sistema', `📋 Modo: 🚀 Direto\n`);
                         data.reviewMode = false;
                     }
@@ -7135,7 +7079,6 @@ wss.on('connection', (ws, req) => {
                         if (parsed && (parsed.sugestoes || parsed.arquivos)) {
                             const plan = parsed;
                             const hasSug = Array.isArray(plan.sugestoes) && plan.sugestoes.length > 0;
-                            const hasArq = Array.isArray(plan.arquivos) && plan.arquivos.length > 0;
                             const planId = crypto.randomBytes(8).toString('hex');
                             pendingPlan = { id: planId, plan, controller: streamController, task, provider: 'opencode' };
                             const payload = { type: 'approval', planId, resumo: plan.resumo || '', total: hasSug ? plan.sugestoes.length : (plan.arquivos || []).length };
@@ -7660,9 +7603,6 @@ async function initMcp() {
     console.log(`[mcp] Conectando ${mcpConfigs.filter(c => c.enabled).length} servidor(es)...`);
     await mcpManager.connectServers(mcpConfigs);
 }
-
-function getMcpTools() { return mcpManager.getAllTools(); }
-async function executeMcpTool(name, args) { return await mcpManager.executeTool(name, args); }
 
 // =============================================
 //  INJEÇÃO DO CONTEXTO DE FERRAMENTAS
