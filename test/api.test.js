@@ -175,6 +175,22 @@ test('getProviderErrorHint trata códigos e mensagens de erro', () => {
     assert.strictEqual(getProviderErrorHint(200, {}, 'unknown'), '');
 });
 
+test('friendlyOpenCodeError traduz erros do opencode', () => {
+    const { friendlyOpenCodeError } = require(SERVER_PATH);
+    // Erro de gateway genérico → orientação para trocar de modelo/provedor
+    assert.match(friendlyOpenCodeError('Unexpected server error. Check server logs for details.'), /gateway opencode/);
+    // Rate limit / quota
+    assert.match(friendlyOpenCodeError('Rate limit exceeded'), /Limite de uso/);
+    // Autenticação
+    assert.match(friendlyOpenCodeError('Unauthorized. API key invalid'), /autenticação/);
+    // Modelo não encontrado
+    assert.match(friendlyOpenCodeError('model not found: foo/bar'), /Modelo opencode não encontrado/);
+    // Mensagem vazia → fallback
+    assert.strictEqual(friendlyOpenCodeError(''), 'opencode não retornou resposta');
+    // Mensagem desconhecida → prefixo padrão
+    assert.strictEqual(friendlyOpenCodeError('algo estranho'), 'opencode erro: algo estranho');
+});
+
 test('backup functions são consistentes e não duplicam lógica', async (t) => {
     const { backupRelativePath, backupFromContent, backupFileBeforeChange, setProjectRoot } = require(SERVER_PATH);
     const PROJECT_ROOT = fs.mkdtempSync(path.join(os.tmpdir(), 'aedificator-backup-test-'));

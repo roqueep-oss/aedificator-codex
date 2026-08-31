@@ -1834,6 +1834,16 @@ function stopOpenCodeServer() {
     if (opencodeServerProcess) { opencodeServerProcess.kill(); opencodeServerProcess = null; }
 }
 
+function friendlyOpenCodeError(raw) {
+    const msg = String(raw || '').trim();
+    if (!msg) return 'opencode não retornou resposta';
+    if (/unexpected server error/i.test(msg)) return 'O gateway opencode (Zen) retornou um erro de servidor. Tente novamente em instantes ou use outro modelo/provedor.';
+    if (/rate\s*limit|429|quota|exceeded/i.test(msg)) return 'Limite de uso do opencode atingido. Aguarde alguns minutos ou troque de modelo.';
+    if (/auth|unauthorized|401|api ?key|login/i.test(msg)) return 'Falha de autenticação do opencode. Verifique a chave API em Configurações.';
+    if (/model.*not found|invalid.*model|404/i.test(msg)) return 'Modelo opencode não encontrado. Escolha outro modelo no seletor.';
+    return 'opencode erro: ' + msg;
+}
+
 async function callOpenCode(prompt, onChunk, signal, model, onToolEvent) {
     const binary = resolveOpenCodeBinary();
     ensureOpenCodeConfig();
@@ -1891,7 +1901,7 @@ async function callOpenCode(prompt, onChunk, signal, model, onToolEvent) {
                             (typeof e.data === 'string' ? e.data : '') ||
                             (typeof e === 'string' ? e : JSON.stringify(e));
                         console.log(`[opencode error] ${lastError}`);
-                        if (onChunk) onChunk('Sistema', `❌ ${lastError}\n`);
+                        if (onChunk) onChunk('Sistema', `❌ ${friendlyOpenCodeError(lastError)}\n`);
                     } else if (event.type === 'text' && event.part && event.part.type === 'text' && typeof event.part.text === 'string') {
                         text = event.part.text;
                     } else if (event.type === 'message' && event.role === 'assistant') {
@@ -1983,12 +1993,17 @@ async function callOpenCode(prompt, onChunk, signal, model, onToolEvent) {
                 const estimatedOutput = Math.round(fullText.length / 4);
                 trackTokens('opencode', estimatedInput, estimatedOutput, false, useModel);
                 if (lastError) {
-                    const err = new Error(`opencode erro: ${lastError}`);
+                    const err = new Error(friendlyOpenCodeError(lastError));
                     err.partialText = fullText.trim().slice(0, 500);
                     reject(err);
                 } else {
                     resolve(fullText.trim());
                 }
+            } else if (lastError) {
+                // Evento de erro do opencode (ex.: gateway indisponível) com saída
+                // vazia: NÃO engole o erro silenciosamente. Antes isso resolvia '' e
+                // o usuário via "não fez nada". Agora a falha real aparece no chat.
+                reject(new Error(friendlyOpenCodeError(lastError)));
             } else if (code === 0) {
                 resolve('');
             } else {
@@ -7573,7 +7588,7 @@ module.exports = { app, server, resolveSafePath, extractJson, setProjectRoot, wr
 readFileContent, listBackups, analyzeTask, executePlan, executeAgentTool, parseJsonC, buildOpenCodePrompt, 
 snapshotProjectFiles, diffSnapshots, computeDiff, parseRemoteUrl, nextVersion, detectRepo, latestVersionTag, runner, formatCode, 
 pushUndoState, undoStack, redoStack, trackTokens, calcCost, getModelPrice, getUsageReport, tokenUsage, listDirectory, 
-getAllFiles, logError, getProviderErrorHint, backupRelativePath, backupFromContent, backupFileBeforeChange, validateAgentCommand, safeValidate: analyzer.safeValidate };
+getAllFiles, logError, getProviderErrorHint, backupRelativePath, backupFromContent, backupFileBeforeChange, validateAgentCommand, friendlyOpenCodeError, safeValidate: analyzer.safeValidate };
 
 // =============================================
 let mcpConfigs = [];
