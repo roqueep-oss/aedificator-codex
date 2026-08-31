@@ -1844,6 +1844,31 @@ function friendlyOpenCodeError(raw) {
     return 'opencode erro: ' + msg;
 }
 
+function friendlyProviderError(provider, status, errorMsg) {
+    const msg = (errorMsg || '').toLowerCase();
+    if (/crédito|balance|insufficient|402/.test(msg)) {
+        if (provider === 'gemini') return 'Créditos GEMINI esgotados. Recarregue no site do provedor ou use outro modelo.';
+        if (provider === 'deepseek') return 'Créditos DEEPSEEK esgotados. Recarregue no site do provedor ou use outro modelo.';
+        return `Créditos ${provider.toUpperCase()} esgotados. Recarregue ou use outro modelo.`;
+    }
+    if (/rate\s*limit|429|quota|exceeded/i.test(msg)) {
+        if (provider === 'gemini') return 'Limite de uso do GEMINI atingido. Aguarde alguns minutos ou troque de modelo.';
+        if (provider === 'deepseek') return 'Limite de uso do DEEPSEEK atingido. Aguarde alguns minutos ou troque de modelo.';
+        return `Limite de uso do ${provider.toUpperCase()} atingido. Aguarde ou troque de modelo.`;
+    }
+    if (/auth|unauthorized|401/i.test(msg)) {
+        if (provider === 'gemini') return 'Falha de autenticação do GEMINI. Verifique a chave API em Configurações.';
+        if (provider === 'deepseek') return 'Falha de autenticação do DEEPSEEK. Verifique a chave API em Configurações.';
+        return `Falha de autenticação do ${provider.toUpperCase()}. Verifique a chave API.`;
+    }
+    if (/model.*not found|invalid.*model|404/i.test(msg)) {
+        if (provider === 'gemini') return 'Modelo GEMINI não encontrado. Selecione outro modelo no seletor.';
+        if (provider === 'deepseek') return 'Modelo DEEPSEEK não encontrado. Selecione outro modelo no seletor.';
+        return `Modelo ${provider.toUpperCase()} não encontrado. Selecione outro modelo.`;
+    }
+    return `${provider.toUpperCase()} erro: ${errorMsg || 'erro desconhecido'}`;
+}
+
 async function callOpenCode(prompt, onChunk, signal, model, onToolEvent) {
     const binary = resolveOpenCodeBinary();
     ensureOpenCodeConfig();
@@ -2162,6 +2187,34 @@ async function callAI(provider, prompt, onChunk, signal, model) {
         return await callOpenCode(prompt, onChunk, signal, model);
     } else {
         throw new Error(`Provedor ${provider} não suportado`);
+    }
+}
+
+function hasOpenCodeFallback() {
+    if (!config.opencode?.apiKey) return false;
+    try { return !!resolveOpenCodeBinary(); } catch (e) { return false; }
+}
+
+// Tenta o provider original; se falhar por créditos/quota/rede e o opencode
+// (modelo gratuito) estiver disponível, cai automaticamente para ele — em vez
+// de o usuário ficar sem resposta quando o provedor principal esgotou créditos.
+async function callAIWithFallback(provider, prompt, onChunk, signal, model) {
+    try {
+        return await callAI(provider, prompt, onChunk, signal, model);
+    } catch (err) {
+        if (provider !== 'opencode' && isFallbackEligibleError(err) && hasOpenCodeFallback()) {
+            console.log(`[fallback] ${provider} falhou (${String(err.message).slice(0, 80)}). Tentando opencode...`);
+            if (onChunk) onChunk('Sistema', `⚠️ ${provider} falhou (${String(err.message).slice(0, 80)}). Usando opencode (gratuito)...\n`);
+            try {
+                // Usa o modelo gratuito configurado do opencode, não o do provedor
+                // que falhou (ex.: deepseek-v4-flash não existe no gateway opencode).
+                return await callAI('opencode', prompt, onChunk, signal, config.opencode?.model || OPENCODE_DEFAULT_MODEL);
+            } catch (fallbackErr) {
+                err.fallbackError = fallbackErr.message;
+                throw err;
+            }
+        }
+        throw err;
     }
 }
 
@@ -2995,7 +3048,10 @@ async function semanticRelevantFilesLlm(message, topK, provider) {
     let candidatePaths;
     try {
         candidatePaths = await semanticShortlist(message, topK, provider);
-    } catch (e) { candidatePaths = []; }
+    } catch (e) {
+        console.log(`[semantic] Erro: ${e.message}`);
+        candidatePaths = [];
+    }
     if (!candidatePaths.length) candidatePaths = entries.slice(0, 200).map(([rel]) => rel);
     const candidates = candidatePaths.map((rel) => {
         const p = parsed[rel] || {};
@@ -3481,7 +3537,7 @@ REGRAS:
 
     if (onChunk) onChunk('Assistente', '🔍 Analisando estrutura do projeto...\n');
 
-    const response = await callAI(provider, analysisPrompt, null, signal);
+    const response = await callAIWithFallback(provider, analysisPrompt, null, signal);
 
     const plan = extractJson(response);
     if (!plan) {
@@ -6948,7 +7004,7 @@ wss.on('connection', (ws, req) => {
                     if (onChunk) onChunk('Sistema', `🤖 Smart: ${classification.reason}\n`);
                     if (classification.route === 'answer') {
                         onChunk('Assistente', '');
-                        const answer = await callAI(provider, `${LANGUAGE_RULE}\n\nResponda de forma concisa e direta (máximo 3 frases): ${task}`, (agent, text) => {
+                        const answer = await callAIWithFallback(provider, `${LANGUAGE_RULE}\n\nResponda de forma concisa e direta (máximo 3 frases): ${task}`, (agent, text) => {
                             if (agent === 'text' || agent === 'Assistente') onChunk('Assistente', text);
                         }, streamController.signal);
                         ws.send(JSON.stringify({ type: 'done', summary: answer ? answer.slice(0, 200).trim() : 'Respondido ✅', command: task }));
@@ -7171,7 +7227,10 @@ wss.on('connection', (ws, req) => {
                         try {
                             if (onChunk) onChunk('Sistema', '🔍 Explorando arquivos...\n');
                             fastExplorationCtx = await runExplorationPhase(task, onChunk, streamController.signal, provider);
-                        } catch (e) {}
+                        } catch (e) {
+                            console.log(`[ws] Erro na exploração: ${e.message}`);
+                            if (onChunk) onChunk('Sistema', `❌ ${friendlyProviderError(provider, 500, e.message)}\n`);
+                        }
                     }
                     const fastTaskWithCtx = fastExplorationCtx
                         ? `CONTEXTO DA EXPLORAÇÃO PRÉVIA:\n${fastExplorationCtx}\n\nTAREFA: ${task}`
@@ -7219,7 +7278,10 @@ wss.on('connection', (ws, req) => {
                         if (onChunk) onChunk('Sistema', '🔍 Explorando arquivos do projeto antes de gerar o plano...\n');
                         explorationCtx = await runExplorationPhase(task, onChunk, streamController.signal, provider);
                         if (explorationCtx && onChunk) onChunk('Sistema', '✅ Exploração concluída. Gerando plano...\n');
-                    } catch (e) {}
+                    } catch (e) {
+                        console.log(`[ws] Erro na exploração: ${e.message}`);
+                        if (onChunk) onChunk('Sistema', `❌ ${friendlyProviderError(provider, 500, e.message)}\n`);
+                    }
                 }
 
                 const plan = await analyzeTask(task, onChunk, streamController.signal, mode, Array.isArray(history) ? history : [], provider, explorationCtx);
@@ -7237,7 +7299,7 @@ wss.on('connection', (ws, req) => {
 
                     if (onChunk) onChunk('Sistema', '🔄 Reforçando solicitação de opções...\n');
                     try {
-                        const retryResponse = await callAI(provider, retryPrompt, null, streamController.signal);
+                        const retryResponse = await callAIWithFallback(provider, retryPrompt, null, streamController.signal);
                         const retryPlan = extractJson(retryResponse);
                         console.log('[ws:plan] Retry concluído', JSON.stringify({ hasRetryPlan: !!retryPlan, retrySugCount: retryPlan ? (retryPlan.sugestoes||[]).length : 0, retryArqCount: retryPlan ? (retryPlan.arquivos||[]).length : 0 }));
                         if (retryPlan) {
@@ -7361,6 +7423,7 @@ wss.on('connection', (ws, req) => {
                     if (config.deepseek?.apiKey) alternatives.push('DeepSeek');
                     if (config.openai?.apiKey) alternatives.push('OpenAI');
                     if (config.claude?.apiKey) alternatives.push('Claude');
+                    if (config.opencode?.apiKey) alternatives.push('OpenCode (gratuito)');
                     const currentProvider = data.provider ? data.provider.charAt(0).toUpperCase() + data.provider.slice(1) : '';
                     const others = alternatives.filter(p => p.toLowerCase() !== (currentProvider || '').toLowerCase());
                     if (others.length > 0) {
@@ -7588,7 +7651,8 @@ module.exports = { app, server, resolveSafePath, extractJson, setProjectRoot, wr
 readFileContent, listBackups, analyzeTask, executePlan, executeAgentTool, parseJsonC, buildOpenCodePrompt, 
 snapshotProjectFiles, diffSnapshots, computeDiff, parseRemoteUrl, nextVersion, detectRepo, latestVersionTag, runner, formatCode, 
 pushUndoState, undoStack, redoStack, trackTokens, calcCost, getModelPrice, getUsageReport, tokenUsage, listDirectory, 
-getAllFiles, logError, getProviderErrorHint, backupRelativePath, backupFromContent, backupFileBeforeChange, validateAgentCommand, friendlyOpenCodeError, safeValidate: analyzer.safeValidate };
+getAllFiles, logError, getProviderErrorHint, backupRelativePath, backupFromContent, backupFileBeforeChange, validateAgentCommand, 
+friendlyOpenCodeError, friendlyProviderError, callAIWithFallback, isFallbackEligibleError, safeValidate: analyzer.safeValidate };
 
 // =============================================
 let mcpConfigs = [];

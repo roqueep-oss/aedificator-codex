@@ -191,6 +191,33 @@ test('friendlyOpenCodeError traduz erros do opencode', () => {
     assert.strictEqual(friendlyOpenCodeError('algo estranho'), 'opencode erro: algo estranho');
 });
 
+test('friendlyProviderError traduz erros de provedores (gemini/deepseek)', () => {
+    const { friendlyProviderError } = require(SERVER_PATH);
+    // Créditos esgotados (402)
+    assert.match(friendlyProviderError('gemini', 402, 'Créditos GEMINI esgotados'), /Créditos GEMINI esgotados/);
+    assert.match(friendlyProviderError('deepseek', 402, 'Insufficient Balance'), /Créditos DEEPSEEK esgotados/);
+    // Rate limit / quota
+    assert.match(friendlyProviderError('gemini', 429, 'Rate limit exceeded'), /Limite de uso do GEMINI/);
+    // Autenticação
+    assert.match(friendlyProviderError('deepseek', 401, 'Unauthorized'), /Falha de autenticação do DEEPSEEK/);
+    // Modelo não encontrado
+    assert.match(friendlyProviderError('gemini', 404, 'model not found: foo'), /Modelo GEMINI não encontrado/);
+    // Mensagem desconhecida → prefixo padrão com nome do provedor
+    assert.strictEqual(friendlyProviderError('deepseek', 500, 'algo estranho'), 'DEEPSEEK erro: algo estranho');
+});
+
+test('isFallbackEligibleError identifica erros de créditos/quota para fallback', () => {
+    const { isFallbackEligibleError } = require(SERVER_PATH);
+    // Erros de créditos/quota devem disparar fallback
+    assert.strictEqual(isFallbackEligibleError(new Error('Créditos GEMINI esgotados')), true);
+    assert.strictEqual(isFallbackEligibleError(new Error('Insufficient Balance')), true);
+    assert.strictEqual(isFallbackEligibleError(new Error('Rate limit exceeded (429)')), true);
+    assert.strictEqual(isFallbackEligibleError(new Error('Payment Required 402')), true);
+    // Erros não relacionados não devem disparar fallback
+    assert.strictEqual(isFallbackEligibleError(new Error('invalid syntax near SELECT')), false);
+    assert.strictEqual(isFallbackEligibleError(new Error('File not found: x.js')), false);
+});
+
 test('backup functions são consistentes e não duplicam lógica', async (t) => {
     const { backupRelativePath, backupFromContent, backupFileBeforeChange, setProjectRoot } = require(SERVER_PATH);
     const PROJECT_ROOT = fs.mkdtempSync(path.join(os.tmpdir(), 'aedificator-backup-test-'));
