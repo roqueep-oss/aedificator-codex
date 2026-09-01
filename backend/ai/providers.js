@@ -50,7 +50,9 @@ function geminiContentsFromCanonical(messages) {
 async function fetchGeminiStreamRaw(url, body, onChunk, signal) {
     const response = await _ctx.fetchWithTimeout(url, {
         method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
+        // Chave via header (x-goog-api-key), não na URL — evita vazar a chave em
+        // logs/proxies e em mensagens de erro de rede.
+        headers: { 'Content-Type': 'application/json', 'x-goog-api-key': _ctx.config.gemini.apiKey },
         body
     }, 120000, signal);
     if (!response.ok) {
@@ -126,7 +128,7 @@ async function callAgentGemini(messages, tools, signal) {
     const geminiKey = _ctx.config.gemini.apiKey;
     if (!geminiKey) throw new Error('Chave Gemini não configurada');
     const model = _ctx.currentTaskModel || _ctx.config.gemini.model || 'gemini-3.5-flash';
-    const url = new URL(`https://generativelanguage.googleapis.com/v1beta/models/${model}:streamGenerateContent?alt=sse&key=${geminiKey}`);
+    const url = new URL(`https://generativelanguage.googleapis.com/v1beta/models/${model}:streamGenerateContent?alt=sse`);
     const toolDeclarations = tools.map(t => ({ name: t.name, description: t.description, parameters: t.parameters }));
     const body = JSON.stringify({
         contents: geminiContentsFromCanonical(messages),

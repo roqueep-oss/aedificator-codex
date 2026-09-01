@@ -114,6 +114,14 @@ test('command injection bloqueado por validateAgentCommand', () => {
     const r4 = validateAgentCommand('echo hello');
     // comando simples sem caracteres perigosos retorna null (permitido)
     assert.ok(r4 === null || r4 === 'Comando vazio', 'comando simples deve passar ou ser vazio');
+    // Bypass via aspas simples (cmd.exe trata ' como literal no Windows):
+    // o conteúdo NÃO pode esconder separadores mesmo dentro de aspas.
+    assert.ok(validateAgentCommand("echo 'a | whoami'") !== null, "| dentro de aspas simples deve ser bloqueado");
+    assert.ok(validateAgentCommand("echo 'a & whoami'") !== null, "& dentro de aspas simples deve ser bloqueado");
+    assert.ok(validateAgentCommand("echo 'a; whoami'") !== null, "; dentro de aspas simples deve ser bloqueado");
+    assert.ok(validateAgentCommand("echo '$(whoami)'") !== null, "$( ) dentro de aspas simples deve ser bloqueado");
+    // Aspas duplas com conteúdo seguro (sem metacaracteres) continuam permitidas
+    assert.strictEqual(validateAgentCommand('git commit -m "fix: corrige bug"'), null);
 });
 
 // ===== TESTES DE MELHORIAS RECIENTES =====

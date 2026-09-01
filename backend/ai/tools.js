@@ -662,6 +662,12 @@ async function executeAgentTool(name, args) {
                         const chunks = [];
                         const child = require('child_process').spawn(cmd, [], { cwd: PROJECT_ROOT, shell: true, stdio: ['ignore', 'pipe', 'pipe'] });
                         registerChildProcess(child);
+                        // Se a tarefa for cancelada/abortada, mata o processo imediatamente
+                        // (antes era preciso esperar os 30s do killTimer ou um kill global).
+                        const onAbort = () => killChildTree(child);
+                        if (_currentAgentSignal && !_currentAgentSignal.aborted) {
+                            _currentAgentSignal.addEventListener('abort', onAbort, { once: true });
+                        }
                         const killTimer = setTimeout(() => killChildTree(child), 30000);
                         child.stdout.on('data', (d) => {
                             const text = d.toString();
@@ -674,8 +680,8 @@ async function executeAgentTool(name, args) {
                             agentStreamCallback('Sistema', text);
                         });
                         const code = await new Promise((resolve) => {
-                            child.on('close', (c) => { clearTimeout(killTimer); resolve(c); });
-                            child.on('error', () => { clearTimeout(killTimer); resolve(-1); });
+                            child.on('close', (c) => { clearTimeout(killTimer); if (_currentAgentSignal) _currentAgentSignal.removeEventListener('abort', onAbort); resolve(c); });
+                            child.on('error', () => { clearTimeout(killTimer); if (_currentAgentSignal) _currentAgentSignal.removeEventListener('abort', onAbort); resolve(-1); });
                         });
                         const output = chunks.join('').slice(0, 10000);
                         return code === 0 ? (output || '(sem saída)') : `Erro (código ${code}): ${output.slice(0, 2000)}`;

@@ -680,9 +680,16 @@ syncOpenCodeProviderAuth();
 
 function saveConfigToFile() {
     let existing = {};
+    let readFailed = false;
     try {
         if (fs.existsSync(configPath)) existing = JSON.parse(fs.readFileSync(configPath, 'utf-8'));
-    } catch (e) {}
+    } catch (e) {
+        // Se o arquivo existe mas não pôde ser lido/parseado, NÃO sobrescreva:
+        // um save subsequente gravaria chaves vazias por cima das criptografadas.
+        readFailed = true;
+        logError('json-parse', 'Falha ao ler config.json antes do save — preservando arquivo', e.message);
+    }
+    if (readFailed) return;
 
     // Se a chave em memória ficou vazia (ex.: secret divergente na carga),
     // preserva o valor criptografado já existente em disco em vez de sobrescrever com vazio.
@@ -744,17 +751,17 @@ function resolveSafePath(relativePath) {
 
 // ===== VALIDAÇÃO DE COMANDOS DE SHELL (agente) =====
 // Bloqueia encadeamento de comandos, redirecionamentos e substituição de
-// comando. Ignora conteúdo entre aspas para não quebrar argumentos legítimos.
+// comando. Valida o texto CRU (sem remover aspas): no Windows o spawn usa
+// cmd.exe, onde aspas simples são literais (não escapam | & ; ...) e até as
+// aspas duplas têm comportamento inconsistente. Remover o conteúdo entre
+// aspas permitiria `echo 'a | whoami'` executar o pipe — injeção real.
 // Retorna null se o comando for seguro ou uma mensagem de erro caso contrário.
 function validateAgentCommand(cmd) {
     const trimmed = String(cmd || '').trim();
     if (!trimmed) return 'Comando vazio';
-    const stripped = trimmed.replace(/"(?:[^"\\]|\\.)*"|'(?:[^'\\]|\\.)*'/g, '""');
     if (/[\r\n]/.test(trimmed)) return 'Comando bloqueado: quebras de linha não são permitidas';
-    if (/[;|`]/.test(stripped)) return 'Comando bloqueado: separadores ; | ` não são permitidos';
-    if (/&/.test(stripped)) return 'Comando bloqueado: encadeamento (&) não é permitido';
-    if (/[<>]/.test(stripped)) return 'Comando bloqueado: redirecionamento (>) não é permitido';
-    if (/\$\s*\(|\$\{/.test(stripped)) return 'Comando bloqueado: substituição de comando não é permitida';
+    if (/[;|`&<>]/.test(trimmed)) return 'Comando bloqueado: separadores/redirecionamento ; | ` & < > não são permitidos';
+    if (/\$\s*\(|\$\{/.test(trimmed)) return 'Comando bloqueado: substituição de comando não é permitida';
     return null;
 }
 
@@ -1071,8 +1078,8 @@ async function callGemini(prompt, onChunk, signal, forcedModel) {
 
     const useStream = !!onChunk;
     const url = useStream
-        ? `https://generativelanguage.googleapis.com/v1beta/models/${model}:streamGenerateContent?alt=sse&key=${apiKey}`
-        : `https://generativelanguage.googleapis.com/v1beta/models/${model}:generateContent?key=${apiKey}`;
+        ? `https://generativelanguage.googleapis.com/v1beta/models/${model}:streamGenerateContent?alt=sse`
+        : `https://generativelanguage.googleapis.com/v1beta/models/${model}:generateContent`;
 
     const parts = [];
 
@@ -1092,7 +1099,7 @@ async function callGemini(prompt, onChunk, signal, forcedModel) {
 
     const response = await fetchWithTimeout(url, {
         method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
+        headers: { 'Content-Type': 'application/json', 'x-goog-api-key': apiKey },
         body: safeJsonStringify({
             contents: [{ parts }]
         })
@@ -1818,7 +1825,7 @@ async function ensureOpenCodeServer() {
     });
     opencodeServerProcess.stderr.on('data', (d) => console.log(`[opencode server] ${d.toString().trim()}`));
     await new Promise((resolve, reject) => {
-        const timeout = setTimeout(() => reject(new Error('Timeout opencode server')), 20000);
+        const timeout = setTimeout(() => { clearInterval(check); reject(new Error('Timeout opencode server')); }, 20000);
         const check = setInterval(async () => {
             try {
                 const resp = await fetch(`http://127.0.0.1:${opencodeServerPort}/health`);
@@ -3196,6 +3203,7 @@ function formatRelevantFiles(files) {
 }
 
 let agentStreamCallback = null;
+let agentStreamCallbackOwner = null;
 let _pendingImages = null;
 let _activeChildProcesses = [];
 let _lastProjectSnapshot = null;
@@ -3282,7 +3290,19 @@ function restoreProjectSnapshot() {
     return { count, files };
 }
 
-function setAgentStreamCallback(cb) { agentStreamCallback = cb; }
+function setAgentStreamCallback(cb, ws) {
+    agentStreamCallback = cb;
+    agentStreamCallbackOwner = ws || null;
+}
+// Limpa o callback global apenas se a conexão que terminou ainda é a dona.
+// Sem isto, o callback da aba A continuava recebendo chunks/tool-events de
+// tarefas de outras abas depois que A já tinha concluído.
+function clearAgentStreamCallback(ws) {
+    if (!ws || agentStreamCallbackOwner === ws) {
+        agentStreamCallback = null;
+        agentStreamCallbackOwner = null;
+    }
+}
 function setPendingImages(images) { _pendingImages = images; }
 function clearPendingImages() { _pendingImages = null; }
 
@@ -4450,6 +4470,10 @@ app.post('/api/run', async (req, res) => {
     if (!command || typeof command !== 'string') {
         return res.status(400).json({ error: 'Comando não especificado' });
     }
+    const cmdError = validateAgentCommand(command);
+    if (cmdError) {
+        return res.status(400).json({ error: cmdError });
+    }
 
     const broadcastRun = (line) => {
         const payload = JSON.stringify({ type: 'run-output', line });
@@ -4494,6 +4518,8 @@ app.post('/api/shell/start', (req, res) => {
 app.post('/api/shell/send', (req, res) => {
     const { command } = req.body || {};
     if (!command) return res.status(400).json({ error: 'Comando vazio' });
+    const cmdError = validateAgentCommand(command);
+    if (cmdError) return res.status(400).json({ error: cmdError });
     try {
         const result = runner.sendToShell(command);
         res.json(result);
@@ -6971,6 +6997,14 @@ wss.on('connection', (ws, req) => {
         if (data.type === 'stream') {
             const { message: task, projectPath, history } = data;
 
+            // Guard contra tarefa concorrente: se já há uma tarefa ativa nesta
+            // conexão, recusa a nova em vez de sobrescrever o streamController e
+            // orfanar a anterior (que não poderia mais ser cancelada).
+            if (ws._taskActive || streamController) {
+                ws.send(JSON.stringify({ type: 'error', content: '❌ Uma tarefa já está em execução nesta aba. Aguarde concluir ou cancele antes de enviar outra.' }));
+                return;
+            }
+
             if (projectPath) {
                 setProjectRoot(projectPath);
             }
@@ -6980,7 +7014,7 @@ wss.on('connection', (ws, req) => {
 
             const onChunk = buildWsOnChunk(ws);
 
-            setAgentStreamCallback(onChunk);
+            setAgentStreamCallback(onChunk, ws);
             ws._taskActive = true;
 
             try {
@@ -7441,6 +7475,12 @@ wss.on('connection', (ws, req) => {
                 _lastProjectFileList = null;
                 _awaitingUserAnswer = false;
                 clearTaskKeepalive();
+                // Sem isto, o watchdog de 8min ficava armado após cada tarefa e
+                // um 'cancel' posterior encontrava streamController ainda não-nulo,
+                // enviando um falso {type:'cancelled'}. Limpa tudo aqui.
+                clearTaskWatchdog();
+                streamController = null;
+                clearAgentStreamCallback(ws);
             }
             return;
         }
@@ -7465,11 +7505,19 @@ wss.on('connection', (ws, req) => {
                     clearTaskWatchdog();
                     logError('plan-execute', error.message, task ? task.slice(0, 300) : '');
                     ws.send(JSON.stringify({ type: 'error', content: '❌ ' + (error.message || 'Erro na execução') }));
+                } finally {
+                    // Sem isto, o keepalive ({type:'progress'} a cada 10s) e o watchdog
+                    // de 8min continuavam rodando para sempre após o sucesso, spamando
+                    // o cliente indefinidamente. Limpa os timers e libera a conexão.
+                    clearTaskWatchdog();
+                    streamController = null;
+                    ws._taskActive = false;
+                    clearAgentStreamCallback(ws);
                 }
                 return;
             }
 
-            setAgentStreamCallback(onChunk);
+            setAgentStreamCallback(onChunk, ws);
             ws._taskActive = true;
 
             try {
@@ -7628,6 +7676,7 @@ wss.on('connection', (ws, req) => {
                 ws._taskActive = false;
                 _lastProjectSnapshot = null;
                 _lastProjectFileList = null;
+                clearAgentStreamCallback(ws);
             }
         }
     });
@@ -7644,6 +7693,7 @@ wss.on('connection', (ws, req) => {
         ws._taskActive = false;
         _lastProjectSnapshot = null;
         _lastProjectFileList = null;
+        clearAgentStreamCallback(ws);
     });
 });
 

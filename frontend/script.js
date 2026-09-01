@@ -1565,6 +1565,18 @@ function handleWsMessage(data) {
         return;
     }
 
+    if (data.type === 'undo-done') {
+        // Evento ignorado antes — os botões de undo/redo só atualizavam no
+        // próximo 'done' ou no poll de 15s. Agora atualiza imediatamente.
+        try { updateUndoRedoButtons(); } catch (e) { console.error('updateUndoRedoButtons error:', e); }
+        return;
+    }
+
+    if (data.type === 'redo-done') {
+        try { updateUndoRedoButtons(); } catch (e) { console.error('updateUndoRedoButtons error:', e); }
+        return;
+    }
+
     if (data.type === 'cancelled') {
         if (concludeTimer) { clearTimeout(concludeTimer); concludeTimer = null; }
         taskConcluded = true;
@@ -3226,7 +3238,7 @@ function filterAndShowAutocomplete(query) {
         const item = document.createElement('div');
         item.className = 'autocomplete-item';
         const dir = f.path.includes('/') ? f.path.substring(0, f.path.lastIndexOf('/')) : '';
-        item.innerHTML = `<span class="ac-icon">${f.icon}</span>${f.name}<span class="ac-path">${dir}</span>`;
+        item.innerHTML = `<span class="ac-icon">${escapeHtml(f.icon)}</span>${escapeHtml(f.name)}<span class="ac-path">${escapeHtml(dir)}</span>`;
         item.addEventListener('click', () => selectAcItem(f));
         dropdown.appendChild(item);
     }
@@ -3509,7 +3521,7 @@ function renderAttachments() {
         const file = attachedFiles[i];
         const chip = document.createElement('span');
         chip.className = 'attachment-chip';
-        chip.innerHTML = `${file.type === 'image' ? '🖼️' : '📄'} ${file.name} <span class="remove-attach" data-idx="${i}">×</span>`;
+        chip.innerHTML = `${file.type === 'image' ? '🖼️' : '📄'} ${escapeHtml(file.name)} <span class="remove-attach" data-idx="${i}">×</span>`;
         chip.querySelector('.remove-attach').addEventListener('click', function(e) {
             e.stopPropagation();
             attachedFiles.splice(i, 1);
@@ -3965,6 +3977,12 @@ function renderActiveTab() {
 function closeTab(filePath) {
     const idx = editorTabs.findIndex(t => t.path === filePath);
     if (idx < 0) return;
+    const tab = editorTabs[idx];
+    // Não descarta edições não salvas sem aviso
+    if (tab && tab.dirty) {
+        const confirmar = confirm('Este arquivo tem alterações não salvas. Descartar mesmo assim?');
+        if (!confirmar) return;
+    }
     disposeMonacoModel(filePath);
     editorTabs.splice(idx, 1);
     if (activeTabPath === filePath) {
@@ -3990,6 +4008,11 @@ function refreshTabIfOpen(filePath) {
 function reloadActiveTab() {
     if (!activeTabPath) return;
     const tab = editorTabs.find(t => t.path === activeTabPath);
+    // Recarregar descarta as edições não salvas — pede confirmação
+    if (tab && tab.dirty) {
+        const confirmar = confirm('Este arquivo tem alterações não salvas. Recarregar do disco e descartá-las?');
+        if (!confirmar) return;
+    }
     if (tab) { tab.loaded = false; tab.dirty = false; }
     loadTabContent(activeTabPath);
 }
@@ -5493,10 +5516,10 @@ function renderTerminal() {
         var detailAttr = hasDetail ? ' onclick="this.classList.toggle(\'expanded\')" style="cursor:pointer;"' : '';
         html += '<div class="term-line ' + cls + '"' + detailAttr + '>';
         if (l.icon) html += '<span class="term-icon">' + l.icon + '</span>';
-        html += '<span class="term-body">' + (l.text || '') + '</span>';
+        html += '<span class="term-body">' + escapeHtml(l.text || '') + '</span>';
         if (timeStr) html += '<span class="term-time">' + timeStr + '</span>';
         html += '</div>';
-        if (hasDetail) html += '<div class="term-detail">' + l.detail + '</div>';
+        if (hasDetail) html += '<div class="term-detail">' + escapeHtml(l.detail) + '</div>';
     }
     el.innerHTML = html;
     el.scrollTop = el.scrollHeight;
@@ -5680,6 +5703,16 @@ function computeDiffFrontend(before, after) {
     if (a.length === 1 && a[0] === '') a.pop();
     if (b.length === 1 && b[0] === '') b.pop();
     const n = a.length, m = b.length;
+    // Guard de tamanho: a matriz LCS é O(n·m) e pode congelar a UI em arquivos
+    // grandes. Acima do teto, devolve um diff "tudo removido + tudo adicionado",
+    // suficiente para o usuário ver o que mudou sem travar o renderer.
+    const MAX_DIFF_LINES = 800;
+    if (n * m > MAX_DIFF_LINES * MAX_DIFF_LINES) {
+        const out = [];
+        for (let i = 0; i < n; i++) out.push({ type: 'del', line: a[i], oldLine: i + 1 });
+        for (let j = 0; j < m; j++) out.push({ type: 'add', line: b[j], newLine: j + 1 });
+        return out;
+    }
     const dp = [];
     for (let i = 0; i <= n; i++) dp.push(new Array(m + 1).fill(0));
     for (let i = n - 1; i >= 0; i--) {
@@ -7615,7 +7648,16 @@ document.addEventListener('keydown', (e) => {
         'diffModal','testRunnerModal','terminalModal','folderPickerModal'];
     for (const id of modals) {
         const el = document.getElementById(id);
-        if (el && el.style.display === 'flex') { el.style.display = 'none'; return; }
+        if (el && el.style.display === 'flex') {
+            if (id === 'approvalModal') {
+                // Não apenas esconder: cancela o plano pendente no backend, senão
+                // ele fica aguardando resposta e um novo pedido colide com o órfão.
+                cancelApproval();
+            } else {
+                el.style.display = 'none';
+            }
+            return;
+        }
     }
 });
 
@@ -9294,10 +9336,10 @@ function renderLogs() {
         var color = colors[e.type] || '#8b949e';
         var time = e.ts.slice(11, 19);
         html += '<div style="margin-bottom:4px;border-bottom:1px solid #21262d;padding-bottom:4px;">';
-        html += '<span style="color:#484f58;">' + time + '</span> ';
-        html += '<span style="color:' + color + ';">[' + e.type + ']</span> ';
-        html += '<span style="color:#e6edf3;">' + e.message + '</span>';
-        if (e.details) html += '<div style="color:#8b949e;margin-left:12px;">' + e.details.slice(0, 200) + '</div>';
+        html += '<span style="color:#484f58;">' + escapeHtml(time) + '</span> ';
+        html += '<span style="color:' + color + ';">[' + escapeHtml(e.type || '') + ']</span> ';
+        html += '<span style="color:#e6edf3;">' + escapeHtml(e.message) + '</span>';
+        if (e.details) html += '<div style="color:#8b949e;margin-left:12px;">' + escapeHtml(e.details.slice(0, 200)) + '</div>';
         html += '</div>';
     }
     content.innerHTML = html;
