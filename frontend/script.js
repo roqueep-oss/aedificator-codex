@@ -1139,7 +1139,13 @@ function connectWebSocket() {
 
     ws.onmessage = (event) => {
         try {
-            handleWsMessage(JSON.parse(event.data));
+            // No multi-agente, roteia pelo dispatcher de sessão para isolar o
+            // estado por aba; sem multi-agente, processa direto.
+            if (typeof window.__agentRouter === 'function') {
+                window.__agentRouter(event.data);
+            } else {
+                handleWsMessage(JSON.parse(event.data));
+            }
         } catch (e) {
             console.error('❌ Erro ao processar mensagem:', e);
         }
@@ -5206,10 +5212,11 @@ function endTask(toastMsg) {
 }
 
 // O cancelamento precisa ir no MESMO socket da sessão que está transmitindo a
-// tarefa. No multi-agente, o stream roda no ws da sessão (window.ws via syncState),
-// e não no ws lexical do connectWebSocket — enviar no ws errado não interrompe nada.
+// tarefa. No multi-agente, cada sessão filha tem um socket próprio (s.ws); o
+// cancel deve ir nele, não no socket base do connectWebSocket.
 function getStreamingSocket() {
-    if (typeof window !== 'undefined' && window.ws && window.ws.readyState === WebSocket.OPEN) return window.ws;
+    var sess = (typeof getAgentSession === 'function') ? getAgentSession() : null;
+    if (sess && sess.ws && sess.ws.readyState === WebSocket.OPEN) return sess.ws;
     if (ws && ws.readyState === WebSocket.OPEN) return ws;
     return null;
 }

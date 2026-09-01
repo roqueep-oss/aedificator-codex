@@ -7,7 +7,9 @@
   },
   "globals": {
     "monaco": "readonly",
-    "marked": "readonly"
+    "marked": "readonly",
+    "getAgentSession": "readonly",
+    "__agentRouter": "readonly"
   },
   "parserOptions": {
     "ecmaVersion": 2022,

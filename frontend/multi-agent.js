@@ -1,6 +1,7 @@
 // =============================================
 //  MULTI-AGENTE — agentes paralelos com estado isolado
 // =============================================
+/* eslint-disable no-global-assign -- o propósito deste arquivo é trocar os bindings globais (declarados com `let` no top-level do script.js) quando o usuário alterna de aba. `window.X = ...` NÃO troca bindings `let`; a atribuição direta é a única forma em scripts clássicos. */
 /* global sendStreamingMessage, endTask, WS_URL, handleWsMessage, isStreaming, agentMessages, agentDivIds, agentCounter, pendingApproval, BACKEND_URL, BACKEND_TOKEN */
 (function() {
     function AgentSession(id, label) {
@@ -26,25 +27,35 @@
     function syncState() {
         var s = sessions[activeId];
         if (!s) return;
-        _streamingMessageFn = sendStreamingMessage;
-        _endTaskFn = endTask;
-        window.sendStreamingMessage = s.streamingMessageProxy.bind(s);
-        window.endTask = s.endTaskProxy.bind(s);
-        window.isStreaming = s.streaming;
-        window.agentMessages = s.agentMessages;
-        window.agentDivIds = s.agentDivIds;
-        window.agentCounter = s.agentCounter;
-        window.pendingApproval = s.pendingApproval;
-        if (s.ws && s.ws.readyState === WebSocket.OPEN) window.ws = s.ws;
+        if (!_streamingMessageFn) _streamingMessageFn = sendStreamingMessage;
+        if (!_endTaskFn) _endTaskFn = endTask;
+        if (s.id === '0') {
+            // Sessão principal: usa as funções e o socket originais do script.js.
+            sendStreamingMessage = _streamingMessageFn;
+            endTask = _endTaskFn;
+        } else {
+            // Sessões filhas: enviam pelo socket próprio e trocam o estado.
+            // ATENÇÃO: `window.X = ...` NÃO troca bindings `let` declarados no
+            // top-level do script.js (eles vivem no escopo lexical global, não
+            // no objeto window). A atribuição direta (sem `window.`) é que troca
+            // — é por isso que antes as abas compartilhavam estado por engano.
+            sendStreamingMessage = s.streamingMessageProxy.bind(s);
+            endTask = s.endTaskProxy.bind(s);
+        }
+        isStreaming = s.streaming;
+        agentMessages = s.agentMessages;
+        agentDivIds = s.agentDivIds;
+        agentCounter = s.agentCounter;
+        pendingApproval = s.pendingApproval;
     }
 
     function restoreGlobals() {
-        if (_streamingMessageFn) window.sendStreamingMessage = _streamingMessageFn;
-        if (_endTaskFn) window.endTask = _endTaskFn;
+        if (_streamingMessageFn) sendStreamingMessage = _streamingMessageFn;
+        if (_endTaskFn) endTask = _endTaskFn;
     }
 
     AgentSession.prototype.streamingMessageProxy = function(msg) {
-        var s = sessions[activeId];
+        var s = this;
         if (!s) return;
         if (msg.type === 'execute' || msg.type === 'stream') s.taskActive = true;
         if (msg && typeof msg === 'object' && !msg.token && typeof BACKEND_TOKEN !== 'undefined') msg.token = BACKEND_TOKEN;
@@ -77,6 +88,14 @@
             if (activeId === s.id) restoreGlobals();
         }
     }
+
+    // Roteia as mensagens do socket base (connectWebSocket) para a sessão
+    // ATIVA — a que o usuário está vendo. Sem isto, o ws base chamava
+    // handleWsMessage sem trocar o contexto, corrompendo o estado da sessão.
+    window.__agentRouter = function(rawData) {
+        var s = sessions[activeId];
+        if (s) handleSessionMessage(s, { data: rawData });
+    };
 
     // Se a conexão cai no meio de uma tarefa, a UI não pode ficar presa em
     // "Enviando.../Executando" esperando um 'done' que nunca chegará.
@@ -129,12 +148,11 @@
         var ids = Object.keys(sessions).map(Number);
         var nextId = String(Math.max.apply(null, ids) + 1);
         saveState();
-        var s = sessions[nextId] = new AgentSession(nextId, 'Agente ' + (parseInt(nextId) + 1));
+        var s = new AgentSession(nextId, 'Agente ' + (parseInt(nextId) + 1));
+        sessions[nextId] = s;
         addTab(nextId, 'Agente ' + (parseInt(nextId) + 1));
-        s.ws = new WebSocket(WS_URL);
-        s.ws.onopen = function() {};
-        s.ws.onmessage = function(e) { handleSessionMessage(s, e); };
-        s.ws.onclose = function() { handleSessionClose(s); };
+        // Socket criado sob demanda no primeiro envio (streamingMessageProxy),
+        // não aqui — evita abrir WebSocket ocioso para cada aba criada.
         switchAgent(nextId);
     }
 
