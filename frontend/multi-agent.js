@@ -97,10 +97,15 @@
     // Roteia as mensagens do socket base (connectWebSocket) para a sessão
     // ATIVA — a que o usuário está vendo. Sem isto, o ws base chamava
     // handleWsMessage sem trocar o contexto, corrompendo o estado da sessão.
-    window.__agentRouter = function(rawData) {
-        var s = sessions[activeId];
-        if (s) handleSessionMessage(s, { data: rawData });
-    };
+    // Só é definido quando há MÚLTIPLAS sessões (após o primeiro spawnAgent);
+    // com uma sessão única o fluxo usa handleWsMessage direto (comportamento
+    // original), evitando a troca de contexto que atrapalhava o streaming.
+    function enableAgentRouter() {
+        window.__agentRouter = function(rawData) {
+            var s = sessions[activeId];
+            if (s) handleSessionMessage(s, { data: rawData });
+        };
+    }
 
     // Se a conexão cai no meio de uma tarefa, a UI não pode ficar presa em
     // "Enviando.../Executando" esperando um 'done' que nunca chegará.
@@ -146,7 +151,9 @@
 
         sessions['0'] = new AgentSession('0', 'Agente 1');
         addTab('0', 'Agente 1');
-        syncState();
+        // NÃO ativa o router nem troca bindings na sessão única: com uma aba só,
+        // o fluxo usa handleWsMessage direto (comportamento original). O router
+        // é ativado no primeiro spawnAgent, quando há estado a isolar.
     }
 
     function spawnAgent() {
@@ -156,6 +163,9 @@
         var s = new AgentSession(nextId, 'Agente ' + (parseInt(nextId) + 1));
         sessions[nextId] = s;
         addTab(nextId, 'Agente ' + (parseInt(nextId) + 1));
+        // Primeira sessão filha: a partir daqui há estado a isolar por aba, então
+        // ativa o roteamento do socket base para a sessão ativa.
+        if (nextId === '1') enableAgentRouter();
         // Socket criado sob demanda no primeiro envio (streamingMessageProxy),
         // não aqui — evita abrir WebSocket ocioso para cada aba criada.
         switchAgent(nextId);
@@ -205,6 +215,12 @@
         var tab = document.querySelector('#agentTabs [data-agent="' + id + '"]');
         if (tab) tab.remove();
         delete sessions[id];
+        // Voltou a uma sessão única: desativa o roteamento e restaura o fluxo
+        // original (handleWsMessage direto, sem troca de contexto por aba).
+        if (Object.keys(sessions).length <= 1) {
+            window.__agentRouter = undefined;
+            restoreGlobals();
+        }
         if (activeId === id) switchAgent('0');
     }
 

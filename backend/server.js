@@ -838,6 +838,22 @@ function buildFallbackSugestoes(task, aiText) {
     };
 }
 
+// Detecta se as sugestões retornadas pelo analyzeTask são uma PERGUNTA de
+// clarificação (FORMATO A: "preciso de uma informação") em vez de opções de
+// implementação. Nesse caso o modo Opções deve gerar as 4 opções de fallback,
+// senão o usuário vê uma única "opção" genérica que é só a pergunta do modelo.
+function isClarificationSugestoes(sugestoes, resumo) {
+    if (!Array.isArray(sugestoes)) return false;
+    if (sugestoes.length === 0) return false;
+    const allEmpty = sugestoes.every(s => !Array.isArray(s.arquivos) || s.arquivos.length === 0);
+    if (!allEmpty) return false;
+    const sum = (resumo || '').toLowerCase();
+    const pergunta = /preciso de uma informa|qual área|o que você quer|qual tipo|dúvida|pergunta|gostaria de saber|preciso saber|não ficou claro|ambígu|vago|escolha entre/i.test(sum);
+    // FORMATO A: id tipo "q1" (pergunta) OU resumo indicando pedido de info
+    const hasQuestionId = sugestoes.some(s => /^q\d+$/i.test(String(s.id || '')));
+    return hasQuestionId || pergunta;
+}
+
 function writeFileContent(filePath, content) {
     try {
         const fullPath = resolveSafePath(filePath);
@@ -7403,6 +7419,19 @@ wss.on('connection', (ws, req) => {
                     hasSugestoes = true;
                 }
 
+                // Modo Opções: se o modelo respondeu com uma PERGUNTA de
+                // clarificação (FORMATO A) em vez de opções reais, gera as 4
+                // opções de fallback. Antes, a pergunta aparecia como uma única
+                // "opção" genérica e o usuário não tinha escolha real.
+                if (hasSugestoes && !hasArquivos && isClarificationSugestoes(plan.sugestoes, plan.resumo)) {
+                    console.log('[ws:plan] analyzeTask retornou pergunta — gerando opções de fallback');
+                    const fallback = buildFallbackSugestoes(task, plan.resumo);
+                    if (onChunk) onChunk('Sistema', '📋 Gerando opções padrão...\n');
+                    plan.resumo = fallback.resumo;
+                    plan.sugestoes = fallback.sugestoes;
+                    plan.arquivos = [];
+                }
+
                 const planId = crypto.randomBytes(8).toString('hex');
                 pendingPlan = { id: planId, plan, controller: streamController, task, provider };
 
@@ -7743,7 +7772,7 @@ readFileContent, listBackups, analyzeTask, executePlan, executeAgentTool, parseJ
 snapshotProjectFiles, diffSnapshots, computeDiff, parseRemoteUrl, nextVersion, detectRepo, latestVersionTag, runner, formatCode, 
 pushUndoState, undoStack, redoStack, trackTokens, calcCost, getModelPrice, getUsageReport, tokenUsage, listDirectory, 
 getAllFiles, logError, getProviderErrorHint, backupRelativePath, backupFromContent, backupFileBeforeChange, validateAgentCommand, 
-friendlyOpenCodeError, friendlyProviderError, sanitizeClientError, callAIWithFallback, isFallbackEligibleError, safeValidate: analyzer.safeValidate };
+friendlyOpenCodeError, friendlyProviderError, sanitizeClientError, isClarificationSugestoes, callAIWithFallback, isFallbackEligibleError, safeValidate: analyzer.safeValidate };
 
 // =============================================
 let mcpConfigs = [];

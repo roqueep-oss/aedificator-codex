@@ -246,6 +246,30 @@ test('sanitizeClientError não vaza caminhos internos e traduz erros comuns', ()
     assert.ok(sanitizeClientError(new Error('x'.repeat(2000))).length <= 501, 'mensagens longas truncadas');
 });
 
+test('isClarificationSugestoes detecta pergunta do analyzeTask (FORMATO A)', () => {
+    const { isClarificationSugestoes } = require(SERVER_PATH);
+    // FORMATO A: id "q1" e arquivos vazios → pergunta de clarificação
+    assert.strictEqual(isClarificationSugestoes(
+        [{ id: 'q1', titulo: 'Pergunta', descricao: 'O que você quer?', arquivos: [] }],
+        'Preciso de uma informação'
+    ), true, 'FORMATO A deve ser detectado como clarificação');
+    // Resumo indicando ambiguidade
+    assert.strictEqual(isClarificationSugestoes(
+        [{ id: 'x', titulo: 'Opção', arquivos: [] }],
+        'Sua solicitação está genérica. Qual área devo melhorar?'
+    ), true, 'resumo ambíguo deve ser detectado');
+    // FORMATO B: 4 opções reais com arquivos → NÃO é clarificação
+    assert.strictEqual(isClarificationSugestoes(
+        [
+            { id: 's1', titulo: 'Opção A', arquivos: [{ caminho: 'a.js' }] },
+            { id: 's2', titulo: 'Opção B', arquivos: [{ caminho: 'b.js' }] }
+        ],
+        'Resumo do plano'
+    ), false, 'FORMATO B com arquivos não é clarificação');
+    // Sugestões vazias → não é clarificação
+    assert.strictEqual(isClarificationSugestoes([], 'x'), false, 'lista vazia não é clarificação');
+});
+
 test('backup functions são consistentes e não duplicam lógica', async (t) => {
     const { backupRelativePath, backupFromContent, backupFileBeforeChange, setProjectRoot } = require(SERVER_PATH);
     const PROJECT_ROOT = fs.mkdtempSync(path.join(os.tmpdir(), 'aedificator-backup-test-'));
