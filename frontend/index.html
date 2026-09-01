@@ -1320,6 +1320,29 @@
             display: flex;
             gap: 8px;
         }
+        .input-area textarea {
+            flex: 1;
+            padding: 8px 14px;
+            background: #0d1117;
+            border: 1px solid #30363d;
+            border-radius: 6px;
+            color: #e6edf3;
+            font-size: 13px;
+            outline: none;
+            resize: none;
+            min-height: 40px;
+            max-height: 150px;
+            overflow-y: auto;
+            font-family: inherit;
+            line-height: 1.4;
+            transition: 0.2s;
+        }
+        .input-area textarea:focus {
+            border-color: #58a6ff;
+        }
+        .input-area textarea::placeholder {
+            color: #484f58;
+        }
         .input-area input {
             flex: 1;
             padding: 8px 14px;
@@ -2298,6 +2321,17 @@ body.theme-light .chat-area,
         body.theme-light .input-area {
             border-top-color: #d0d7de;
             background: #ffffff;
+        }
+        body.theme-light .input-area textarea {
+            background: #ffffff;
+            border-color: #d0d7de;
+            color: #1f2328;
+        }
+        body.theme-light .input-area textarea:focus {
+            border-color: #0969da;
+        }
+        body.theme-light .input-area textarea::placeholder {
+            color: #8c959f;
         }
         body.theme-light .input-area input {
             background: #ffffff;
@@ -3360,7 +3394,7 @@ body.theme-light .chat-area,
                 padding: 6px 12px;
                 max-width: 95%;
             }
-            .input-area input {
+            .input-area input, .input-area textarea {
                 font-size: 12px;
                 padding: 6px 10px;
             }
@@ -3770,7 +3804,7 @@ body.theme-light .chat-area,
             <div class="input-area">
                 <span class="agent-status-chip" id="agentStatusChip" style="display:none;margin:0 0 4px;"><span class="chip-dot"></span><span id="agentStatusChipText">🤖 IA trabalhando</span></span>
                 <div class="input-row">
-                    <input type="text" id="chatInput" placeholder="Digite seu comando... (@ para referenciar arquivos, / para comandos)">
+                    <textarea id="chatInput" rows="1" placeholder="Digite seu comando... (@ para referenciar arquivos, / para comandos)"></textarea>
                     <div class="autocomplete-dropdown" id="autocompleteDropdown"></div>
                     <div class="autocomplete-dropdown" id="slashDropdown"></div>
                     <button id="sendButton" onclick="sendMessage()">Enviar</button>

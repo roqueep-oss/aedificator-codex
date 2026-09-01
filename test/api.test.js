@@ -226,6 +226,26 @@ test('isFallbackEligibleError identifica erros de créditos/quota para fallback'
     assert.strictEqual(isFallbackEligibleError(new Error('File not found: x.js')), false);
 });
 
+test('sanitizeClientError não vaza caminhos internos e traduz erros comuns', () => {
+    const { sanitizeClientError, setProjectRoot } = require(SERVER_PATH);
+    const PROJECT_ROOT = fs.mkdtempSync(path.join(os.tmpdir(), 'aedificator-sanitize-test-'));
+    setProjectRoot(PROJECT_ROOT);
+    // Caminho absoluto do projeto removido da mensagem
+    const leaked = sanitizeClientError(new Error(`ENOENT: no such file at ${PROJECT_ROOT}\\backend\\x.js`));
+    assert.ok(!leaked.includes(PROJECT_ROOT), 'caminho absoluto não deve vazar');
+    assert.ok(!/enoent|no such file/i.test(leaked), 'erro de arquivo deve ser traduzido');
+    assert.match(leaked, /Erro de arquivo/);
+    // Erro de rede
+    assert.match(sanitizeClientError(new Error('fetch failed: ECONNREFUSED')), /Falha de conexão/);
+    // Créditos/quota
+    assert.match(sanitizeClientError(new Error('402 Insufficient Balance')), /Limite de uso/);
+    // Autenticação
+    assert.match(sanitizeClientError(new Error('Unauthorized 401')), /Falha de autenticação/);
+    // Erro desconhecido sem caminhos é preservado (truncado se longo)
+    assert.strictEqual(sanitizeClientError(new Error('algo estranho')), 'algo estranho');
+    assert.ok(sanitizeClientError(new Error('x'.repeat(2000))).length <= 501, 'mensagens longas truncadas');
+});
+
 test('backup functions são consistentes e não duplicam lógica', async (t) => {
     const { backupRelativePath, backupFromContent, backupFileBeforeChange, setProjectRoot } = require(SERVER_PATH);
     const PROJECT_ROOT = fs.mkdtempSync(path.join(os.tmpdir(), 'aedificator-backup-test-'));
@@ -299,4 +319,31 @@ test('validação de caminho segura (resolveSafePath) bloqueia escape', () => {
     assert.ok(seguro !== null && seguro.includes('test-file.txt'), 'arquivo dentro do projeto deve ser permitido');
 
     assert.ok(true, 'resolveSafePath bloqueia path traversal');
+});
+
+test('resolveSafePath bloqueia symlink que aponta para fora do projeto', async (t) => {
+    const { resolveSafePath, setProjectRoot } = require(SERVER_PATH);
+    // Diretório externo "vítima" com conteúdo sensível
+    const outside = fs.mkdtempSync(path.join(os.tmpdir(), 'aedificator-outside-'));
+    fs.writeFileSync(path.join(outside, 'secret.txt'), 'secreto');
+    // Projeto de teste com um symlink para fora
+    const projectRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'aedificator-symlink-'));
+    setProjectRoot(projectRoot);
+    let symlinkCreated = true;
+    try {
+        fs.symlinkSync(outside, path.join(projectRoot, 'vitima'), process.platform === 'win32' ? 'junction' : 'dir');
+    } catch (e) {
+        symlinkCreated = false; // sem privilégio/FS que suporte symlink
+    }
+    if (!symlinkCreated) {
+        t.skip('FS não suporta criação de symlink');
+        return;
+    }
+    // Acessar via o symlink NÃO pode escapar do projeto
+    assert.strictEqual(resolveSafePath('vitima/secret.txt'), null, 'symlink para fora deve ser bloqueado');
+    assert.strictEqual(resolveSafePath('vitima'), null, 'leitura do diretório-symlink deve ser bloqueada');
+    // Caminho comum dentro do projeto continua permitido
+    fs.writeFileSync(path.join(projectRoot, 'ok.txt'), 'ok');
+    const ok = resolveSafePath('ok.txt');
+    assert.ok(ok !== null && ok.includes('ok.txt'), 'arquivo normal dentro do projeto segue permitido');
 });

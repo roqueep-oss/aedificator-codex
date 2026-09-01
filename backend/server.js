@@ -746,6 +746,24 @@ function resolveSafePath(relativePath) {
     if (resolved !== root && !resolved.startsWith(root + path.sep)) {
         return null;
     }
+    // Anti-symlink: um link dentro do projeto pode apontar para fora (ex.:
+    // project/victim -> C:\qualquer\lugar). A checagem de prefixo string não
+    // pega isso. Se o caminho (ou o ancestral existente mais próximo) resolver
+    // para um diretório fora do realpath do projeto, bloqueia.
+    try {
+        const realRoot = fs.realpathSync(root);
+        let probe = resolved;
+        while (probe && probe !== root && !fs.existsSync(probe)) {
+            probe = path.dirname(probe);
+        }
+        const realProbe = fs.realpathSync(probe || root);
+        if (realProbe !== realRoot && !realProbe.startsWith(realRoot + path.sep)) {
+            return null;
+        }
+    } catch (e) {
+        // Sem permissão/erro de realpath: mantém o comportamento de prefixo
+        // string (já validado acima).
+    }
     return resolved;
 }
 
@@ -1874,6 +1892,29 @@ function friendlyProviderError(provider, status, errorMsg) {
         return `Modelo ${provider.toUpperCase()} não encontrado. Selecione outro modelo.`;
     }
     return `${provider.toUpperCase()} erro: ${errorMsg || 'erro desconhecido'}`;
+}
+
+// Converte um erro interno em mensagem segura para exibir ao usuário: remove
+// caminhos absolutos do projeto, mapeia classes comuns (arquivo, rede, permissão,
+// provider) para texto amigável e trunca. O detalhe bruto fica no log do servidor.
+function sanitizeClientError(err) {
+    let msg = String((err && err.message) || err || 'Erro interno').trim();
+    const abs = path.resolve(PROJECT_ROOT || '.');
+    if (abs) msg = msg.split(abs).join('…');
+    const lower = msg.toLowerCase();
+    if (/enoent|eacces|eperm|eexist|eisdir|enotdir|no such file|permission denied|already exists/i.test(lower)) {
+        msg = 'Erro de arquivo: verifique se o caminho existe e as permissões estão corretas.';
+    } else if (/enetdown|econnrefused|econnreset|etimedout|eai_again|fetch failed|network error|socket hang up/i.test(lower)) {
+        msg = 'Falha de conexão com o servidor. Verifique sua internet e tente novamente.';
+    } else if (/quota|billing|credit|balance|insufficient|429|402/i.test(lower)) {
+        msg = 'Limite de uso do provedor atingido. Verifique seus créditos em Configurações.';
+    } else if (/unauthorized|401|api ?key|authentication/i.test(lower)) {
+        msg = 'Falha de autenticação. Verifique a chave API em Configurações.';
+    } else if (/unexpected server error|502|503|504|gateway/i.test(lower)) {
+        msg = 'O servidor do provedor está instável. Tente novamente em instantes.';
+    }
+    if (msg.length > 500) msg = msg.slice(0, 500) + '…';
+    return msg;
 }
 
 async function callOpenCode(prompt, onChunk, signal, model, onToolEvent) {
@@ -6673,7 +6714,7 @@ app.post('/api/chat', async (req, res) => {
             res.json({ success: true, response });
         }
     } catch (error) {
-        res.status(500).json({ error: error.message });
+        res.status(500).json({ error: sanitizeClientError(error) });
     }
 });
 
@@ -7450,7 +7491,7 @@ wss.on('connection', (ws, req) => {
                         : '⏹️ Tarefa cancelada';
                 } else {
                     type = 'error';
-                    content = `❌ ${error.message}`;
+                    content = `❌ ${sanitizeClientError(error)}`;
                     logError('agent-loop', error.message, task ? task.slice(0, 300) : '');
                     const alternatives = [];
                     if (config.gemini?.apiKey) alternatives.push('Gemini');
@@ -7504,7 +7545,7 @@ wss.on('connection', (ws, req) => {
                 } catch (error) {
                     clearTaskWatchdog();
                     logError('plan-execute', error.message, task ? task.slice(0, 300) : '');
-                    ws.send(JSON.stringify({ type: 'error', content: '❌ ' + (error.message || 'Erro na execução') }));
+                    ws.send(JSON.stringify({ type: 'error', content: '❌ ' + sanitizeClientError(error) }));
                 } finally {
                     // Sem isto, o keepalive ({type:'progress'} a cada 10s) e o watchdog
                     // de 8min continuavam rodando para sempre após o sucesso, spamando
@@ -7668,7 +7709,7 @@ wss.on('connection', (ws, req) => {
                     ws.send(JSON.stringify({ type: 'error', content: '⏰ A tarefa excedeu o tempo máximo (10 minutos) e foi interrompida. Tente novamente ou divida o pedido em etapas menores.' }));
                 } else if (!cancelled) {
                     logError('plan-execute', error.message, task ? task.slice(0, 300) : '');
-                    ws.send(JSON.stringify({ type: 'error', content: '❌ ' + (error.message || 'Erro na execução') }));
+                    ws.send(JSON.stringify({ type: 'error', content: '❌ ' + sanitizeClientError(error) }));
                 }
             } finally {
                 clearTaskWatchdog();
@@ -7702,7 +7743,7 @@ readFileContent, listBackups, analyzeTask, executePlan, executeAgentTool, parseJ
 snapshotProjectFiles, diffSnapshots, computeDiff, parseRemoteUrl, nextVersion, detectRepo, latestVersionTag, runner, formatCode, 
 pushUndoState, undoStack, redoStack, trackTokens, calcCost, getModelPrice, getUsageReport, tokenUsage, listDirectory, 
 getAllFiles, logError, getProviderErrorHint, backupRelativePath, backupFromContent, backupFileBeforeChange, validateAgentCommand, 
-friendlyOpenCodeError, friendlyProviderError, callAIWithFallback, isFallbackEligibleError, safeValidate: analyzer.safeValidate };
+friendlyOpenCodeError, friendlyProviderError, sanitizeClientError, callAIWithFallback, isFallbackEligibleError, safeValidate: analyzer.safeValidate };
 
 // =============================================
 let mcpConfigs = [];

@@ -687,8 +687,17 @@ document.addEventListener('DOMContentLoaded', () => {
     });
 
     document.getElementById('sendButton').addEventListener('click', sendMessage);
-    document.getElementById('chatInput').addEventListener('keypress', (e) => {
-        if (e.key === 'Enter') sendMessage();
+    document.getElementById('chatInput').addEventListener('keydown', (e) => {
+        if (e.key !== 'Enter') return;
+        if (e.shiftKey || e.ctrlKey) return; // Shift/Ctrl+Enter = nova linha
+        e.preventDefault();
+        sendMessage();
+    });
+    document.getElementById('chatInput').addEventListener('input', (e) => {
+        // Auto-resize do textarea multi-linha (até o teto definido no CSS)
+        const ta = e.target;
+        ta.style.height = 'auto';
+        ta.style.height = Math.min(ta.scrollHeight, 150) + 'px';
     });
     document.getElementById('chatInput').addEventListener('paste', (e) => {
         const items = e.clipboardData?.items;
@@ -5014,6 +5023,7 @@ function sendMessage() {
     if (message.startsWith('/run ')) {
         const cmd = message.slice(5).trim();
         input.value = '';
+        input.style.height = 'auto';
         if (!cmd) {
             showToast('⚠️ Uso: /run <comando>');
             return;
@@ -5028,6 +5038,7 @@ function sendMessage() {
     const firstLine = message.split('\n')[0].trim();
     if (firstLine.startsWith('/') && SLASH_COMMANDS.some(c => firstLine.toLowerCase().startsWith(c.cmd))) {
         input.value = '';
+        input.style.height = 'auto';
         executeSlashCommand(firstLine);
         return;
     }
@@ -5038,6 +5049,7 @@ function sendMessage() {
     }
 
     input.value = '';
+    input.style.height = 'auto';
     addMessage('user', message);
     const reactBtnNow = document.getElementById('reactFileBtn');
     if (reactBtnNow) reactBtnNow.style.display = 'none';
@@ -5471,6 +5483,7 @@ function clearPipeline() {
 let terminalLines = [];
 let terminalBlockStart = 0;
 let _terminalToolStarts = {};
+let _terminalRenderPending = false;
 
 function terminalAdd(type, text, meta) {
     if (!meta) meta = {};
@@ -5483,6 +5496,9 @@ function terminalAdd(type, text, meta) {
     if (type === 'block-start') { line.icon = '▣'; terminalBlockStart = now; }
     if (type === 'block-end') line.icon = '▣';
     terminalLines.push(line);
+    // Cap de memória: renderTerminal reconstrói todo o HTML; sem limite, sessões
+    // longas acumulam linhas sem fim e cada render fica mais lento.
+    if (terminalLines.length > 500) terminalLines.splice(0, terminalLines.length - 500);
     renderTerminal();
 }
 
@@ -5502,6 +5518,17 @@ function terminalFinishTool(id, status, errorDetail) {
 }
 
 function renderTerminal() {
+    // Coalesce múltiplas chamadas no mesmo frame (streams rápidos chamam
+    // terminalAdd várias vezes por frame); renderiza apenas uma vez por frame.
+    if (_terminalRenderPending) return;
+    _terminalRenderPending = true;
+    requestAnimationFrame(() => {
+        _terminalRenderPending = false;
+        _renderTerminalNow();
+    });
+}
+
+function _renderTerminalNow() {
     var el = document.getElementById('terminalOutput');
     if (!el) return;
     if (terminalLines.length === 0) {
@@ -8345,7 +8372,11 @@ function newTerminalSession() {
 
 function updateTerminalOutput(text) {
     const session = terminalSessions.find(s => s.id === activeTerminalSessionId);
-    if (session) session.output += text;
+    if (session) {
+        session.output += text;
+        // Cap de memória para sessões longas de terminal
+        if (session.output.length > 200000) session.output = session.output.slice(-200000);
+    }
 }
 
 // =============================================
