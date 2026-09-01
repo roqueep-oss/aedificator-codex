@@ -82,6 +82,11 @@
             var prev = activeId;
             activeId = s.id; syncState();
             handleWsMessage(JSON.parse(e.data));
+            // Persiste o que handleWsMessage modificou (pendingApproval,
+            // agentMessages, isStreaming, etc.) na sessão s ANTES de voltar.
+            // Sem isto, o syncState final sobrescrevia o pendingApproval do
+            // approval com o valor antigo → clicar em "Executar" não fazia nada.
+            saveState();
             activeId = prev; syncState();
             if (activeId === s.id) restoreGlobals();
         } catch (err) {
