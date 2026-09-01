@@ -33,7 +33,11 @@ const app = express();
 
 // ===== ORIGEM LOCAL (CORS restrito + proteção contra DNS rebinding) =====
 function isLocalOrigin(origin) {
-    if (!origin || origin === 'null') return true;
+    // Sem origin (ex.: curl/health checks) é aceito. `'null'` é rejeitado:
+    // iframes sandboxed/data: têm origin 'null' e não devem ser tratados como
+    // confiáveis (o token ainda é exigido, mas reduz o blast radius).
+    if (!origin) return true;
+    if (origin === 'null') return false;
     return /^https?:\/\/(localhost|127\.0\.0\.1)(:\d+)?$/i.test(origin);
 }
 
@@ -532,7 +536,16 @@ function loadTokenUsage() {
 }
 
 function saveTokenUsage() {
-    try { fs.writeFileSync(usagePath, JSON.stringify(tokenUsage), 'utf-8'); } catch (e) {}
+    // Write atômico (tmp + rename) como no pricing.json: tarefas concorrentes
+    // gravando ao mesmo tempo não corrompem o arquivo nem perdem atualizações.
+    const tmpFile = usagePath + '.tmp';
+    try {
+        fs.writeFileSync(tmpFile, JSON.stringify(tokenUsage), 'utf-8');
+        fs.renameSync(tmpFile, usagePath);
+    } catch (e) {
+        logError('json-parse', 'Erro ao salvar token_usage.json', e.message);
+        try { fs.rmSync(tmpFile, { force: true }); } catch (_) {}
+    }
 }
 
 function trackTokens(provider, inputTokens, outputTokens, isCacheHit, model, cacheTokens) {
@@ -2949,7 +2962,7 @@ app.post('/api/project/rules', (req, res) => {
         fs.writeFileSync(filePath, ((req.body.content || '').trim() || '') + '\n', 'utf-8');
         res.json({ success: true, path: AGENTS_FILE });
     } catch (e) {
-        res.status(500).json({ error: e.message });
+        res.status(500).json({ error: sanitizeClientError(e) });
     }
 });
 
@@ -3315,11 +3328,17 @@ function killAllChildProcesses() {
     }
 }
 
-function restoreProjectSnapshot() {
-    if (!_lastProjectSnapshot || !_lastProjectSnapshot.size) { _lastProjectFileList = null; return { count: 0, files: [] }; }
+function restoreProjectSnapshot(ws) {
+    // Contexto por conexão: se a tarefa registrou snapshot no ws, usa o dele;
+    // senão cai para o global (compatibilidade). Isto evita que o cancel de uma
+    // aba restaure o snapshot de outra aba (perda de trabalho confirmado).
+    const ctx = ws && ws._taskContext;
+    const snapshot = (ctx && ctx.snapshot) || _lastProjectSnapshot;
+    const fileList = (ctx && ctx.fileList) || _lastProjectFileList;
+    if (!snapshot || !snapshot.size) { return { count: 0, files: [] }; }
     const files = [];
     let count = 0;
-    for (const [file, content] of _lastProjectSnapshot) {
+    for (const [file, content] of snapshot) {
         try {
             const absPath = path.join(PROJECT_ROOT, ...file.split('/'));
             if (content === null) {
@@ -3335,12 +3354,16 @@ function restoreProjectSnapshot() {
             }
         } catch (e) {}
     }
-    if (_lastProjectFileList) {
+    if (fileList) {
         for (const file of snapshotProjectFiles().keys()) {
-            if (_lastProjectFileList.has(file)) continue;
+            if (fileList.has(file)) continue;
             const absPath = path.join(PROJECT_ROOT, ...file.split('/'));
             try { if (fs.existsSync(absPath)) { fs.unlinkSync(absPath); count++; files.push(file); } } catch (e) {}
         }
+    }
+    if (ctx) {
+        ctx.snapshot = null;
+        ctx.fileList = null;
     }
     _lastProjectSnapshot = null;
     _lastProjectFileList = null;
@@ -3362,6 +3385,22 @@ function clearAgentStreamCallback(ws) {
 }
 function setPendingImages(images) { _pendingImages = images; }
 function clearPendingImages() { _pendingImages = null; }
+
+// Inicializa o contexto de tarefa por conexão. Agrupa o estado que deve ser
+// isolado entre abas (snapshot de rollback, arquivos, imagens pendentes) para
+// que o cancel/rollback de uma aba não afete outra.
+function ensureTaskContext(ws) {
+    if (!ws._taskContext) {
+        ws._taskContext = { snapshot: null, fileList: null, pendingImages: null };
+    }
+    return ws._taskContext;
+}
+
+function clearTaskContext(ws) {
+    if (ws && ws._taskContext) {
+        ws._taskContext = null;
+    }
+}
 
 function getImagePartsForOpenAI() {
     if (!_pendingImages || !_pendingImages.length) return null;
@@ -3850,7 +3889,7 @@ app.post('/api/config', (req, res) => {
         syncOpenCodeProviderAuth();
         res.json({ success: true, message: 'Configuração salva!' });
     } catch (e) {
-        res.status(500).json({ error: e.message });
+        res.status(500).json({ error: sanitizeClientError(e) });
     }
 });
 
@@ -3893,7 +3932,7 @@ app.post('/api/config/permissions', (req, res) => {
         saveConfigToFile();
         res.json({ success: true, ask: config.toolPermissions.ask, grants: config.toolPermissions.grants });
     } catch (e) {
-        res.status(500).json({ error: e.message });
+        res.status(500).json({ error: sanitizeClientError(e) });
     }
 });
 
@@ -3903,7 +3942,7 @@ app.post('/api/config/permissions/reset', (req, res) => {
         saveConfigToFile();
         res.json({ success: true, message: 'Permissões resetadas' });
     } catch (e) {
-        res.status(500).json({ error: e.message });
+        res.status(500).json({ error: sanitizeClientError(e) });
     }
 });
 
@@ -4014,7 +4053,7 @@ app.get('/api/models/opencode', async (req, res) => {
         const models = await listOpenCodeFreeModels();
         res.json({ success: true, models });
     } catch (e) {
-        res.status(500).json({ error: e.message });
+        res.status(500).json({ error: sanitizeClientError(e) });
     }
 });
 
@@ -4194,7 +4233,7 @@ app.post('/api/backup/restore', (req, res) => {
         fs.copyFileSync(backupFile, safeTarget);
         res.json({ success: true, message: 'Arquivo restaurado!', path: targetRel });
     } catch (e) {
-        res.status(500).json({ error: e.message });
+        res.status(500).json({ error: sanitizeClientError(e) });
     }
 });
 
@@ -4419,7 +4458,7 @@ app.post('/api/snapshot/create', (req, res) => {
         }, null, 2));
         res.json({ success: true, message: `Snapshot "${label}" criado (${copied} arquivos)`, name: label });
     } catch (e) {
-        res.status(500).json({ error: e.message });
+        res.status(500).json({ error: sanitizeClientError(e) });
     }
 });
 
@@ -4568,7 +4607,7 @@ app.post('/api/shell/start', (req, res) => {
         const result = runner.startShellSession(PROJECT_ROOT, broadcast);
         res.json(result);
     } catch (e) {
-        res.status(500).json({ error: e.message });
+        res.status(500).json({ error: sanitizeClientError(e) });
     }
 });
 
@@ -4581,7 +4620,7 @@ app.post('/api/shell/send', (req, res) => {
         const result = runner.sendToShell(command);
         res.json(result);
     } catch (e) {
-        res.status(500).json({ error: e.message });
+        res.status(500).json({ error: sanitizeClientError(e) });
     }
 });
 
@@ -4594,7 +4633,7 @@ app.post('/api/remote/shell', async (req, res) => {
         const result = await remote.execRemote(command);
         res.json({ success: true, output: result.stdout || result.stderr, cwd: '', code: result.code });
     } catch (e) {
-        res.status(500).json({ error: e.message });
+        res.status(500).json({ error: sanitizeClientError(e) });
     }
 });
 
@@ -4602,7 +4641,7 @@ app.post('/api/shell/stop', (req, res) => {
     try {
         res.json(runner.stopShellSession());
     } catch (e) {
-        res.status(500).json({ error: e.message });
+        res.status(500).json({ error: sanitizeClientError(e) });
     }
 });
 
@@ -4617,7 +4656,7 @@ app.post('/api/docker/run', async (req, res) => {
         const result = await runner.runCommand({ command, cwd: PROJECT_ROOT, timeoutMs: 300000 });
         res.json({ success: true, output: result.stdout || result.stderr, code: result.code });
     } catch (e) {
-        res.status(500).json({ error: e.message });
+        res.status(500).json({ error: sanitizeClientError(e) });
     }
 });
 
@@ -4639,7 +4678,7 @@ app.post('/api/remote/connect', async (req, res) => {
         const result = await remote.connect({ host, user, port: port || 22, keyFile });
         res.json(result);
     } catch (e) {
-        res.status(500).json({ error: e.message });
+        res.status(500).json({ error: sanitizeClientError(e) });
     }
 });
 
@@ -4657,7 +4696,7 @@ app.post('/api/remote/ls', async (req, res) => {
         const result = await remote.listDir(remotePath || '.');
         res.json(result);
     } catch (e) {
-        res.status(500).json({ error: e.message });
+        res.status(500).json({ error: sanitizeClientError(e) });
     }
 });
 
@@ -4668,7 +4707,7 @@ app.post('/api/remote/exec', async (req, res) => {
         const result = await remote.execRemote(command);
         res.json({ success: true, output: result.stdout || result.stderr, code: result.code });
     } catch (e) {
-        res.status(500).json({ error: e.message });
+        res.status(500).json({ error: sanitizeClientError(e) });
     }
 });
 
@@ -4681,7 +4720,7 @@ app.post('/api/remote/upload', async (req, res) => {
         const result = await remote.uploadFile(fullLocal, remotePath);
         res.json(result);
     } catch (e) {
-        res.status(500).json({ error: e.message });
+        res.status(500).json({ error: sanitizeClientError(e) });
     }
 });
 
@@ -4693,7 +4732,7 @@ app.post('/api/remote/download', async (req, res) => {
         const result = await remote.downloadFile(remotePath, fullLocal);
         res.json(result);
     } catch (e) {
-        res.status(500).json({ error: e.message });
+        res.status(500).json({ error: sanitizeClientError(e) });
     }
 });
 
@@ -4705,7 +4744,7 @@ app.post('/api/remote/deploy', async (req, res) => {
         broadcastAll({ type: 'deploy-done', message: 'Deploy concluído: ' + remotePath });
         res.json(result);
     } catch (e) {
-        res.status(500).json({ error: e.message });
+        res.status(500).json({ error: sanitizeClientError(e) });
     }
 });
 
@@ -4723,7 +4762,7 @@ app.post('/api/settings/export', (req, res) => {
         fs.writeFileSync(SETTINGS_FILE(), JSON.stringify(toSave, null, 2), 'utf-8');
         res.json({ success: true, file: '.aedificator-settings.json' });
     } catch (e) {
-        res.status(500).json({ error: e.message });
+        res.status(500).json({ error: sanitizeClientError(e) });
     }
 });
 
@@ -4735,7 +4774,7 @@ app.post('/api/settings/import', (req, res) => {
         const settings = JSON.parse(fs.readFileSync(file, 'utf-8'));
         res.json({ success: true, settings });
     } catch (e) {
-        res.status(500).json({ error: e.message });
+        res.status(500).json({ error: sanitizeClientError(e) });
     }
 });
 
@@ -4760,7 +4799,7 @@ app.post('/api/keybindings/save', (req, res) => {
         fs.writeFileSync(KEYBINDINGS_FILE(), JSON.stringify(bindings, null, 2), 'utf-8');
         res.json({ success: true });
     } catch (e) {
-        res.status(500).json({ error: e.message });
+        res.status(500).json({ error: sanitizeClientError(e) });
     }
 });
 
@@ -4785,7 +4824,7 @@ app.post('/api/tasks/save', (req, res) => {
         fs.writeFileSync(TASKS_FILE(), JSON.stringify(tasks, null, 2), 'utf-8');
         res.json({ success: true });
     } catch (e) {
-        res.status(500).json({ error: e.message });
+        res.status(500).json({ error: sanitizeClientError(e) });
     }
 });
 
@@ -4846,7 +4885,7 @@ app.post('/api/analyzer/validate', (req, res) => {
         const fixes = errors.length ? analyzer.suggestFix(errors[0], code) : [];
         res.json({ errors, valid, filePath, suggestionCount: errors.filter(e => e.severity === 'warning').length, fixes });
     } catch (e) {
-        res.status(500).json({ error: e.message });
+        res.status(500).json({ error: sanitizeClientError(e) });
     }
 });
 
@@ -4857,7 +4896,7 @@ app.post('/api/analyzer/ts-symbols', (req, res) => {
         const symbols = analyzer.getTSSymbols(file, PROJECT_ROOT);
         res.json({ success: true, symbols });
     } catch (e) {
-        res.status(500).json({ error: e.message });
+        res.status(500).json({ error: sanitizeClientError(e) });
     }
 });
 
@@ -4868,7 +4907,7 @@ app.post('/api/analyzer/python-symbols', (req, res) => {
         const symbols = analyzer.getPythonSymbols(file, PROJECT_ROOT);
         res.json({ success: true, symbols });
     } catch (e) {
-        res.status(500).json({ error: e.message });
+        res.status(500).json({ error: sanitizeClientError(e) });
     }
 });
 
@@ -4879,7 +4918,7 @@ app.post('/api/analyzer/python-validate', (req, res) => {
         const errors = analyzer.validateWithPythonAST(file, PROJECT_ROOT);
         res.json({ success: true, errors });
     } catch (e) {
-        res.status(500).json({ error: e.message });
+        res.status(500).json({ error: sanitizeClientError(e) });
     }
 });
 
@@ -4890,7 +4929,7 @@ app.post('/api/analyzer/go-symbols', (req, res) => {
         const symbols = analyzer.getGoSymbols(file, PROJECT_ROOT);
         res.json({ success: true, symbols });
     } catch (e) {
-        res.status(500).json({ error: e.message });
+        res.status(500).json({ error: sanitizeClientError(e) });
     }
 });
 
@@ -4901,7 +4940,7 @@ app.post('/api/analyzer/go-validate', (req, res) => {
         const errors = analyzer.validateWithGoVet(file, PROJECT_ROOT);
         res.json({ success: true, errors });
     } catch (e) {
-        res.status(500).json({ error: e.message });
+        res.status(500).json({ error: sanitizeClientError(e) });
     }
 });
 
@@ -4921,7 +4960,7 @@ app.post('/api/analyzer/index', (req, res) => {
         }
         res.json({ success: true, stats, files: Object.keys(idx.files).slice(0, 100) });
     } catch (e) {
-        res.status(500).json({ error: e.message });
+        res.status(500).json({ error: sanitizeClientError(e) });
     }
 });
 
@@ -5215,7 +5254,7 @@ app.post('/api/file/upload', (req, res) => {
         }
         res.json({ success: true, path: relPath });
     } catch (e) {
-        res.status(500).json({ error: e.message });
+        res.status(500).json({ error: sanitizeClientError(e) });
     }
 });
 
@@ -5980,7 +6019,7 @@ app.post('/api/project/summary', (req, res) => {
             testFramework: testFramework ? testFramework.command : null,
             timestamp: new Date().toISOString()
         });
-    } catch (e) { res.status(500).json({ error: e.message }); }
+    } catch (e) { res.status(500).json({ error: sanitizeClientError(e) }); }
 });
 
 // ===== ENDPOINT: BUILD TASK =====
@@ -5993,7 +6032,7 @@ app.post('/api/project/build', async (req, res) => {
         const fullCmd = [command, ...(args || []).map(a => /\s/.test(String(a)) ? `"${a}"` : String(a))].join(' ');
         const result = await runner.runCommand({ command: fullCmd, cwd: PROJECT_ROOT, timeoutMs: 120000 });
         res.json({ success: true, output: result.stdout || result.stderr, code: result.code });
-    } catch (e) { res.status(500).json({ error: e.message }); }
+    } catch (e) { res.status(500).json({ error: sanitizeClientError(e) }); }
 });
 
 // ===== FILE WATCHER (mudanças externas) =====
@@ -6120,7 +6159,7 @@ app.post('/api/file/format', async (req, res) => {
         const formatted = await formatCode(language || 'javascript', content);
         res.json({ success: true, content: formatted });
     } catch (e) {
-        res.status(500).json({ error: e.message });
+        res.status(500).json({ error: sanitizeClientError(e) });
     }
 });
 
@@ -6153,7 +6192,7 @@ app.post('/api/git/status', async (req, res) => {
         const output = (branch.code === 0 ? `🌿 Branch: ${branch.output.trim()}\n\n` : '') + (status.output || '(repositório limpo)');
         res.json({ success: true, isRepo: branch.code === 0, output });
     } catch (e) {
-        res.status(500).json({ error: e.message });
+        res.status(500).json({ error: sanitizeClientError(e) });
     }
 });
 
@@ -6167,7 +6206,7 @@ app.post('/api/git/commit', async (req, res) => {
         const commit = await runGit(['commit', '-m', message.trim()], PROJECT_ROOT);
         res.json({ success: true, addOutput: add.output, commitOutput: commit.output, code: commit.code });
     } catch (e) {
-        res.status(500).json({ error: e.message });
+        res.status(500).json({ error: sanitizeClientError(e) });
     }
 });
 
@@ -6181,7 +6220,7 @@ app.post('/api/git/diff', async (req, res) => {
         const stat = await runGit(['diff', '--stat', '--no-color', '--'], PROJECT_ROOT);
         res.json({ success: true, output: diff.output, staged: staged.output, stat: stat.output });
     } catch (e) {
-        res.status(500).json({ error: e.message });
+        res.status(500).json({ error: sanitizeClientError(e) });
     }
 });
 
@@ -6192,7 +6231,7 @@ app.post('/api/git/stage', async (req, res) => {
         const r = await runGit(args, PROJECT_ROOT);
         res.json({ success: r.code === 0, output: r.output || r.errOutput, code: r.code });
     } catch (e) {
-        res.status(500).json({ error: e.message });
+        res.status(500).json({ error: sanitizeClientError(e) });
     }
 });
 
@@ -6202,7 +6241,7 @@ app.post('/api/git/unstage', async (req, res) => {
         const r = await runGit(['reset', 'HEAD', '--', file], PROJECT_ROOT);
         res.json({ success: r.code === 0, output: r.output || r.errOutput, code: r.code });
     } catch (e) {
-        res.status(500).json({ error: e.message });
+        res.status(500).json({ error: sanitizeClientError(e) });
     }
 });
 
@@ -6214,7 +6253,7 @@ app.post('/api/git/push', async (req, res) => {
         const r = await runGit(args, PROJECT_ROOT);
         res.json({ success: r.code === 0, output: r.output || r.errOutput, code: r.code });
     } catch (e) {
-        res.status(500).json({ error: e.message });
+        res.status(500).json({ error: sanitizeClientError(e) });
     }
 });
 
@@ -6223,7 +6262,7 @@ app.post('/api/git/pull', async (req, res) => {
         const r = await runGit(['pull'], PROJECT_ROOT);
         res.json({ success: r.code === 0, output: r.output || r.errOutput, code: r.code });
     } catch (e) {
-        res.status(500).json({ error: e.message });
+        res.status(500).json({ error: sanitizeClientError(e) });
     }
 });
 
@@ -6233,7 +6272,7 @@ app.post('/api/git/branches', async (req, res) => {
         const current = (await runGit(['rev-parse', '--abbrev-ref', 'HEAD'], PROJECT_ROOT)).output.trim();
         res.json({ success: true, output: r.output, current, code: r.code });
     } catch (e) {
-        res.status(500).json({ error: e.message });
+        res.status(500).json({ error: sanitizeClientError(e) });
     }
 });
 
@@ -6244,7 +6283,7 @@ app.post('/api/git/checkout', async (req, res) => {
         const r = await runGit(['checkout', branch], PROJECT_ROOT);
         res.json({ success: r.code === 0, output: r.output || r.errOutput, code: r.code });
     } catch (e) {
-        res.status(500).json({ error: e.message });
+        res.status(500).json({ error: sanitizeClientError(e) });
     }
 });
 
@@ -6253,7 +6292,7 @@ app.post('/api/git/log', async (req, res) => {
         const r = await runGit(['log', '--oneline', '-20'], PROJECT_ROOT);
         res.json({ success: true, output: r.output, code: r.code });
     } catch (e) {
-        res.status(500).json({ error: e.message });
+        res.status(500).json({ error: sanitizeClientError(e) });
     }
 });
 
@@ -6265,7 +6304,7 @@ app.post('/api/git/merge', async (req, res) => {
         const r = await runGit(['merge', branch], PROJECT_ROOT);
         res.json({ success: r.code === 0, output: r.output, error: r.stderr, code: r.code });
     } catch (e) {
-        res.status(500).json({ error: e.message });
+        res.status(500).json({ error: sanitizeClientError(e) });
     }
 });
 
@@ -6286,7 +6325,7 @@ app.post('/api/git/stash', async (req, res) => {
         const r = await runGit(args, PROJECT_ROOT);
         res.json({ success: r.code === 0, output: r.output, error: r.stderr, code: r.code });
     } catch (e) {
-        res.status(500).json({ error: e.message });
+        res.status(500).json({ error: sanitizeClientError(e) });
     }
 });
 
@@ -6333,7 +6372,7 @@ app.post('/api/test/run', async (req, res) => {
             res.json({ success: false, error: err.message });
         });
     } catch (e) {
-        res.status(500).json({ error: e.message });
+        res.status(500).json({ error: sanitizeClientError(e) });
     }
 });
 
@@ -6485,7 +6524,7 @@ app.post('/api/git/blame', async (req, res) => {
         lines.forEach((l, i) => { l.line = i + 1; });
         res.json({ success: true, lines });
     } catch (e) {
-        res.status(500).json({ error: e.message });
+        res.status(500).json({ error: sanitizeClientError(e) });
     }
 });
 
@@ -6507,7 +6546,7 @@ app.post('/api/file/original', (req, res) => {
             res.json({ success: true, original: '', current: fs.readFileSync(fullPath, 'utf-8') });
         });
     } catch (e) {
-        res.status(500).json({ error: e.message });
+        res.status(500).json({ error: sanitizeClientError(e) });
     }
 });
 
@@ -6520,7 +6559,7 @@ app.post('/api/file/diff-preview', (req, res) => {
         const original = fs.existsSync(fullPath) ? fs.readFileSync(fullPath, 'utf-8') : '';
         res.json({ success: true, original, modified: typeof conteudo === 'string' ? conteudo : '' });
     } catch (e) {
-        res.status(500).json({ error: e.message });
+        res.status(500).json({ error: sanitizeClientError(e) });
     }
 });
 
@@ -6607,7 +6646,7 @@ app.post('/api/git/detect', async (req, res) => {
             nextTag: nextVersion(lastTag)
         });
     } catch (e) {
-        res.status(500).json({ error: e.message });
+        res.status(500).json({ error: sanitizeClientError(e) });
     }
 });
 
@@ -6645,7 +6684,7 @@ app.post('/api/git/publish', async (req, res) => {
             output: push.output
         });
     } catch (e) {
-        res.status(500).json({ error: e.message });
+        res.status(500).json({ error: sanitizeClientError(e) });
     }
 });
 
@@ -6809,35 +6848,46 @@ function buildWsOnChunk(ws) {
         if (agent === 'file-status') {
             try {
                 const statusData = JSON.parse(text);
-                ws.send(JSON.stringify({ type: 'file-status', files: statusData }));
+                safeSend(ws, { type: 'file-status', files: statusData });
             } catch (e) {}
             return;
         }
         if (agent === 'plan') {
-            ws.send(JSON.stringify({ type: 'plan', total: Number(text) || 0 }));
+            safeSend(ws, { type: 'plan', total: Number(text) || 0 });
             return;
         }
         if (agent === 'activity') {
             try {
-                ws.send(JSON.stringify({ type: 'activity-event', ...JSON.parse(text) }));
+                safeSend(ws, { type: 'activity-event', ...JSON.parse(text) });
             } catch (e) {}
             return;
         }
         if (agent === 'interaction') {
             try {
                 const payload = JSON.parse(text);
-                ws.send(JSON.stringify({ type: payload.kind, ...payload }));
+                safeSend(ws, { type: payload.kind, ...payload });
             } catch (e) {}
             return;
         }
         if (agent === 'todo') {
             try {
-                ws.send(JSON.stringify({ type: 'todo', todos: JSON.parse(text) }));
+                safeSend(ws, { type: 'todo', todos: JSON.parse(text) });
             } catch (e) {}
             return;
         }
-        ws.send(JSON.stringify({ type: 'chunk', agent: agent || 'Sistema', content: text }));
+        safeSend(ws, { type: 'chunk', agent: agent || 'Sistema', content: text });
     };
+}
+
+// Envio seguro de mensagem WebSocket: ignora silenciosamente se a conexão já
+// fechou (readyState !== OPEN), evitando throw de "WebSocket is not open" em
+// mensagens tardias (broadcasts, keepalive, respostas de tarefa concluída).
+function safeSend(ws, obj) {
+    try {
+        if (ws && ws.readyState === ws.OPEN) {
+            ws.send(JSON.stringify(obj));
+        }
+    } catch (e) {}
 }
 
 // Aplica (ou submete à aprovação) as alterações feitas por um agente/provedor.
@@ -6928,6 +6978,16 @@ wss.on('connection', (ws, req) => {
         return;
     }
     console.log('🔌 Cliente WebSocket conectado');
+    // Wrapper central de ws.send: todas as chamadas do handler passam por aqui,
+    // ignorando envios quando a conexão fechou (evita throw tardio de
+    // "WebSocket is not open" em broadcasts/keepalive). ~45 chamadas diretas
+    // existentes são cobertas sem precisar editar cada uma.
+    const _origSend = ws.send.bind(ws);
+    ws.send = (payload) => {
+        try {
+            if (ws.readyState === ws.OPEN) _origSend(payload);
+        } catch (e) {}
+    };
     let streamController = null;
     let pendingPlan = null;
 
@@ -6991,6 +7051,7 @@ wss.on('connection', (ws, req) => {
     }
 
     ws.on('message', async (message) => {
+        try {
         let data;
         try {
             data = JSON.parse(message);
@@ -7012,7 +7073,7 @@ wss.on('connection', (ws, req) => {
             // Sem isso, um 'cancel' enviado após a tarefa concluída (ou de outra
             // aba) reverteria o projeto inteiro, apagando trabalho já confirmado.
             if (ws._taskActive) {
-                restored = restoreProjectSnapshot();
+                restored = restoreProjectSnapshot(ws);
             } else {
                 _lastProjectSnapshot = null;
                 _lastProjectFileList = null;
@@ -7075,8 +7136,11 @@ wss.on('connection', (ws, req) => {
             ws._taskActive = true;
 
             try {
-                _lastProjectSnapshot = snapshotProjectContents();
-                _lastProjectFileList = new Set(snapshotProjectFiles().keys());
+                const tctx = ensureTaskContext(ws);
+                tctx.snapshot = snapshotProjectContents();
+                tctx.fileList = new Set(snapshotProjectFiles().keys());
+                _lastProjectSnapshot = tctx.snapshot;
+                _lastProjectFileList = tctx.fileList;
                 const model = data.model || 'gemini-3.5-flash';
                 const provider = data.provider || 'gemini';
                 const mode = data.mode || 'cowork';
@@ -7086,7 +7150,10 @@ wss.on('connection', (ws, req) => {
                 // Tarefas grandes ganham tetos completos; as simples ficam econômicas.
                 _currentTaskComplexity = isComplexTask(task) ? 'complex' : 'simple';
 
-                if (data.images && data.images.length) setPendingImages(data.images);
+                if (data.images && data.images.length) {
+                    tctx.pendingImages = data.images;
+                    setPendingImages(data.images);
+                }
 
                 let effectiveMode = mode;
                 if (mode === 'auto' || mode === 'smart') {
@@ -7551,6 +7618,7 @@ wss.on('connection', (ws, req) => {
                 clearTaskWatchdog();
                 streamController = null;
                 clearAgentStreamCallback(ws);
+                clearTaskContext(ws);
             }
             return;
         }
@@ -7583,6 +7651,7 @@ wss.on('connection', (ws, req) => {
                     streamController = null;
                     ws._taskActive = false;
                     clearAgentStreamCallback(ws);
+                    clearTaskContext(ws);
                 }
                 return;
             }
@@ -7591,8 +7660,11 @@ wss.on('connection', (ws, req) => {
             ws._taskActive = true;
 
             try {
-                _lastProjectSnapshot = snapshotProjectContents();
-                _lastProjectFileList = new Set(snapshotProjectFiles().keys());
+                const tctx = ensureTaskContext(ws);
+                tctx.snapshot = snapshotProjectContents();
+                tctx.fileList = new Set(snapshotProjectFiles().keys());
+                _lastProjectSnapshot = tctx.snapshot;
+                _lastProjectFileList = tctx.fileList;
                 let filesToExecute;
                 if (Array.isArray(plan.sugestoes) && plan.sugestoes.length > 0) {
                     const selected = new Set(Array.isArray(data.selecionadas) ? data.selecionadas : []);
@@ -7747,7 +7819,20 @@ wss.on('connection', (ws, req) => {
                 _lastProjectSnapshot = null;
                 _lastProjectFileList = null;
                 clearAgentStreamCallback(ws);
+                clearTaskContext(ws);
             }
+        }
+        } catch (err) {
+            // Catch de segurança: qualquer exceção não tratada no handler de
+            // mensagem é notificada ao cliente (senão a UI fica presa em
+            // "Enviando...") e logada. Não deixa a tarefa órfã.
+            clearTaskWatchdog();
+            streamController = null;
+            ws._taskActive = false;
+            clearAgentStreamCallback(ws);
+            clearTaskContext(ws);
+            logError('ws-handler', (err && err.message) || String(err), '');
+            try { ws.send(JSON.stringify({ type: 'error', content: '❌ ' + sanitizeClientError(err) })); } catch (e) {}
         }
     });
 
@@ -7764,6 +7849,7 @@ wss.on('connection', (ws, req) => {
         _lastProjectSnapshot = null;
         _lastProjectFileList = null;
         clearAgentStreamCallback(ws);
+        clearTaskContext(ws);
     });
 });
 

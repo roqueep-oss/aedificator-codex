@@ -152,10 +152,6 @@ function safeOn(id, event, handler) {
     if (el) el.addEventListener(event, handler);
 }
 
-function formatContent(text) {
-    return escapeHtml(text).replace(/\n/g, '<br>');
-}
-
 function simpleHash(str) {
     let hash = 0;
     for (let i = 0; i < str.length; i++) {
@@ -243,6 +239,7 @@ function initMonacoEditor() {
                 const tab = editorTabs.find(t => t.path === activeTabPath);
                 if (tab && !tab.isImage) { tab.dirty = true; maybeAutoSave(); }
                 runDiagnostics();
+                aedScheduleGutterDebounced();
             });
 
             monacoEditor.onDidChangeCursorPosition((e) => {
@@ -6126,18 +6123,25 @@ function restoreChatHistory() {
                 <div class="msg-header">
                     <span class="agent-badge">🤖 ${escapeHtml(item.agent)}</span>
                 </div>
-                <div class="msg-content">${formatContent(item.content)}</div>
+                <div class="msg-content">${renderChatContent(item.content)}</div>
             `;
         } else {
-            div.innerHTML = `<div class="msg-content">${formatContent(item.content)}</div>`;
+            div.innerHTML = `<div class="msg-content">${renderChatContent(item.content)}</div>`;
         }
         container.appendChild(div);
+        try { colorizeCodeBlocks(div); } catch (e) {}
     }
 }
 
 function showToast(msg) {
     const toast = document.getElementById('toast');
-    toast.textContent = msg;
+    // Mensagens com botão (ex.: "Recarregar") são HTML intencional; o restante
+    // é tratado como texto puro (escape) para evitar injeção de HTML.
+    if (String(msg).indexOf('<button') !== -1) {
+        toast.innerHTML = msg;
+    } else {
+        toast.textContent = msg;
+    }
     toast.className = 'show';
     clearTimeout(toast._timeout);
     toast._timeout = setTimeout(() => {
@@ -6776,7 +6780,25 @@ function renderChatContent(text) {
 }
 
 function linkifyFilePaths(html) {
-    return html.replace(/([\w.\-/\\]+\.(jsx?|tsx?|html?|css|scss|less|json|md|py|rb|go|rs|java|c|cpp|h|php|sql|yaml|yml|xml|sh|bat|env|lock)(:\d+)?)/gi, function(match) {
+    // Divide o HTML em segmentos: dentro de tags (<...>) fica intocado, e o texto
+    // entre tags recebe o linkify. Isto impede que paths DENTRO de <code>...</code>
+    // (ex.: `x = "utils/helper.js"`) sejam envolvidos por spans, o que corrompia
+    // o DOM do code block e quebrava seleção/cópia.
+    var re = /<[^>]*>/g;
+    var out = '';
+    var last = 0;
+    var m;
+    while ((m = re.exec(html)) !== null) {
+        out += linkifyTextSegment(html.slice(last, m.index));
+        out += m[0];
+        last = m.index + m[0].length;
+    }
+    out += linkifyTextSegment(html.slice(last));
+    return out;
+}
+
+function linkifyTextSegment(text) {
+    return text.replace(/([\w.\-/\\]+\.(jsx?|tsx?|html?|css|scss|less|json|md|py|rb|go|rs|java|c|cpp|h|php|sql|yaml|yml|xml|sh|bat|env|lock)(:\d+)?)/gi, function(match) {
         if (match.includes('<') || match.includes('>') || match.includes('&')) return match;
         var path = match.replace(/:(\d+)$/, '');
         var line = (match.match(/:(\d+)$/) || [])[1] || null;
@@ -8271,10 +8293,25 @@ async function provideAedReferences(model, position, context) {
 //  GIT GUTTER DECORATIONS (diff inline)
 // =============================================
 function scheduleAedGutterDecorations() {
+    // Polling esparso como fallback (8s); o disparo principal é sob demanda no
+    // evento de mudança do editor (ver aedScheduleGutterDebounced), então não
+    // há request a cada 3s durante a digitação.
     window._aedGutterTimer = setInterval(() => {
         if (!monacoEditor || !monacoEditor.getModel() || !activeTabPath || !currentProjectPath) return;
         aedApplyGutterDecorations();
-    }, 3000);
+    }, 8000);
+}
+
+// Dispara a atualização do gutter logo após a digitação (debounced 800ms), em
+// vez de depender só do polling. O guard _aedLastGutterContent evita request
+// duplicado quando o conteúdo não mudou de fato.
+function aedScheduleGutterDebounced() {
+    if (window._aedGutterDebounce) clearTimeout(window._aedGutterDebounce);
+    window._aedGutterDebounce = setTimeout(() => {
+        window._aedGutterDebounce = null;
+        if (!monacoEditor || !monacoEditor.getModel() || !activeTabPath || !currentProjectPath) return;
+        aedApplyGutterDecorations();
+    }, 800);
 }
 
 let _aedLastGutterFile = null;
