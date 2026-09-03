@@ -25,6 +25,7 @@ const {
     getUsdBrl, setUsdBrl, setPricingDeps
 } = require('./pricing');
 const { configureSnapshot, registerSnapshotRoutes, restoreSnapshot } = require('./snapshot');
+const { registerStateRoutes } = require('./routes-state');
 
 // Configura o módulo de snapshots com as dependências dinâmicas do server
 // (getters lazily avaliados: respeitam mudanças de PROJECT_ROOT em runtime).
@@ -4160,85 +4161,8 @@ app.post('/api/remote/deploy', async (req, res) => {
     }
 });
 
-// ===== SETTINGS SYNC =====
-const SETTINGS_FILE = () => path.join(PROJECT_ROOT, '.aedificator-settings.json');
-const KEYBINDINGS_FILE = () => path.join(PROJECT_ROOT, '.aedificator-keybindings.json');
-
-app.post('/api/settings/export', (req, res) => {
-    if (!PROJECT_ROOT) return res.status(400).json({ error: 'Nenhum projeto aberto' });
-    try {
-        const { settings } = req.body || {};
-        if (!settings && !req.body.id) return res.status(400).json({ error: 'Envie as configurações como { settings: {...} }' });
-        const toSave = settings || req.body;
-        toSave.exportedAt = new Date().toISOString();
-        fs.writeFileSync(SETTINGS_FILE(), JSON.stringify(toSave, null, 2), 'utf-8');
-        res.json({ success: true, file: '.aedificator-settings.json' });
-    } catch (e) {
-        res.status(500).json({ error: sanitizeClientError(e) });
-    }
-});
-
-app.post('/api/settings/import', (req, res) => {
-    if (!PROJECT_ROOT) return res.status(400).json({ error: 'Nenhum projeto aberto' });
-    try {
-        const file = SETTINGS_FILE();
-        if (!fs.existsSync(file)) return res.status(404).json({ error: 'Arquivo .aedificator-settings.json não encontrado. Exporte primeiro.' });
-        const settings = JSON.parse(fs.readFileSync(file, 'utf-8'));
-        res.json({ success: true, settings });
-    } catch (e) {
-        res.status(500).json({ error: sanitizeClientError(e) });
-    }
-});
-
-app.post('/api/keybindings/list', (req, res) => {
-    if (!PROJECT_ROOT) return res.json({ success: true, bindings: [] });
-    try {
-        const file = KEYBINDINGS_FILE();
-        let bindings = [];
-        if (fs.existsSync(file)) {
-            bindings = JSON.parse(fs.readFileSync(file, 'utf-8'));
-        }
-        res.json({ success: true, bindings });
-    } catch (e) {
-        res.json({ success: true, bindings: [] });
-    }
-});
-
-app.post('/api/keybindings/save', (req, res) => {
-    const { bindings } = req.body || {};
-    if (!PROJECT_ROOT || !Array.isArray(bindings)) return res.status(400).json({ error: 'Dados inválidos' });
-    try {
-        fs.writeFileSync(KEYBINDINGS_FILE(), JSON.stringify(bindings, null, 2), 'utf-8');
-        res.json({ success: true });
-    } catch (e) {
-        res.status(500).json({ error: sanitizeClientError(e) });
-    }
-});
-
-// ===== TAREFAS DE BUILD =====
-const TASKS_FILE = () => path.join(PROJECT_ROOT, '.aedificator-tasks.json');
-
-app.post('/api/tasks/list', (req, res) => {
-    const file = TASKS_FILE();
-    let tasks = [];
-    try {
-        if (fs.existsSync(file)) {
-            tasks = JSON.parse(fs.readFileSync(file, 'utf-8'));
-        }
-    } catch (e) {}
-    res.json({ success: true, tasks });
-});
-
-app.post('/api/tasks/save', (req, res) => {
-    const { tasks } = req.body;
-    if (!Array.isArray(tasks)) return res.status(400).json({ error: 'Lista de tarefas inválida' });
-    try {
-        fs.writeFileSync(TASKS_FILE(), JSON.stringify(tasks, null, 2), 'utf-8');
-        res.json({ success: true });
-    } catch (e) {
-        res.status(500).json({ error: sanitizeClientError(e) });
-    }
-});
+// ===== SETTINGS / KEYBINDINGS / TASKS (por projeto) — em ./routes-state.js =====
+registerStateRoutes(app, { getProjectRoot: () => PROJECT_ROOT, sanitizeClientError });
 
 // =============================================
 //  ANALYZER — validação e indexação de código
