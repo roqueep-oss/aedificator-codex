@@ -27,6 +27,10 @@ const {
 const { configureSnapshot, registerSnapshotRoutes, restoreSnapshot } = require('./snapshot');
 const { registerStateRoutes } = require('./routes-state');
 const { registerProjectRoutes } = require('./routes-project');
+const { setHistoryCtx, registerHistoryRoutes, pushUndoState, undoLastChange, redoLastChange, undoStack, redoStack } = require('./history');
+
+// Injetar dependências dinâmicas do server no módulo de histórico/undo.
+setHistoryCtx({ getProjectRoot: () => PROJECT_ROOT, resolveSafePath, sanitizeClientError, listBackups, broadcastAll });
 
 // Configura o módulo de snapshots com as dependências dinâmicas do server
 // (getters lazily avaliados: respeitam mudanças de PROJECT_ROOT em runtime).
@@ -3769,140 +3773,8 @@ app.post('/api/file/move', (req, res) => {
     }
 });
 
-// ===== BACKUP / RESTAURAR =====
-app.post('/api/backup/list', (req, res) => {
-    const files = listBackups();
-    res.json({ success: true, files });
-});
-
-app.post('/api/backup/restore', (req, res) => {
-    const { file } = req.body;
-    if (!file) return res.status(400).json({ error: 'Arquivo não especificado' });
-
-    const backupFile = path.join(PROJECT_ROOT, BACKUP_DIR_NAME, file);
-    if (!fs.existsSync(backupFile) || fs.statSync(backupFile).isDirectory()) {
-        return res.status(404).json({ error: 'Backup não encontrado' });
-    }
-
-    const targetRel = file.replace(/\.\d+$/, '');
-    const safeTarget = resolveSafePath(targetRel);
-    if (!safeTarget) return res.status(400).json({ error: 'Caminho fora do projeto' });
-
-    try {
-        fs.mkdirSync(path.dirname(safeTarget), { recursive: true });
-        fs.copyFileSync(backupFile, safeTarget);
-        res.json({ success: true, message: 'Arquivo restaurado!', path: targetRel });
-    } catch (e) {
-        res.status(500).json({ error: sanitizeClientError(e) });
-    }
-});
-
-// ===== UNDO / REDO =====
-const undoStack = [];
-const redoStack = [];
-
-function pushUndoState(affectedFiles) {
-    if (!Array.isArray(affectedFiles) || !affectedFiles.length) return;
-    const entry = { timestamp: Date.now(), files: [] };
-    for (const f of affectedFiles) {
-        const fullPath = resolveSafePath(typeof f === 'string' ? f : f.caminho || f.file);
-        if (!fullPath || !fs.existsSync(fullPath)) continue;
-        try {
-            entry.files.push({ path: typeof f === 'string' ? f : f.caminho || f.file, content: fs.readFileSync(fullPath, 'utf-8') });
-        } catch (e) {}
-    }
-    if (entry.files.length) {
-        undoStack.push(entry);
-        if (undoStack.length > 50) undoStack.shift();
-        redoStack.length = 0;
-    }
-}
-
-app.post('/api/undo', (req, res) => {
-    if (!undoStack.length) return res.json({ success: false, message: 'Nada para desfazer' });
-    const entry = undoStack.pop();
-    const redoEntry = { timestamp: Date.now(), files: [] };
-    for (const f of entry.files) {
-        const fullPath = resolveSafePath(f.path);
-        if (!fullPath) continue;
-        try {
-            if (fs.existsSync(fullPath)) {
-                redoEntry.files.push({ path: f.path, content: fs.readFileSync(fullPath, 'utf-8') });
-            }
-            fs.mkdirSync(path.dirname(fullPath), { recursive: true });
-            fs.writeFileSync(fullPath, f.content, 'utf-8');
-        } catch (e) {}
-    }
-    if (redoEntry.files.length) redoStack.push(redoEntry);
-    broadcastAll({ type: 'refresh' });
-    broadcastAll({ type: 'undo-done', message: `${entry.files.length} arquivo(s) restaurado(s)` });
-    res.json({ success: true, files: entry.files.length, message: `${entry.files.length} arquivo(s) restaurado(s)` });
-});
-
-app.post('/api/redo', (req, res) => {
-    if (!redoStack.length) return res.json({ success: false, message: 'Nada para refazer' });
-    const entry = redoStack.pop();
-    const undoEntry = { timestamp: Date.now(), files: [] };
-    for (const f of entry.files) {
-        const fullPath = resolveSafePath(f.path);
-        if (!fullPath) continue;
-        try {
-            if (fs.existsSync(fullPath)) {
-                undoEntry.files.push({ path: f.path, content: fs.readFileSync(fullPath, 'utf-8') });
-            }
-            fs.mkdirSync(path.dirname(fullPath), { recursive: true });
-            fs.writeFileSync(fullPath, f.content, 'utf-8');
-        } catch (e) {}
-    }
-    if (undoEntry.files.length) undoStack.push(undoEntry);
-    broadcastAll({ type: 'refresh' });
-    broadcastAll({ type: 'redo-done', message: `${entry.files.length} arquivo(s) refeito(s)` });
-    res.json({ success: true, files: entry.files.length, message: `${entry.files.length} arquivo(s) refeito(s)` });
-});
-
-app.post('/api/undo/status', (req, res) => {
-    res.json({ canUndo: undoStack.length > 0, canRedo: redoStack.length > 0, undoCount: undoStack.length, redoCount: redoStack.length });
-});
-
-async function undoLastChange() {
-    if (!undoStack.length) return null;
-    const entry = undoStack.pop();
-    const redoEntry = { timestamp: Date.now(), files: [] };
-    for (const f of entry.files) {
-        const fullPath = resolveSafePath(f.path);
-        if (!fullPath) continue;
-        try {
-            if (fs.existsSync(fullPath)) {
-                redoEntry.files.push({ path: f.path, content: fs.readFileSync(fullPath, 'utf-8') });
-            }
-            fs.mkdirSync(path.dirname(fullPath), { recursive: true });
-            fs.writeFileSync(fullPath, f.content, 'utf-8');
-        } catch (e) {}
-    }
-    if (redoEntry.files.length) redoStack.push(redoEntry);
-    broadcastAll({ type: 'refresh' });
-    return `${entry.files.length} arquivo(s) restaurado(s)`;
-}
-
-async function redoLastChange() {
-    if (!redoStack.length) return null;
-    const entry = redoStack.pop();
-    const undoEntry = { timestamp: Date.now(), files: [] };
-    for (const f of entry.files) {
-        const fullPath = resolveSafePath(f.path);
-        if (!fullPath) continue;
-        try {
-            if (fs.existsSync(fullPath)) {
-                undoEntry.files.push({ path: f.path, content: fs.readFileSync(fullPath, 'utf-8') });
-            }
-            fs.mkdirSync(path.dirname(fullPath), { recursive: true });
-            fs.writeFileSync(fullPath, f.content, 'utf-8');
-        } catch (e) {}
-    }
-    if (undoEntry.files.length) undoStack.push(undoEntry);
-    broadcastAll({ type: 'refresh' });
-    return `${entry.files.length} arquivo(s) refeito(s)`;
-}
+// ===== BACKUP / UNDO / REDO (histórico) — em ./history.js =====
+registerHistoryRoutes(app);
 
 function copyDirContents(srcDir, dstDir, ignore) {
     for (const entry of fs.readdirSync(srcDir, { withFileTypes: true })) {
