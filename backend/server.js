@@ -16,6 +16,7 @@ const { LANGUAGE_RULE, MODE_INSTRUCTIONS } = require('./ai/prompts');
 const { TOOL_SCHEMAS, stripBOM, setToolContext, executeAgentTool } = require('./ai/tools');
 const { callAgentProvider, getConfiguredProviders, setProvidersContext } = require('./ai/providers');
 const { runAgentLoop, setLoopContext } = require('./ai/loop');
+const { walkProjectFiles, MAX_FILE_SIZE } = require('./project-files');
 
 // ===== ENCODING UTF-8 (evita acentos corrompidos no console Windows) =====
 process.stdout.setDefaultEncoding('utf8');
@@ -139,7 +140,7 @@ const PORT = process.env.PORT || 3001;
 // Versão do protocolo do backend: usada pelo main.js para detectar um backend
 // antigo ainda rodando na porta (o `isBackendRunning` reutilizaria um processo
 // com bugs já corrigidos). Incremente ao mudar o comportamento do fluxo WS/API.
-const BACKEND_PROTOCOL_VERSION = '4';
+const { BACKEND_PROTOCOL_VERSION } = require('./version');
 
 // =============================================
 //  AUTENTICAÇÃO LOCAL
@@ -5434,48 +5435,32 @@ app.post('/api/search', (req, res) => {
     }
 
     const results = [];
-    const count = { n: 0 };
 
-    const walk = (dir, rel) => {
-        if (count.n >= MAX_CONTEXT_FILES) return;
-        let items;
-        try { items = fs.readdirSync(dir, { withFileTypes: true }); } catch (e) { return; }
-        for (const entry of items) {
-            if (count.n >= MAX_CONTEXT_FILES) return;
-            if (entry.isDirectory()) {
-                if (IGNORED_DIRS.has(entry.name)) continue;
-                walk(path.join(dir, entry.name), rel ? `${rel}/${entry.name}` : entry.name);
-                continue;
-            }
-            const relPath = rel ? `${rel}/${entry.name}` : entry.name;
-            count.n++;
-            const nameMatch = testFn(entry.name);
-            let matches = [];
+    walkProjectFiles(PROJECT_ROOT, (f) => {
+        const nameMatch = testFn(f.name);
+        let matches = [];
 
-            if (inContent) {
-                const full = path.join(dir, entry.name);
-                try {
-                    if (fs.statSync(full).size <= 2 * 1024 * 1024 && !isBinaryExtension(entry.name)) {
-                        const content = fs.readFileSync(full, 'utf-8');
-                        if (!content.includes('\u0000')) {
-                            const lines = content.split('\n');
-                            for (let i = 0; i < lines.length && matches.length < 20; i++) {
-                                if (testFn(lines[i])) {
-                                    matches.push({ line: i + 1, text: lines[i].trim().slice(0, 200) });
-                                }
+        if (inContent && !isBinaryExtension(f.name)) {
+            try {
+                if (fs.statSync(f.full).size <= MAX_FILE_SIZE) {
+                    const content = fs.readFileSync(f.full, 'utf-8');
+                    if (!content.includes('\u0000')) {
+                        const lines = content.split('\n');
+                        for (let i = 0; i < lines.length && matches.length < 20; i++) {
+                            if (testFn(lines[i])) {
+                                matches.push({ line: i + 1, text: lines[i].trim().slice(0, 200) });
                             }
                         }
                     }
-                } catch (e) {}
-            }
-
-            if (nameMatch || matches.length > 0) {
-                results.push({ path: relPath, name: entry.name, matches });
-            }
+                }
+            } catch (e) {}
         }
-    };
 
-    walk(PROJECT_ROOT, '');
+        if (nameMatch || matches.length > 0) {
+            results.push({ path: f.relPath, name: f.name, matches });
+        }
+    }, { ignoredDirs: IGNORED_DIRS, maxFiles: MAX_CONTEXT_FILES });
+
     res.json({ success: true, results: results.slice(0, 100) });
 });
 
@@ -5486,9 +5471,8 @@ app.post('/api/replace', (req, res) => {
     if (!q) return res.status(400).json({ error: 'Busca vazia' });
     
     const results = [];
-    const count = { n: 0 };
     const affectedFiles = [];
-    
+
     let searchPattern;
     try {
         if (useRegex) {
@@ -5497,58 +5481,42 @@ app.post('/api/replace', (req, res) => {
         } else {
             searchPattern = caseSensitive ? q : q.toLowerCase();
         }
-} catch (e) {
+    } catch (e) {
         return res.status(400).json({ error: 'Regex inválida: ' + e.message });
     }
 
-    const walk = (dir, rel) => {
-        if (count.n >= MAX_CONTEXT_FILES) return;
-        let items;
-        try { items = fs.readdirSync(dir, { withFileTypes: true }); } catch (e) { return; }
-        for (const entry of items) {
-            if (count.n >= MAX_CONTEXT_FILES) return;
-            if (entry.isDirectory()) {
-                if (IGNORED_DIRS.has(entry.name)) continue;
-                walk(path.join(dir, entry.name), rel ? `${rel}/${entry.name}` : entry.name);
-                continue;
+    walkProjectFiles(PROJECT_ROOT, (f) => {
+        if (isBinaryExtension(f.name)) return;
+        try {
+            if (fs.statSync(f.full).size > MAX_FILE_SIZE) return;
+            const content = fs.readFileSync(f.full, 'utf-8');
+            // Arquivo binário (contém NUL): pula só este arquivo e segue a varredura.
+            if (content.includes('\u0000')) return;
+
+            const lines = content.split('\n');
+            const matches = [];
+            for (let i = 0; i < lines.length; i++) {
+                const matches_ = useRegex
+                    ? (lines[i].match(searchPattern) || [])
+                    : (caseSensitive ? lines[i].split(q).length - 1 : lines[i].toLowerCase().split(q).length - 1);
+                const hitCount = Array.isArray(matches_) ? matches_.length : matches_;
+                if (hitCount > 0 && matches.length < 20) {
+                    matches.push({ line: i + 1, text: lines[i].trim().slice(0, 200), count: hitCount });
+                }
             }
-            const relPath = rel ? `${rel}/${entry.name}` : entry.name;
-            count.n++;
-            if (isBinaryExtension(entry.name)) continue;
-            
-            const full = path.join(dir, entry.name);
-            try {
-                if (fs.statSync(full).size > 2 * 1024 * 1024) continue;
-                const content = fs.readFileSync(full, 'utf-8');
-                if (content.includes('\u0000')) return;
-                
-                const lines = content.split('\n');
-                const matches = [];
-                for (let i = 0; i < lines.length; i++) {
-                    const matches_ = useRegex 
-                        ? (lines[i].match(searchPattern) || [])
-                        : (caseSensitive ? lines[i].split(q).length - 1 : lines[i].toLowerCase().split(q).length - 1);
-                    const hitCount = Array.isArray(matches_) ? matches_.length : matches_;
-                    if (hitCount > 0 && matches.length < 20) {
-                        matches.push({ line: i + 1, text: lines[i].trim().slice(0, 200), count: hitCount });
-                    }
-                }
-                
-                if (matches.length > 0) {
-                    results.push({ 
-                        path: relPath, 
-                        name: entry.name, 
-                        matches,
-                        totalMatches: matches.reduce((s, m) => s + m.count, 0)
-                    });
-                    affectedFiles.push({ path: relPath, fullPath: full });
-                }
-            } catch (e) {}
-        }
-    };
-    
-    walk(PROJECT_ROOT, '');
-    
+
+            if (matches.length > 0) {
+                results.push({
+                    path: f.relPath,
+                    name: f.name,
+                    matches,
+                    totalMatches: matches.reduce((s, m) => s + m.count, 0)
+                });
+                affectedFiles.push({ path: f.relPath, fullPath: f.full });
+            }
+        } catch (e) {}
+    }, { ignoredDirs: IGNORED_DIRS, maxFiles: MAX_CONTEXT_FILES });
+
     // If replace provided, execute replacement
     if (replace !== undefined && replace !== null) {
         let totalReplaced = 0;
@@ -5598,72 +5566,56 @@ app.post('/api/replace/preview', (req, res) => {
     }
 
     const results = [];
-    const count = { n: 0 };
 
-    const walk = (dir, rel) => {
-        if (count.n >= MAX_CONTEXT_FILES) return;
-        let items;
-        try { items = fs.readdirSync(dir, { withFileTypes: true }); } catch (e) { return; }
-        for (const entry of items) {
-            if (count.n >= MAX_CONTEXT_FILES) return;
-            if (entry.isDirectory()) {
-                if (IGNORED_DIRS.has(entry.name)) continue;
-                walk(path.join(dir, entry.name), rel ? `${rel}/${entry.name}` : entry.name);
-                continue;
+    walkProjectFiles(PROJECT_ROOT, (f) => {
+        if (isBinaryExtension(f.name)) return;
+        try {
+            if (fs.statSync(f.full).size > MAX_FILE_SIZE) return;
+            const content = fs.readFileSync(f.full, 'utf-8');
+            // Arquivo binário (contém NUL): pula só este arquivo e segue a varredura.
+            if (content.includes('\u0000')) return;
+
+            let newContent;
+            let changeCount = 0;
+            if (useRegex) {
+                const matches = content.match(searchPattern);
+                changeCount = matches ? matches.length : 0;
+                newContent = content.replace(searchPattern, replace || '');
+            } else if (caseSensitive) {
+                changeCount = content.split(q).length - 1;
+                newContent = content.split(q).join(replace || '');
+            } else {
+                const escaped = q.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+                const re = new RegExp(escaped, 'gi');
+                const matches = content.match(re);
+                changeCount = matches ? matches.length : 0;
+                newContent = content.replace(re, replace || '');
             }
-            const relPath = rel ? `${rel}/${entry.name}` : entry.name;
-            count.n++;
-            if (isBinaryExtension(entry.name)) continue;
 
-            const full = path.join(dir, entry.name);
-            try {
-                if (fs.statSync(full).size > 2 * 1024 * 1024) continue;
-                const content = fs.readFileSync(full, 'utf-8');
-                if (content.includes('\u0000')) return;
-
-                let newContent;
-                let changeCount = 0;
-                if (useRegex) {
-                    const matches = content.match(searchPattern);
-                    changeCount = matches ? matches.length : 0;
-                    newContent = content.replace(searchPattern, replace || '');
-                } else if (caseSensitive) {
-                    changeCount = content.split(q).length - 1;
-                    newContent = content.split(q).join(replace || '');
-                } else {
-                    const escaped = q.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
-                    const re = new RegExp(escaped, 'gi');
-                    const matches = content.match(re);
-                    changeCount = matches ? matches.length : 0;
-                    newContent = content.replace(re, replace || '');
-                }
-
-                if (changeCount > 0) {
-                    var previewLines = [];
-                    var oldLines = content.split('\n');
-                    var newLines = newContent.split('\n');
-                    var maxLine = Math.min(Math.max(oldLines.length, newLines.length), 80);
-                    for (var i = 0; i < maxLine; i++) {
-                        var ol = oldLines[i] || '';
-                        var nl = newLines[i] || '';
-                        if (ol !== nl) {
-                            if (ol) previewLines.push('- ' + ol.slice(0, 120));
-                            if (nl) previewLines.push('+ ' + nl.slice(0, 120));
-                        }
+            if (changeCount > 0) {
+                var previewLines = [];
+                var oldLines = content.split('\n');
+                var newLines = newContent.split('\n');
+                var maxLine = Math.min(Math.max(oldLines.length, newLines.length), 80);
+                for (var i = 0; i < maxLine; i++) {
+                    var ol = oldLines[i] || '';
+                    var nl = newLines[i] || '';
+                    if (ol !== nl) {
+                        if (ol) previewLines.push('- ' + ol.slice(0, 120));
+                        if (nl) previewLines.push('+ ' + nl.slice(0, 120));
                     }
-                    var preview = previewLines.slice(0, 60).join('\n');
-
-                    results.push({
-                        file: relPath,
-                        changes: changeCount,
-                        preview: preview
-                    });
                 }
-            } catch (e) {}
-        }
-    };
+                var preview = previewLines.slice(0, 60).join('\n');
 
-    walk(PROJECT_ROOT, '');
+                results.push({
+                    file: f.relPath,
+                    changes: changeCount,
+                    preview: preview
+                });
+            }
+        } catch (e) {}
+    }, { ignoredDirs: IGNORED_DIRS, maxFiles: MAX_CONTEXT_FILES });
+
     res.json({ success: true, results: results.slice(0, 50) });
 });
 
@@ -5990,17 +5942,11 @@ app.post('/api/project/summary', (req, res) => {
     try {
         const extCounts = {};
         let totalFiles = 0;
-        const walk = (dir) => {
-            let items;
-            try { items = fs.readdirSync(dir, { withFileTypes: true }); } catch (e) { return; }
-            for (const entry of items) {
-                if (entry.isDirectory()) { if (!IGNORED_DIRS.has(entry.name)) walk(path.join(dir, entry.name)); continue; }
-                totalFiles++;
-                const ext = path.extname(entry.name).toLowerCase();
-                extCounts[ext] = (extCounts[ext] || 0) + 1;
-            }
-        };
-        walk(PROJECT_ROOT);
+        walkProjectFiles(PROJECT_ROOT, (f) => {
+            totalFiles++;
+            const ext = path.extname(f.name).toLowerCase();
+            extCounts[ext] = (extCounts[ext] || 0) + 1;
+        }, { ignoredDirs: IGNORED_DIRS, maxFiles: Infinity });
         const buildCommands = detectBuildCommands();
         const testFramework = detectTestFramework();
         const pkgPath = path.join(PROJECT_ROOT, 'package.json');

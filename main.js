@@ -55,7 +55,7 @@ function getOrCreateBackendSecret() {
 // BACKEND_PROTOCOL_VERSION em backend/server.js). Um backend desatualizado
 // rodando na porta seria reutilizado pelo isBackendRunning e continuaria com
 // bugs já corrigidos no código atual.
-const BACKEND_PROTOCOL_VERSION = '4';
+const { BACKEND_PROTOCOL_VERSION } = require(path.join(__dirname, 'backend', 'version.js'));
 
 // ===== FUNÇÃO PARA VERIFICAR SE O BACKEND ESTÁ RODANDO =====
 function isBackendRunning() {
