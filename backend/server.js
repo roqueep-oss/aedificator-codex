@@ -24,6 +24,17 @@ const {
     getUsageReport, trackTokens, savePricingFile, fetchUsdBrlRate, fetchAiPrices,
     getUsdBrl, setUsdBrl, setPricingDeps
 } = require('./pricing');
+const { configureSnapshot, registerSnapshotRoutes, restoreSnapshot } = require('./snapshot');
+
+// Configura o módulo de snapshots com as dependências dinâmicas do server
+// (getters lazily avaliados: respeitam mudanças de PROJECT_ROOT em runtime).
+configureSnapshot({
+    getProjectRoot: () => PROJECT_ROOT,
+    backupDirName: () => BACKUP_DIR_NAME,
+    resolveSafePath,
+    sanitizeClientError,
+    projectFileContents: () => snapshotProjectContents()
+});
 
 // ===== ENCODING UTF-8 (evita acentos corrompidos no console Windows) =====
 process.stdout.setDefaultEncoding('utf8');
@@ -3913,24 +3924,6 @@ function copyDirContents(srcDir, dstDir, ignore) {
     }
 }
 
-function restoreSnapshot(label) {
-    const root = SNAPSHOT_ROOT();
-    const dir = path.join(root, label);
-    if (!dir.startsWith(root) || !fs.existsSync(dir)) throw new Error('Snapshot não encontrado');
-    let restored = 0;
-    for (const rel of walkSnapshotFiles(dir)) {
-        const src = path.join(dir, rel);
-        const target = resolveSafePath(rel);
-        if (!target) continue;
-        try {
-            fs.mkdirSync(path.dirname(target), { recursive: true });
-            fs.copyFileSync(src, target);
-            restored++;
-        } catch (e) {}
-    }
-    return restored;
-}
-
 // ===== SHARE =====
 function escapeHtml(text) {
     return (text || '').replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;');
@@ -3976,138 +3969,8 @@ pre{background:#161b22;padding:10px;border-radius:6px;overflow-x:auto;font-size:
 });
 
 // ===== SNAPSHOTS ROTULADOS (versões completas da pasta) =====
-// Guarda cópias completas rotuladas em .aedificator-codex-ide-backup/snapshots/<rotulo>/,
-// ignorando pastas grandes (node_modules, .git, dist, build) e binários maiores que o limite.
-const SNAPSHOT_ROOT = () => path.join(PROJECT_ROOT, BACKUP_DIR_NAME, 'snapshots');
-
-function snapshotAll() {
-    return snapshotProjectContents(); // Map relPath -> conteúdo (já filtra IGNORED_DIRS, binários e >3MB)
-}
-
-function sanitizeLabel(label) {
-    const s = String(label || '').trim().replace(/[\\/:*?"<>|]/g, '-').replace(/\s+/g, '_');
-    return s.slice(0, 80) || 'snapshot';
-}
-
-app.post('/api/snapshot/create', (req, res) => {
-    const { name, note } = req.body;
-    const label = sanitizeLabel(name);
-    const dir = path.join(SNAPSHOT_ROOT(), label);
-    try {
-        // se já existe, apaga para renomear a versão nova
-        fs.rmSync(dir, { recursive: true, force: true });
-        const files = snapshotAll();
-        let copied = 0;
-        for (const [relPath] of files) {
-            const full = resolveSafePath(relPath);
-            if (!full || !fs.existsSync(full)) continue;
-            const target = path.join(dir, relPath);
-            fs.mkdirSync(path.dirname(target), { recursive: true });
-            try {
-                fs.copyFileSync(full, target);
-                copied++;
-            } catch { /* ignora inúmeros */ }
-        }
-        fs.writeFileSync(path.join(dir, '.meta.json'), JSON.stringify({
-            name: label, note: note || '', createdAt: Date.now(), files: copied
-        }, null, 2));
-        res.json({ success: true, message: `Snapshot "${label}" criado (${copied} arquivos)`, name: label });
-    } catch (e) {
-        res.status(500).json({ error: sanitizeClientError(e) });
-    }
-});
-
-app.post('/api/snapshot/list', (req, res) => {
-    const root = SNAPSHOT_ROOT();
-    const list = [];
-    if (fs.existsSync(root)) {
-        for (const entry of fs.readdirSync(root, { withFileTypes: true })) {
-            if (!entry.isDirectory()) continue;
-            const metaPath = path.join(root, entry.name, '.meta.json');
-            let meta = { name: entry.name, note: '', createdAt: null, files: 0 };
-            try {
-                if (fs.existsSync(metaPath)) meta = { ...meta, ...JSON.parse(fs.readFileSync(metaPath, 'utf-8')) };
-                else meta.createdAt = fs.statSync(path.join(root, entry.name)).mtimeMs;
-            } catch {}
-            list.push(meta);
-        }
-    }
-    list.sort((a, b) => (b.createdAt || 0) - (a.createdAt || 0));
-    res.json({ success: true, snapshots: list });
-});
-
-// Retorna o conteúdo de um arquivo dentro de um snapshot, de forma segura.
-function readSnapshotFile(dir, relPath) {
-    const target = path.resolve(dir, relPath);
-    if (target !== dir && !target.startsWith(dir + path.sep)) return null;
-    if (!fs.existsSync(target) || fs.statSync(target).isDirectory()) return null;
-    return fs.readFileSync(target, 'utf-8');
-}
-
-// Lista os caminhos (relPath) presentes dentro de um snapshot.
-function walkSnapshotFiles(dir) {
-    const out = [];
-    walkProjectFiles(dir, (f) => {
-        if (f.name === '.meta.json') return;
-        out.push(f.relPath);
-    }, { ignoredDirs: new Set(), maxFiles: Infinity });
-    return out;
-}
-
-app.post('/api/snapshot/diff', (req, res) => {
-    const { name } = req.body;
-    const label = sanitizeLabel(name);
-    const root = SNAPSHOT_ROOT();
-    const dir = path.join(root, label);
-    if (!dir.startsWith(root) || !fs.existsSync(dir)) {
-        return res.status(404).json({ error: 'Snapshot não encontrado' });
-    }
-    const changes = { modified: [], created: [], deleted: [], unchanged: 0 };
-    const snapFiles = walkSnapshotFiles(dir);
-
-    // arquivos no snapshot comparados com o projeto atual
-    for (const rel of snapFiles) {
-        const snapContent = readSnapshotFile(dir, rel);
-        const full = resolveSafePath(rel);
-        if (!full || !fs.existsSync(full)) {
-            changes.deleted.push(rel); // existe no snapshot, não existe agora
-            continue;
-        }
-        const cur = fs.readFileSync(full, 'utf-8');
-        if (snapContent === null || snapContent === cur) changes.unchanged++;
-        else changes.modified.push(rel);
-    }
-    // arquivos atuais que não existem no snapshot (criados depois)
-    const currentFiles = snapshotAll();
-    for (const rel of currentFiles.keys()) {
-        const target = path.join(dir, rel);
-        if (!fs.existsSync(target)) changes.created.push(rel);
-    }
-    res.json({ success: true, name: label, changes });
-});
-
-// Restaura um snapshot rotulado por cima do projeto atual.
-app.post('/api/snapshot/restore', (req, res) => {
-    const { name } = req.body;
-    const label = sanitizeLabel(name);
-    const root = SNAPSHOT_ROOT();
-    const dir = path.join(root, label);
-    if (!dir.startsWith(root) || !fs.existsSync(dir)) {
-        return res.status(404).json({ error: 'Snapshot não encontrado' });
-    }
-    let restored = 0;
-    for (const rel of walkSnapshotFiles(dir)) {
-        const src = path.join(dir, rel);
-        const target = resolveSafePath(rel);
-        if (!target) continue;
-        try {
-            fs.mkdirSync(path.dirname(target), { recursive: true });
-            fs.copyFileSync(src, target);
-            restored++;
-        } catch {}
-    }
-    res.json({ success: true, message: `Snapshot "${label}" restaurado (${restored} arquivos)`, restored });
-});
+// Lógica e rotas vivem em ./snapshot.js (registerSnapshotRoutes), injetadas no boot.
+registerSnapshotRoutes(app);
 
 // ===== EXECUTAR COMANDOS =====
 app.post('/api/run', async (req, res) => {
