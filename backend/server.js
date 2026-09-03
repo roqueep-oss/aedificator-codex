@@ -26,6 +26,7 @@ const {
 } = require('./pricing');
 const { configureSnapshot, registerSnapshotRoutes, restoreSnapshot } = require('./snapshot');
 const { registerStateRoutes } = require('./routes-state');
+const { registerProjectRoutes } = require('./routes-project');
 
 // Configura o módulo de snapshots com as dependências dinâmicas do server
 // (getters lazily avaliados: respeitam mudanças de PROJECT_ROOT em runtime).
@@ -2525,21 +2526,13 @@ function getMemoryContext() {
     return `\n\nMEMÓRIA DO PROJETO (tarefas/decisões anteriores):\n${mem}\n`;
 }
 
-app.get('/api/project/rules', (req, res) => {
-    const filePath = path.join(PROJECT_ROOT, AGENTS_FILE);
-    const content = fs.existsSync(filePath) ? fs.readFileSync(filePath, 'utf-8') : '';
-    const defaultTemplate = `# Regras do Projeto\n\n## REGRA DE OURO\n- Pode melhorar o código (refatorar, otimizar, limpar), mas TODAS as funções existentes devem CONTINUAR FUNCIONANDO.\n- Melhore a qualidade sem alterar o comportamento.\n- Se uma função recebe X e retorna Y, continue recebendo X e retornando Y — mesmo que o código interno mude.\n\n## Convenções de Código\n- Use ponto e vírgula\n- Prefira const a let\n- Use arrow functions\n\n## Arquitetura\n- Separe lógica de negócio da UI\n\n## Preferências\n- Prefira alterações mínimas e seguras\n`;
-    res.json({ success: true, content: content || defaultTemplate, exists: fs.existsSync(filePath) });
-});
-
-app.post('/api/project/rules', (req, res) => {
-    const filePath = path.join(PROJECT_ROOT, AGENTS_FILE);
-    try {
-        fs.writeFileSync(filePath, ((req.body.content || '').trim() || '') + '\n', 'utf-8');
-        res.json({ success: true, path: AGENTS_FILE });
-    } catch (e) {
-        res.status(500).json({ error: sanitizeClientError(e) });
-    }
+// Rotas de projeto (rules/summary) e de testes (discover/run) — em ./routes-project.js
+registerProjectRoutes(app, {
+    getProjectRoot: () => PROJECT_ROOT,
+    ignoredDirs: IGNORED_DIRS,
+    sanitizeClientError,
+    detectBuildCommands,
+    detectTestFramework
 });
 
 // =============================================
@@ -5264,38 +5257,6 @@ function detectBuildCommands() {
     return commands;
 }
 
-// ===== ENDPOINT: PROJECT SUMMARY =====
-app.post('/api/project/summary', (req, res) => {
-    if (!PROJECT_ROOT) return res.json({ success: false, error: 'Nenhum projeto aberto' });
-    try {
-        const extCounts = {};
-        let totalFiles = 0;
-        walkProjectFiles(PROJECT_ROOT, (f) => {
-            totalFiles++;
-            const ext = path.extname(f.name).toLowerCase();
-            extCounts[ext] = (extCounts[ext] || 0) + 1;
-        }, { ignoredDirs: IGNORED_DIRS, maxFiles: Infinity });
-        const buildCommands = detectBuildCommands();
-        const testFramework = detectTestFramework();
-        const pkgPath = path.join(PROJECT_ROOT, 'package.json');
-        let pkgName = '', pkgVersion = '';
-        if (fs.existsSync(pkgPath)) {
-            try { const p = JSON.parse(fs.readFileSync(pkgPath, 'utf-8')); pkgName = p.name || ''; pkgVersion = p.version || ''; } catch (e) {}
-        }
-        res.json({
-            success: true,
-            projectRoot: PROJECT_ROOT,
-            name: pkgName || path.basename(PROJECT_ROOT),
-            version: pkgVersion,
-            totalFiles,
-            languages: extCounts,
-            buildCommands,
-            testFramework: testFramework ? testFramework.command : null,
-            timestamp: new Date().toISOString()
-        });
-    } catch (e) { res.status(500).json({ error: sanitizeClientError(e) }); }
-});
-
 // ===== ENDPOINT: BUILD TASK =====
 app.post('/api/project/build', async (req, res) => {
     const { command, args } = req.body || {};
@@ -5598,45 +5559,6 @@ app.post('/api/git/stash', async (req, res) => {
         }
         const r = await runGit(args, PROJECT_ROOT);
         res.json({ success: r.code === 0, output: r.output, error: r.stderr, code: r.code });
-    } catch (e) {
-        res.status(500).json({ error: sanitizeClientError(e) });
-    }
-});
-
-// =============================================
-//  TEST RUNNER
-// =============================================
-app.post('/api/test/discover', (req, res) => {
-    const testPatterns = [/\.test\.(js|ts|jsx|tsx|mjs|cjs)$/i, /\.spec\.(js|ts|jsx|tsx|mjs|cjs)$/i, /__tests__\/.*\.(js|ts|jsx|tsx)$/i];
-    const results = [];
-    walkProjectFiles(PROJECT_ROOT, (f) => {
-        if (testPatterns.some(p => p.test(f.name))) {
-            results.push(f.relPath);
-        }
-    }, { ignoredDirs: IGNORED_DIRS, maxFiles: Infinity });
-    res.json({ success: true, tests: results });
-});
-
-app.post('/api/test/run', async (req, res) => {
-    const { command } = req.body || {};
-    const cmdStr = command || 'node --test';
-    const [cmd, ...args] = cmdStr.split(/\s+/);
-    try {
-        const proc = spawn(cmd, args, { cwd: PROJECT_ROOT, shell: true });
-        let output = '';
-        proc.stdout.on('data', (d) => { output += d.toString('utf8'); });
-        proc.stderr.on('data', (d) => { output += d.toString('utf8'); });
-        proc.on('close', (code) => {
-            res.json({
-                success: true,
-                exitCode: code,
-                output,
-                results: parseTestOutput(output)
-            });
-        });
-        proc.on('error', (err) => {
-            res.json({ success: false, error: err.message });
-        });
     } catch (e) {
         res.status(500).json({ error: sanitizeClientError(e) });
     }
