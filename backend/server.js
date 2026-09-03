@@ -27,6 +27,7 @@ const {
 const { configureSnapshot, registerSnapshotRoutes, restoreSnapshot } = require('./snapshot');
 const { registerStateRoutes } = require('./routes-state');
 const { registerProjectRoutes } = require('./routes-project');
+const { registerConfigRoutes } = require('./routes-config');
 const { setHistoryCtx, registerHistoryRoutes, pushUndoState, undoLastChange, redoLastChange, undoStack, redoStack } = require('./history');
 
 // Injetar dependências dinâmicas do server no módulo de histórico/undo.
@@ -3439,84 +3440,15 @@ app.post('/api/project/create', (req, res) => {
     }
 });
 
-app.post('/api/config', (req, res) => {
-    const { geminiKey, deepseekKey, opencodeKey, openaiKey, claudeKey, openaiModel, claudeModel, deepseekModel, autoCommit, memory, semanticSearch, inlineCompletion } = req.body;
-    if (geminiKey && geminiKey !== '********') config.gemini.apiKey = geminiKey;
-    if (deepseekKey && deepseekKey !== '********') config.deepseek.apiKey = deepseekKey;
-    if (opencodeKey && opencodeKey !== '********') {
-        config.opencode.apiKey = opencodeKey;
-        ensureOpenCodeAuth(opencodeKey);
-    }
-    if (openaiKey && openaiKey !== '********') config.openai.apiKey = openaiKey;
-    if (openaiModel) config.openai.model = openaiModel;
-    if (claudeKey && claudeKey !== '********') config.claude.apiKey = claudeKey;
-    if (claudeModel) config.claude.model = claudeModel;
-    if (deepseekModel) config.deepseek.model = normalizeDeepseekModel(deepseekModel);
-    if (autoCommit !== undefined) config.autoCommit = !!autoCommit;
-    if (memory !== undefined) config.memory = !!memory;
-    if (semanticSearch !== undefined) config.semanticSearch = !!semanticSearch;
-    if (inlineCompletion !== undefined) config.inlineCompletion = !!inlineCompletion;
-
-    try {
-        saveConfigToFile();
-        syncOpenCodeProviderAuth();
-        res.json({ success: true, message: 'Configuração salva!' });
-    } catch (e) {
-        res.status(500).json({ error: sanitizeClientError(e) });
-    }
-});
-
-app.get('/api/config/get', (req, res) => {
-    res.json({
-        success: true,
-        gemini: config.gemini.apiKey ? '********' : '',
-        deepseek: config.deepseek.apiKey ? '********' : '',
-        opencode: config.opencode.apiKey || getOpenCodeAuthKey() ? '********' : '',
-        openai: config.openai.apiKey ? '********' : '',
-        claude: config.claude.apiKey ? '********' : '',
-        openaiModel: config.openai.model || '',
-        claudeModel: config.claude.model || '',
-        deepseekModel: config.deepseek.model || 'deepseek-v4-flash',
-        autoCommit: config.autoCommit,
-        memory: !!config.memory,
-        semanticSearch: !!config.semanticSearch,
-        inlineCompletion: config.inlineCompletion !== false
-    });
-});
-
-app.get('/api/config/status', (req, res) => {
-    res.json({
-        gemini: { configured: !!config.gemini.apiKey },
-        deepseek: { configured: !!config.deepseek.apiKey },
-        opencode: { configured: !!config.opencode.apiKey || !!getOpenCodeAuthKey() },
-        openai: { configured: !!config.openai.apiKey },
-        claude: { configured: !!config.claude.apiKey }
-    });
-});
-
-app.get('/api/config/permissions', (req, res) => {
-    res.json({ success: true, ask: config.toolPermissions.ask || [], grants: config.toolPermissions.grants || {} });
-});
-
-app.post('/api/config/permissions', (req, res) => {
-    const { ask } = req.body || {};
-    if (Array.isArray(ask)) config.toolPermissions.ask = ask;
-    try {
-        saveConfigToFile();
-        res.json({ success: true, ask: config.toolPermissions.ask, grants: config.toolPermissions.grants });
-    } catch (e) {
-        res.status(500).json({ error: sanitizeClientError(e) });
-    }
-});
-
-app.post('/api/config/permissions/reset', (req, res) => {
-    config.toolPermissions.grants = {};
-    try {
-        saveConfigToFile();
-        res.json({ success: true, message: 'Permissões resetadas' });
-    } catch (e) {
-        res.status(500).json({ error: sanitizeClientError(e) });
-    }
+// Rotas de configuração — em ./routes-config.js
+registerConfigRoutes(app, {
+    config,
+    saveConfigToFile,
+    syncOpenCodeProviderAuth,
+    getOpenCodeAuthKey,
+    ensureOpenCodeAuth,
+    normalizeDeepseekModel,
+    sanitizeClientError
 });
 
 app.get('/api/usage', (req, res) => {
