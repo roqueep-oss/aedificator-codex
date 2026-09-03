@@ -287,6 +287,20 @@ test('replace substitui globalmente, versiona e preview não altera', async () =
     assert.ok(backups.body.files.some((f) => /^troca\.txt\.\d+$/.test(f.file)), 'deve haver backup de troca.txt');
 });
 
+// ===== TEST DISCOVER =====
+test('test/discover lista arquivos de teste (raiz e __tests__)', async () => {
+    writeRaw('soma.test.js', 'const { test } = require("node:test");\ntest("ok", () => {});');
+    writeRaw('__tests__/util.spec.ts', 'export const x = 1;');
+    writeRaw('nao-teste.js', 'console.log(1);');
+
+    const r = await post('/api/test/discover', {});
+    assert.strictEqual(r.status, 200);
+    assert.strictEqual(r.body.success, true);
+    assert.ok(r.body.tests.includes('soma.test.js'), 'deve achar soma.test.js');
+    assert.ok(r.body.tests.includes('__tests__/util.spec.ts'), 'deve achar __tests__/util.spec.ts');
+    assert.ok(!r.body.tests.includes('nao-teste.js'), 'não deve listar arquivo comum');
+});
+
 // ===== ANALYZER =====
 test('analyzer/validate valida JS válido e acusa erro de sintaxe', async () => {
     let r = await post('/api/analyzer/validate', { code: 'const x = 1;\nconsole.log(x);', file: 'valid.js' });

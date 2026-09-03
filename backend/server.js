@@ -951,23 +951,14 @@ function listBackups() {
     const backupRoot = path.join(PROJECT_ROOT, BACKUP_DIR_NAME);
     if (!fs.existsSync(backupRoot)) return [];
     const files = [];
-    const walk = (dir, rel) => {
-        for (const entry of fs.readdirSync(dir, { withFileTypes: true })) {
-            const full = path.join(dir, entry.name);
-            const relPath = rel ? `${rel}/${entry.name}` : entry.name;
-            if (entry.isDirectory()) {
-                walk(full, relPath);
-            } else {
-                const m = relPath.match(/^(.*)\.(\d+)$/);
-                files.push({
-                    file: relPath,
-                    path: m ? m[1] : relPath,
-                    modified: fs.statSync(full).mtime.toISOString()
-                });
-            }
-        }
-    };
-    walk(backupRoot, '');
+    walkProjectFiles(backupRoot, (f) => {
+        const m = f.relPath.match(/^(.*)\.(\d+)$/);
+        files.push({
+            file: f.relPath,
+            path: m ? m[1] : f.relPath,
+            modified: fs.statSync(f.full).mtime.toISOString()
+        });
+    }, { ignoredDirs: new Set(), maxFiles: Infinity });
     files.sort((a, b) => (a.path === b.path ? (a.modified < b.modified ? 1 : -1) : a.path.localeCompare(b.path)));
     return files;
 }
@@ -1643,50 +1634,26 @@ ${optionsBlock}`;
 // ===== SNAPSHOT DOS ARQUIVOS PARA DETECTAR MUDANÇAS DO OPEncode =====
 function snapshotProjectFiles() {
     const snapshot = new Map();
-    const walk = (dir, rel) => {
-        let items;
-        try { items = fs.readdirSync(dir, { withFileTypes: true }); } catch (e) { return; }
-        for (const entry of items) {
-            if (entry.isDirectory()) {
-                if (IGNORED_DIRS.has(entry.name)) continue;
-                walk(path.join(dir, entry.name), rel ? `${rel}/${entry.name}` : entry.name);
-                continue;
-            }
-            const relPath = rel ? `${rel}/${entry.name}` : entry.name;
-            const full = path.join(dir, entry.name);
-            try {
-                const st = fs.statSync(full);
-                snapshot.set(relPath.replace(/\\/g, '/'), `${st.size}:${st.mtimeMs}`);
-            } catch (e) {}
-        }
-    };
-    walk(PROJECT_ROOT, '');
+    walkProjectFiles(PROJECT_ROOT, (f) => {
+        try {
+            const st = fs.statSync(f.full);
+            snapshot.set(f.relPath, `${st.size}:${st.mtimeMs}`);
+        } catch (e) {}
+    }, { ignoredDirs: IGNORED_DIRS, maxFiles: Infinity });
     return snapshot;
 }
 
 // ===== SNAPSHOT DO CONTEÚDO DOS ARQUIVOS (ANTES DO OPEncode) =====
 function snapshotProjectContents() {
     const snapshot = new Map();
-    const walk = (dir, rel) => {
-        let items;
-        try { items = fs.readdirSync(dir, { withFileTypes: true }); } catch (e) { return; }
-        for (const entry of items) {
-            if (entry.isDirectory()) {
-                if (IGNORED_DIRS.has(entry.name)) continue;
-                walk(path.join(dir, entry.name), rel ? `${rel}/${entry.name}` : entry.name);
-                continue;
+    walkProjectFiles(PROJECT_ROOT, (f) => {
+        try {
+            const st = fs.statSync(f.full);
+            if (st.size <= 3 * 1024 * 1024 && !isBinaryExtension(f.name)) {
+                snapshot.set(f.relPath, fs.readFileSync(f.full, 'utf-8'));
             }
-            const relPath = rel ? `${rel}/${entry.name}` : entry.name;
-            const full = path.join(dir, entry.name);
-            try {
-                const st = fs.statSync(full);
-                if (st.size <= 3 * 1024 * 1024 && !isBinaryExtension(entry.name)) {
-                    snapshot.set(relPath.replace(/\\/g, '/'), fs.readFileSync(full, 'utf-8'));
-                }
-            } catch (e) {}
-        }
-    };
-    walk(PROJECT_ROOT, '');
+        } catch (e) {}
+    }, { ignoredDirs: IGNORED_DIRS, maxFiles: Infinity });
     return snapshot;
 }
 
@@ -4493,16 +4460,10 @@ function readSnapshotFile(dir, relPath) {
 // Lista os caminhos (relPath) presentes dentro de um snapshot.
 function walkSnapshotFiles(dir) {
     const out = [];
-    const walk = (d, rel) => {
-        let items;
-        try { items = fs.readdirSync(d, { withFileTypes: true }); } catch (e) { return; }
-        for (const entry of items) {
-            if (entry.name === '.meta.json') continue;
-            if (entry.isDirectory()) { walk(path.join(d, entry.name), rel ? `${rel}/${entry.name}` : entry.name); continue; }
-            out.push(rel ? `${rel}/${entry.name}` : entry.name);
-        }
-    };
-    walk(dir, '');
+    walkProjectFiles(dir, (f) => {
+        if (f.name === '.meta.json') return;
+        out.push(f.relPath);
+    }, { ignoredDirs: new Set(), maxFiles: Infinity });
     return out;
 }
 
@@ -5731,18 +5692,11 @@ async function _runPostExecutionDiagnostics(affectedFiles, planResumo) {
     try {
         const detectedFramework = detectTestFramework();
         const testFiles = [];
-        const walkTests = (dir, rel) => {
-            let items;
-            try { items = fs.readdirSync(dir, { withFileTypes: true }); } catch (e) { return; }
-            for (const entry of items) {
-                if (entry.isDirectory()) { if (!IGNORED_DIRS.has(entry.name)) walkTests(path.join(dir, entry.name), rel ? `${rel}/${entry.name}` : entry.name); continue; }
-                const name = entry.name;
-                if (name.match(/\.(test|spec)\.(js|ts|tsx|mjs|cjs|py|go|rs|java|rb|php|kt|swift|dart|scala|ex|exs)$/) || (rel && rel.includes('__tests__'))) {
-                    testFiles.push(rel ? `${rel}/${name}` : name);
-                }
+        walkProjectFiles(PROJECT_ROOT, (f) => {
+            if (f.name.match(/\.(test|spec)\.(js|ts|tsx|mjs|cjs|py|go|rs|java|rb|php|kt|swift|dart|scala|ex|exs)$/) || f.relPath.includes('__tests__')) {
+                testFiles.push(f.relPath);
             }
-        };
-        walkTests(PROJECT_ROOT, '');
+        }, { ignoredDirs: IGNORED_DIRS, maxFiles: Infinity });
         // Só roda testes (e reverte em falha) quando havia testes ANTES do pedido.
         // Teste criado AGORA pelo agente não dispara rollback automático: evita
         // reverter trabalho novo quando o modelo gera teste com sintaxe de outro
@@ -6281,19 +6235,11 @@ app.post('/api/git/stash', async (req, res) => {
 app.post('/api/test/discover', (req, res) => {
     const testPatterns = [/\.test\.(js|ts|jsx|tsx|mjs|cjs)$/i, /\.spec\.(js|ts|jsx|tsx|mjs|cjs)$/i, /__tests__\/.*\.(js|ts|jsx|tsx)$/i];
     const results = [];
-    const walk = (dir, rel) => {
-        let items;
-        try { items = fs.readdirSync(dir, { withFileTypes: true }); } catch (e) { return; }
-        for (const entry of items) {
-            if (entry.isDirectory()) {
-                if (IGNORED_DIRS.has(entry.name)) continue;
-                walk(path.join(dir, entry.name), rel ? `${rel}/${entry.name}` : entry.name);
-            } else if (testPatterns.some(p => p.test(entry.name))) {
-                results.push(rel ? `${rel}/${entry.name}` : entry.name);
-            }
+    walkProjectFiles(PROJECT_ROOT, (f) => {
+        if (testPatterns.some(p => p.test(f.name))) {
+            results.push(f.relPath);
         }
-    };
-    walk(PROJECT_ROOT, '');
+    }, { ignoredDirs: IGNORED_DIRS, maxFiles: Infinity });
     res.json({ success: true, tests: results });
 });
 
