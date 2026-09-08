@@ -4028,6 +4028,36 @@ registerStateRoutes(app, { getProjectRoot: () => PROJECT_ROOT, sanitizeClientErr
 // =============================================
 //  ANALYZER — validação e indexação de código
 // =============================================
+// ===== DIAGNÓSTICOS TS DO PROJETO INTEIRO (cross-file) =====
+// Reporta erros de TODOS os arquivos .ts/.tsx do projeto (inclui arquivos
+// fechados quebrados por mudanças em outros arquivos). Rebuild do programa só
+// quando a assinatura (lista+mtime dos .ts) muda ou a cada 30s.
+const tsProjectCache = { key: '', errors: null, at: 0 };
+app.post('/api/analyzer/project-errors', (req, res) => {
+    try {
+        if (!PROJECT_ROOT || !fs.existsSync(PROJECT_ROOT)) return res.json({ success: true, errors: [] });
+        const tsFiles = [];
+        walkProjectFiles(PROJECT_ROOT, (f) => {
+            if (/\.(ts|tsx|mts|cts)$/i.test(f.relPath) && !/\.d\.ts$/i.test(f.relPath)) tsFiles.push(f.relPath);
+        }, { maxFiles: Infinity });
+
+        let key = '';
+        for (const f of tsFiles) {
+            try { const st = fs.statSync(path.join(PROJECT_ROOT, f)); key += f + ':' + st.mtimeMs + ';'; }
+            catch (e) { key += f + ':0;'; }
+        }
+        const now = Date.now();
+        if (tsProjectCache.key !== key || now - tsProjectCache.at > 30000) {
+            tsProjectCache.errors = analyzer.getTSProjectErrors(PROJECT_ROOT, tsFiles);
+            tsProjectCache.key = key;
+            tsProjectCache.at = now;
+        }
+        res.json({ success: true, files: tsFiles.length, errors: tsProjectCache.errors || [] });
+    } catch (e) {
+        res.json({ success: true, errors: [] });
+    }
+});
+
 app.post('/api/analyzer/validate', (req, res) => {
     const { code, file: filePath } = req.body || {};
     if (!code || !filePath) return res.status(400).json({ error: 'Código e caminho do arquivo são obrigatórios' });

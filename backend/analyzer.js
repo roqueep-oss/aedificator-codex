@@ -20,6 +20,9 @@ function getAcorn() {
 
 function getTypeScript() {
     if (tsCompiler) return tsCompiler;
+    // IMPORTANTE: manter no TypeScript 6.x (API clássica createProgram/…). O
+    // TypeScript 7 (nativo/Go) não exporta mais essa API via require('typescript')
+    // — só subcaminhos "unstable", o que quebraria todo o type-check do analyzer.
     try { tsCompiler = require('typescript'); } catch (e) {}
     return tsCompiler;
 }
@@ -696,6 +699,74 @@ function validateWithTSProgram(filePath, rootDir) {
         errors.push({ type: 'typescript', line: 1, column: 1, message: 'Type-check falhou: ' + e.message, severity: 'error' });
     }
 
+    return errors;
+}
+
+// =============================================
+//  TYPE-CHECKING DO PROJETO INTEIRO (cross-file)
+//  Cria UM programa TypeScript com todos os arquivos TS/TSX do projeto e
+//  reporta erros por arquivo — inclusive em arquivos FECHADOS quebrados por uma
+//  mudança feita em outro arquivo (o validateWithTSProgram só olha um arquivo +
+//  a cadeia de imports dele). `files` = caminhos relativos (posix) dos .ts/.tsx.
+// =============================================
+function getTSProjectErrors(rootDir, files) {
+    const errors = [];
+    const ts = getTypeScript();
+    if (!ts || !rootDir) return errors;
+    const relFiles = (files || [])
+        .filter((f) => /\.(ts|tsx|mts|cts)$/i.test(f) && !/\.d\.ts$/i.test(f))
+        .slice(0, 4000);
+    if (relFiles.length === 0) return errors;
+
+    try {
+        const absFiles = relFiles.map((f) => path.resolve(rootDir, f)).filter((p) => fs.existsSync(p));
+        if (absFiles.length === 0) return errors;
+
+        let compilerOptions = {
+            target: 99, module: 1, moduleResolution: 2, jsx: 4, // ESNext/CommonJS/NodeJs/ReactJSX
+            strict: true,
+            esModuleInterop: true,
+            allowSyntheticDefaultImports: true,
+            skipLibCheck: true,
+            noEmit: true,
+            lib: ['lib.es2022.d.ts', 'lib.dom.d.ts']
+        };
+        // Respeita o tsconfig do projeto (options); mantém noEmit/skipLibCheck.
+        try {
+            const cfgPath = path.join(rootDir, 'tsconfig.json');
+            if (fs.existsSync(cfgPath)) {
+                const read = ts.readConfigFile ? ts.readConfigFile(cfgPath, (p) => fs.readFileSync(p, 'utf-8')) : null;
+                if (read && !read.error && read.config) {
+                    const parsed = ts.parseJsonConfigFileContent
+                        ? ts.parseJsonConfigFileContent(read.config, ts.sys, rootDir)
+                        : null;
+                    if (parsed && parsed.options) {
+                        compilerOptions = { ...compilerOptions, ...parsed.options, noEmit: true, skipLibCheck: true };
+                    }
+                }
+            }
+        } catch (e) {}
+
+        const program = ts.createProgram(absFiles, compilerOptions);
+        for (const absFile of absFiles) {
+            const sf = program.getSourceFile(absFile);
+            if (!sf) continue;
+            const diags = program.getSemanticDiagnostics(sf);
+            for (const d of diags) {
+                const pos = d.file ? d.file.getLineAndCharacterOfPosition(d.start || 0) : { line: 0, character: 0 };
+                errors.push({
+                    file: path.relative(rootDir, absFile).replace(/\\/g, '/'),
+                    line: pos.line + 1,
+                    column: pos.character + 1,
+                    message: ts.flattenDiagnosticMessageText(d.messageText, '\n').slice(0, 600),
+                    severity: d.category === 1 ? 'error' : d.category === 2 ? 'warning' : 'info',
+                    code: d.code
+                });
+            }
+        }
+    } catch (e) {
+        errors.push({ file: '', line: 1, column: 1, message: 'Type-check do projeto falhou: ' + e.message, severity: 'warning', code: 0 });
+    }
     return errors;
 }
 
@@ -2290,6 +2361,7 @@ module.exports = {
     detectCodeSmellsEnhanced,
     splitSubWords,
     validateWithTSProgram,
+    getTSProjectErrors,
     getTSSymbols,
     validateWithPythonAST,
     getPythonSymbols,

@@ -4396,6 +4396,35 @@ async function _runDiagnostics() {
                 });
             }
         }
+
+        // TypeScript/JavaScript: soma os erros do PROJETO INTEIRO (cross-file).
+        // Captura erros em arquivos fechados quebrados por esta edição.
+        const isTsExt = /\.(ts|tsx|mts|cts)$/i.test(activeTabPath);
+        if (isTsExt && currentProjectPath) {
+            try {
+                const proj = await (await apiFetch('/api/analyzer/project-errors', {
+                    method: 'POST', headers: { 'Content-Type': 'application/json' }, body: '{}'
+                })).json();
+                if (proj.errors) {
+                    const seen = new Set(markers.map((m) => `${m.startLineNumber}:${m.startColumn}:${m.message}`));
+                    for (const err of proj.errors) {
+                        if (err.file && err.file !== activeTabPath) continue;
+                        const key = `${err.line}:${err.column}:${err.message}`;
+                        if (seen.has(key)) continue;
+                        seen.add(key);
+                        markers.push({
+                            severity: err.severity === 'error' ? monaco.MarkerSeverity.Error : monaco.MarkerSeverity.Warning,
+                            message: err.message || 'Error',
+                            startLineNumber: parseInt(err.line) || 1,
+                            startColumn: parseInt(err.column) || 1,
+                            endLineNumber: parseInt(err.line) || 1,
+                            endColumn: 100,
+                        });
+                    }
+                }
+            } catch (e) {}
+        }
+
         monaco.editor.removeAllMarkers();
         if (markers.length) {
             monaco.editor.setModelMarkers(monacoEditor.getModel(), 'analyzer', markers);

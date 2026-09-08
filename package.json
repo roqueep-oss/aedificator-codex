@@ -132,7 +132,7 @@
     "merge-descriptors": "^2.0.0",
     "monaco-editor": "^0.56.0",
     "puppeteer-core": "^25.5.0",
-    "typescript": "^7.0.2",
+    "typescript": "^6.0.3",
     "ws": "^8.21.1"
   }
 }
