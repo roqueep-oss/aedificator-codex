@@ -34,11 +34,26 @@ function stopServer(child, root) {
         } else {
             child.kill('SIGKILL');
         }
-        const attempt = (n) => {
-            try { fs.rmSync(root, { recursive: true, force: true }); resolve(); }
-            catch (e) { if (n >= 3) resolve(); else setTimeout(() => attempt(n + 1), 300); }
+        // Aguarda a porta realmente fechar antes do próximo teste spawnar na
+        // mesma porta (evita corrida/flake do tipo "fetch failed").
+        const waitClosed = (tries) => {
+            const sock = net.connect(PORT, '127.0.0.1');
+            sock.on('connect', () => {
+                sock.destroy();
+                if (tries > 50) { rm(); return; }
+                setTimeout(() => waitClosed(tries + 1), 120);
+            });
+            sock.on('error', () => { sock.destroy(); rm(); });
         };
-        setTimeout(() => attempt(0), 300);
+        const rm = () => {
+            let n = 0;
+            const attempt = () => {
+                try { fs.rmSync(root, { recursive: true, force: true }); resolve(); }
+                catch (e) { if (n >= 5) resolve(); else { n += 1; setTimeout(attempt, 300); } }
+            };
+            attempt();
+        };
+        setTimeout(() => waitClosed(0), 200);
     });
 }
 function waitForPort(t = 10000) {

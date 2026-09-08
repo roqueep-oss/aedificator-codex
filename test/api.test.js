@@ -31,6 +31,28 @@ function authHeaders() {
     return { 'Authorization': `Bearer ${TOKEN}` };
 }
 
+// Aguarda a porta deixar de aceitar conexões (evita corrida entre testes que
+// reutilizam a mesma porta: o socket do processo antigo pode responder por um
+// instante após o kill, derrubando o fetch do teste seguinte com "fetch failed").
+function waitPortClosed(timeoutMs = 6000) {
+    return new Promise((resolve) => {
+        const start = Date.now();
+        const check = () => {
+            const sock = net.connect(PORT, '127.0.0.1');
+            sock.on('connect', () => {
+                sock.destroy();
+                if (Date.now() - start > timeoutMs) resolve();
+                else setTimeout(check, 120);
+            });
+            sock.on('error', () => {
+                sock.destroy();
+                resolve();
+            });
+        };
+        check();
+    });
+}
+
 function stopServer(child, projectRoot) {
     return new Promise((resolve) => {
         if (process.platform === 'win32') {
@@ -38,13 +60,15 @@ function stopServer(child, projectRoot) {
         } else {
             child.kill('SIGKILL');
         }
-        let cleaned = false;
-        const attempt = (n) => {
-            if (cleaned) return;
-            try { fs.rmSync(projectRoot, { recursive: true, force: true }); cleaned = true; resolve(); }
-            catch (_) { if (n >= 3) resolve(); else setTimeout(() => attempt(n + 1), 300); }
-        };
-        setTimeout(() => attempt(0), 300);
+        waitPortClosed().then(() => {
+            let cleaned = false;
+            const attempt = (n) => {
+                if (cleaned) return;
+                try { fs.rmSync(projectRoot, { recursive: true, force: true }); cleaned = true; resolve(); }
+                catch (_) { if (n >= 3) resolve(); else setTimeout(() => attempt(n + 1), 300); }
+            };
+            attempt(0);
+        });
     });
 }
 
