@@ -561,6 +561,19 @@ async function runSmokeTest(backendOk) {
         const health = await fetch(`http://127.0.0.1:${BACKEND_PORT}/api/health`, { headers });
         if (health.status !== 200) return fail(`health respondeu ${health.status}`);
         smokeLog('health OK');
+
+        // Frontend e assets empacotados precisam ser servidos de dentro do asar:
+        // valida index.html (com token injetado) e os assets críticos (monaco).
+        const index = await fetch(`http://127.0.0.1:${BACKEND_PORT}/`);
+        const indexHtml = await index.text();
+        if (index.status !== 200 || !/<script/i.test(indexHtml)) {
+            return fail(`index.html não foi servido corretamente (status ${index.status})`);
+        }
+        const loader = await fetch(`http://127.0.0.1:${BACKEND_PORT}/node_modules/monaco-editor/min/vs/loader.js`);
+        if (loader.status !== 200) return fail(`monaco loader respondeu ${loader.status}`);
+        const appJs = await fetch(`http://127.0.0.1:${BACKEND_PORT}/script.js`);
+        if (appJs.status !== 200) return fail(`script.js respondeu ${appJs.status}`);
+        smokeLog('frontend + monaco servidos OK');
         // Força uma gravação real de config no diretório de dados gravável
         // (regressão do bug em que o app empacotado tentava gravar no asar).
         const cfg = await fetch(`http://127.0.0.1:${BACKEND_PORT}/api/config`, {
