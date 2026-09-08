@@ -11,12 +11,12 @@ const TOKEN = 'test-token-123';
 const BASE = `http://127.0.0.1:${PORT}`;
 const SERVER_PATH = path.join(__dirname, '..', 'backend', 'server.js');
 
-function startServer(token = TOKEN) {
+function startServer(token = TOKEN, port = PORT) {
     const projectRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'aedificator-ide-test-'));
     const child = spawn(process.execPath, [SERVER_PATH], {
         env: {
             ...process.env,
-            PORT: String(PORT),
+            PORT: String(port),
             BACKEND_TOKEN: token,
             PROJECT_ROOT: projectRoot,
             AED_DATA_DIR: projectRoot
@@ -34,11 +34,11 @@ function authHeaders() {
 // Aguarda a porta deixar de aceitar conexões (evita corrida entre testes que
 // reutilizam a mesma porta: o socket do processo antigo pode responder por um
 // instante após o kill, derrubando o fetch do teste seguinte com "fetch failed").
-function waitPortClosed(timeoutMs = 6000) {
+function waitPortClosed(port = PORT, timeoutMs = 6000) {
     return new Promise((resolve) => {
         const start = Date.now();
         const check = () => {
-            const sock = net.connect(PORT, '127.0.0.1');
+            const sock = net.connect(port, '127.0.0.1');
             sock.on('connect', () => {
                 sock.destroy();
                 if (Date.now() - start > timeoutMs) resolve();
@@ -53,14 +53,14 @@ function waitPortClosed(timeoutMs = 6000) {
     });
 }
 
-function stopServer(child, projectRoot) {
+function stopServer(child, projectRoot, port = PORT) {
     return new Promise((resolve) => {
         if (process.platform === 'win32') {
             try { require('child_process').execSync(`taskkill /F /PID ${child.pid} /T`, { stdio: 'ignore' }); } catch (_) {}
         } else {
             child.kill('SIGKILL');
         }
-        waitPortClosed().then(() => {
+        waitPortClosed(port).then(() => {
             let cleaned = false;
             const attempt = (n) => {
                 if (cleaned) return;
@@ -72,11 +72,11 @@ function stopServer(child, projectRoot) {
     });
 }
 
-function waitForPort(timeoutMs = 10000) {
+function waitForPort(port = PORT, timeoutMs = 10000) {
     return new Promise((resolve, reject) => {
         const start = Date.now();
         const tryConnect = () => {
-            const sock = net.connect(PORT, '127.0.0.1');
+            const sock = net.connect(port, '127.0.0.1');
             sock.on('connect', () => {
                 sock.destroy();
                 resolve();
@@ -110,13 +110,16 @@ test('health check responde ok', async (t) => {
 });
 
 test('auth requer token bearer', async (t) => {
-    const { child, projectRoot } = startServer();
+    // Porta própria: testes que sobem servidor consecutivamente NÃO reutilizam
+    // a mesma porta (elimina a corrida do socket antigo ainda aceitando conexão).
+    const AUTH_PORT = 3997;
+    const { child, projectRoot } = startServer(TOKEN, AUTH_PORT);
     try {
-        await waitForPort();
-        const res = await fetch(`${BASE}/api/health`);
+        await waitForPort(AUTH_PORT);
+        const res = await fetch(`http://127.0.0.1:${AUTH_PORT}/api/health`);
         assert.strictEqual(res.status, 401);
     } finally {
-        stopServer(child, projectRoot);
+        stopServer(child, projectRoot, AUTH_PORT);
     }
 });
 
@@ -170,7 +173,7 @@ test('main.js trata erros não tratados com exit', async (t) => {
     // O servidor deve iniciar e as handlers de erro agora chamam process.exit(1)
     // em vez de silenciar eventos não tratados.
     await new Promise(r => setTimeout(r, 2000));
-    stopServer(child, projectRoot).then(() => {
+    stopServer(child, projectRoot, PORT).then(() => {
         // O importante é que as handlers existem e chamam process.exit
         // (verificação de que o código não falha silenciosamente)
         assert.ok(true, 'Handlers de erro configurados com process.exit');
