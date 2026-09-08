@@ -187,6 +187,62 @@ function getFileIcon(name) {
 }
 
 // =============================================
+//  INTELLISENSE TIPO-PROFUNDO (TypeScript / JavaScript)
+//  Ativa o Language Service nativo do Monaco (worker TS/JS), que entrega
+//  completions, hover, definição, referências e rename BASEADOS EM TIPO. Os
+//  providers heurísticos do Aedificator (analyzer por palavra/arquivo) ficam
+//  apenas como reserva para linguagens sem serviço nativo no Monaco (py/go...).
+// =============================================
+let _nativeTsReady = false;
+const TS_NATIVE_IDS = new Set(['typescript', 'javascript']);
+
+function isTsNativeManaged(langId) {
+    return _nativeTsReady && TS_NATIVE_IDS.has(langId);
+}
+
+function configureNativeTypeScript() {
+    try {
+        const t = window.monaco && monaco.languages && monaco.languages.typescript;
+        if (!t) { _nativeTsReady = false; return false; }
+        // Valores numéricos = enum do TS: ESNext(99), ModuleKind ESNext(99),
+        // ModuleResolutionKind.NodeJs(2), JsxEmit.ReactJSX(4).
+        const compilerOptions = {
+            target: 99, module: 99, moduleResolution: 2,
+            allowJs: true, checkJs: false, jsx: 4, esModuleInterop: true,
+            allowSyntheticDefaultImports: true, skipLibCheck: true, noEmit: true
+        };
+        if (t.typescriptDefaults && t.typescriptDefaults.setCompilerOptions) t.typescriptDefaults.setCompilerOptions(compilerOptions);
+        if (t.javascriptDefaults && t.javascriptDefaults.setCompilerOptions) t.javascriptDefaults.setCompilerOptions(compilerOptions);
+        const diag = { noSemanticValidation: false, noSyntaxValidation: false, noSuggestionDiagnostics: false };
+        if (t.typescriptDefaults && t.typescriptDefaults.setDiagnosticsOptions) t.typescriptDefaults.setDiagnosticsOptions(diag);
+        if (t.javascriptDefaults && t.javascriptDefaults.setDiagnosticsOptions) t.javascriptDefaults.setDiagnosticsOptions(diag);
+        _nativeTsReady = true;
+        console.log('🧠 IntelliSense TS/JS nativo ativado (worker do Monaco)');
+        return true;
+    } catch (e) {
+        console.error('Falha ao ativar IntelliSense TS nativo:', e && e.message);
+        _nativeTsReady = false;
+        return false;
+    }
+}
+
+function ensureNativeTypeScript() {
+    // Se o editor.main do Monaco já registrou o serviço TS, configura na hora.
+    try {
+        if (window.monaco && monaco.languages && monaco.languages.typescript) {
+            configureNativeTypeScript();
+            return;
+        }
+    } catch (e) {}
+    // Caso contrário, carrega a contribution do TS (worker) de forma explícita.
+    try {
+        require(['vs/language/typescript/monaco.contribution'], function () {
+            configureNativeTypeScript();
+        }, function () { _nativeTsReady = false; });
+    } catch (e) { _nativeTsReady = false; }
+}
+
+// =============================================
 //  MONACO EDITOR - inicialização
 // =============================================
 function initMonacoEditor() {
@@ -194,6 +250,7 @@ function initMonacoEditor() {
         if (typeof require !== 'function') return;
         require(['vs/editor/editor.main'], function () {
             monacoReady = true;
+            ensureNativeTypeScript();
             const container = document.getElementById('monacoContainer');
             if (!container) return;
             const isLight = document.body.classList.contains('theme-light');
@@ -8079,6 +8136,7 @@ let _aedCompletionCache = null;
 let _aedCompletionCacheTs = 0;
 
 async function provideAedCompletionItems(model, position) {
+    if (isTsNativeManaged(model.getLanguageId())) return { suggestions: [] };
     const word = model.getWordUntilPosition(position);
     const range = { startLineNumber: position.lineNumber, endLineNumber: position.lineNumber, startColumn: word.startColumn, endColumn: word.endColumn };
     const suggestions = [];
@@ -8238,6 +8296,7 @@ async function provideGoCompletions(model, position) {
 }
 
 async function provideAedHover(model, position) {
+    if (isTsNativeManaged(model.getLanguageId())) return null;
     const word = model.getWordAtPosition(position);
     if (!word) return null;
     try {
@@ -8256,6 +8315,7 @@ async function provideAedHover(model, position) {
 }
 
 async function provideAedDefinition(model, position) {
+    if (isTsNativeManaged(model.getLanguageId())) return [];
     const word = model.getWordAtPosition(position);
     if (!word) return [];
     try {
@@ -8273,6 +8333,7 @@ async function provideAedDefinition(model, position) {
 }
 
 async function provideAedReferences(model, position, context) {
+    if (isTsNativeManaged(model.getLanguageId())) return [];
     const word = model.getWordAtPosition(position);
     if (!word) return [];
     try {
@@ -8458,6 +8519,7 @@ function provideAIQuickFixes(model, range, context) {
     return { actions: actions, dispose: function() {} };
 }
 async function provideAedRenameEdits(model, position, newName) {
+    if (isTsNativeManaged(model.getLanguageId())) return null;
     const word = model.getWordAtPosition(position);
     if (!word) return null;
     try {
@@ -8479,6 +8541,7 @@ async function provideAedRenameEdits(model, position, newName) {
 }
 
 function provideAedRenameLocation(model, position) {
+    if (isTsNativeManaged(model.getLanguageId())) return null;
     const word = model.getWordAtPosition(position);
     if (!word) return null;
     return {
@@ -8491,6 +8554,7 @@ function provideAedRenameLocation(model, position) {
 //  REFERENCE CODELENS
 // =============================================
 async function provideAedReferenceCodeLenses(model) {
+    if (isTsNativeManaged(model.getLanguageId())) return { lenses: [], dispose: () => {} };
     if (!currentProjectPath || !activeTabPath) return { lenses: [], dispose: () => {} };
     const text = model.getValue();
     const lenses = [];
