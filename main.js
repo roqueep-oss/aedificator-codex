@@ -573,6 +573,23 @@ async function runSmokeTest(backendOk) {
         await new Promise((r) => setTimeout(r, 400));
         const configFile = path.join(AED_DATA_DIR, 'config.json');
         if (!fs.existsSync(configFile)) return fail('config.json não foi gravado em AED_DATA_DIR (userData)');
+
+        // Garantia de privacidade: o app empacotado NUNCA pode nascer com as
+        // chaves do desenvolvedor. Se algum dia o config.json do dev vazar para
+        // o pacote, ele seria decifrado (BACKEND_SECRET viaja no asar) e copiado
+        // para o userData — este check falha o build nesse caso.
+        try {
+            const saved = JSON.parse(fs.readFileSync(configFile, 'utf-8'));
+            const vazadas = ['gemini', 'deepseek', 'opencode', 'openai', 'claude']
+                .filter((p) => saved[p] && String(saved[p].apiKey || '').length > 0);
+            if (vazadas.length > 0) {
+                return fail(`config.json empacotado vazou chaves de: ${vazadas.join(', ')} (chaves do desenvolvedor NÃO podem ir para o instalador)`);
+            }
+            smokeLog('chaves em branco OK (config gerado sem chaves do desenvolvedor)');
+        } catch (e) {
+            return fail(`falha ao validar config.json gerado: ${e.message}`);
+        }
+
         smokeLog(`SMOKE_OK config.json em: ${configFile}`);
         try { if (backendProcess) backendProcess.kill(); } catch (e) {}
         app.exit(0);
