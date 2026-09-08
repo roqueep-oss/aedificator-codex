@@ -159,6 +159,13 @@ async function references(root, relPath, line, offset, content) {
     return send(root, 'references', { file, line, offset });
 }
 
+// Retorna as localizações que seriam renomeadas (tsserver 'rename'):
+// { info, locs: [{ file, start:{line,offset}, end:{line,offset} }] }.
+async function renameLocations(root, relPath, line, offset, content) {
+    const file = await ensureOpenFile(root, relPath, content);
+    return send(root, 'rename', { file, line, offset, findInComments: false, findInStrings: false });
+}
+
 async function completions(root, relPath, line, offset, prefix, content) {
     const file = await ensureOpenFile(root, relPath, content);
     return send(root, 'completions', { file, line, offset, prefix });
@@ -166,5 +173,5 @@ async function completions(root, relPath, line, offset, prefix, content) {
 
 module.exports = {
     tsserverPath, disposeRoot, disposeAll,
-    ensureOpenFile, quickinfo, definition, references, completions, send
+    ensureOpenFile, quickinfo, definition, references, renameLocations, completions, send
 };

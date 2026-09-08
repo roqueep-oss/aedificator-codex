@@ -4116,6 +4116,95 @@ app.post('/api/lsp/ts/close', (req, res) => {
     res.json({ success: true });
 });
 
+// Rename de símbolo no PROJETO INTEIRO: usa o tsserver para achar todas as
+// ocorrências (inclusive em arquivos FECHADOS) e reescreve os arquivos em disco.
+// O worker nativo do Monaco só renomeia nas abas abertas — este cobre o resto.
+function absOffsetToIndex(content, line, offset) {
+    const lines = content.split('\n');
+    let idx = 0;
+    for (let i = 0; i < line - 1 && i < lines.length; i++) idx += lines[i].length + 1;
+    idx += Math.max(0, (offset || 1) - 1);
+    return Math.min(idx, content.length);
+}
+
+app.post('/api/lsp/ts/rename', async (req, res) => {
+    try {
+        if (!PROJECT_ROOT) return lspErr(res, new Error('Nenhum projeto aberto'));
+        const { file, line, offset, newName, content } = req.body || {};
+        if (!file || !newName) return lspErr(res, new Error('file e newName são obrigatórios'));
+
+        // tsserver 'rename' normaliza para [{file,start,end}].
+        const normalize = (body) => {
+            const out = [];
+            if (!body) return out;
+            if (Array.isArray(body)) {
+                for (const it of body) if (it && it.file) out.push({ file: it.file, start: it.start, end: it.end });
+                return out;
+            }
+            for (const g of Array.isArray(body.locs) ? body.locs : []) {
+                if (!g) continue;
+                if (g.file && Array.isArray(g.locs)) {
+                    for (const inl of g.locs) if (inl) out.push({ file: g.file, start: inl.start, end: inl.end });
+                } else if (g.file) {
+                    out.push({ file: g.file, start: g.start, end: g.end });
+                }
+            }
+            return out;
+        };
+
+        let body = await tsbridge.renameLocations(PROJECT_ROOT, file, lspInt(line), lspInt(offset), content);
+        let locs = normalize(body);
+
+        // Renomear a partir do USO de um símbolo importado pode dar canRename:false;
+        // nesse caso, descobre a declaração (definition) e renomeia a partir dela.
+        if (locs.length === 0 && body && body.info && body.info.canRename === false) {
+            const def = await tsbridge.definition(PROJECT_ROOT, file, lspInt(line), lspInt(offset), content);
+            if (Array.isArray(def) && def.length && def[0] && def[0].file) {
+                const d0 = def[0];
+                const rootNormD = path.resolve(PROJECT_ROOT).replace(/\\/g, '/');
+                const absD = String(d0.file).replace(/\\/g, '/');
+                if (absD.toLowerCase().startsWith(rootNormD.toLowerCase())) {
+                    const relD = absD.slice(rootNormD.length).replace(/^\/+/, '');
+                    const dStart = d0.start || { line: 1, offset: 1 };
+                    body = await tsbridge.renameLocations(PROJECT_ROOT, relD, dStart.line || 1, dStart.offset || 1);
+                    locs = normalize(body);
+                }
+            }
+        }
+
+        const rootNorm = path.resolve(PROJECT_ROOT).replace(/\\/g, '/');
+        const perFile = new Map();
+        let outside = 0;
+        for (const loc of locs) {
+            const abs = String(loc.file || '').replace(/\\/g, '/');
+            if (!abs.toLowerCase().startsWith(rootNorm.toLowerCase())) { outside++; continue; }
+            const rel = abs.slice(rootNorm.length).replace(/^\/+/, '');
+            if (/\/node_modules\//.test('/' + rel) || /\.d\.ts$/.test(rel)) { outside++; continue; }
+            if (!perFile.has(rel)) perFile.set(rel, []);
+            perFile.get(rel).push({ s: loc.start, e: loc.end });
+        }
+
+        const changed = [];
+        for (const [rel, edits] of perFile) {
+            const full = path.join(PROJECT_ROOT, rel);
+            if (!fs.existsSync(full)) continue;
+            let text = fs.readFileSync(full, 'utf-8');
+            const ordered = [...edits].sort((a, b) => absOffsetToIndex(text, b.s.line, b.s.offset) - absOffsetToIndex(text, a.s.line, a.s.offset));
+            for (const ed of ordered) {
+                const startIdx = absOffsetToIndex(text, ed.s.line, ed.s.offset);
+                const endIdx = absOffsetToIndex(text, ed.e.line, ed.e.offset);
+                if (endIdx <= startIdx) continue;
+                text = text.slice(0, startIdx) + newName + text.slice(endIdx);
+            }
+            const tmp = full + '.aedtmp';
+            fs.writeFileSync(tmp, text, 'utf-8');
+            fs.renameSync(tmp, full);
+            changed.push(rel);
+        }
+        res.json({ success: true, changed, outside });
+    } catch (e) { lspErr(res, e); }
+});
+
 app.post('/api/analyzer/validate', (req, res) => {
     const { code, file: filePath } = req.body || {};
     if (!code || !filePath) return res.status(400).json({ error: 'Código e caminho do arquivo são obrigatórios' });

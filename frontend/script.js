@@ -384,6 +384,14 @@ function initMonacoEditor() {
                 }
             });
 
+            // Renomear símbolo no projeto inteiro (Ctrl+Shift+R) — via bridge LSP
+            monacoEditor.addAction({
+                id: 'aed-rename-project',
+                label: '🔁 Renomear símbolo no projeto inteiro',
+                keybindings: [monaco.KeyMod.CtrlCmd | monaco.KeyMod.Shift | monaco.KeyCode.KeyR],
+                run: function (ed) { renameProjectSymbolViaBridge(ed); }
+            });
+
             monaco.languages.registerCompletionItemProvider(['javascript', 'typescript', 'javascriptreact', 'typescriptreact'], {
                 provideCompletionItems: function (model, position) {
                     return provideAedCompletionItems(model, position);
@@ -8361,6 +8369,47 @@ function bridgeFilterClosed(locations) {
         }
         return !openRel.has(rel);
     });
+}
+
+async function renameProjectSymbolViaBridge(ed) {
+    try {
+        const model = ed.getModel();
+        const pos = ed.getPosition();
+        if (!model || !pos || !activeTabPath) return;
+        if (!/\.(ts|tsx|mts|cts)$/i.test(activeTabPath)) { showToast('Abra um arquivo TS/TSX para renomear no projeto'); return; }
+        const tab = editorTabs.find(t => t.path === activeTabPath);
+        if (tab && tab.dirty) { showToast('💾 Salve o arquivo antes de renomear no projeto inteiro'); return; }
+        const word = model.getWordAtPosition(pos);
+        if (!word || !word.word) return;
+        const newName = window.prompt(`Novo nome para "${word.word}" (projeto inteiro):`, word.word);
+        if (!newName || newName === word.word) return;
+        const res = await apiFetch('/api/lsp/ts/rename', {
+            method: 'POST', headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ file: activeTabPath, line: pos.lineNumber, offset: pos.column, newName, content: model.getValue() })
+        });
+        const data = await res.json();
+        if (!data.success) { showToast('❌ Rename falhou: ' + (data.error || 'erro')); return; }
+        await reloadChangedFiles(data.changed || []);
+        showToast('✅ Renomeado para "' + newName + '" em ' + (data.changed || []).length + ' arquivo(s)');
+    } catch (e) { showToast('❌ Rename: ' + e.message); }
+}
+
+// Após o rename no disco, recarrega os arquivos abertos afetados.
+async function reloadChangedFiles(rels) {
+    for (const rel of rels || []) {
+        try {
+            const res = await apiFetch('/api/file/read', {
+                method: 'POST', headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ path: rel })
+            });
+            const data = await res.json();
+            const tab = (editorTabs || []).find(t => t.path === rel);
+            if (!tab) continue;
+            if (data.success && data.content !== undefined) tab.content = data.content;
+            if (monacoModels[rel]) { try { monacoModels[rel].dispose(); } catch (e) {} delete monacoModels[rel]; }
+            if (activeTabPath === rel) renderActiveTab();
+        } catch (e) {}
+    }
 }
 
 async function provideTsLspHover(model, position) {

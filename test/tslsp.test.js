@@ -113,6 +113,17 @@ test('LSP tsserver resolve tipos de arquivo FECHADO (definition + completions)',
         const refFiles = (refs.body || []).map((r) => String(r.file || '').replace(/\\/g, '/'));
         assert.ok(refFiles.some((f) => /main\.ts$/.test(f)), 'references deve incluir o uso em main.ts');
         assert.ok(refFiles.some((f) => /lib\/dep\.ts$/.test(f)), 'references deve incluir a declaração em dep.ts');
+
+        // 5) rename no projeto inteiro reescreve main.ts E lib/dep.ts (fechado)
+        const rn = await call('/api/lsp/ts/rename', { file: 'main.ts', line: 2, offset: offsetGreeter, newName: 'Saudacao' });
+        assert.strictEqual(rn.success, true, JSON.stringify(rn));
+        assert.ok((rn.changed || []).includes('main.ts'), 'deve alterar main.ts');
+        assert.ok((rn.changed || []).includes('lib/dep.ts'), 'deve alterar o arquivo FECHADO lib/dep.ts');
+        const depAfter = fs.readFileSync(path.join(projectRoot, 'lib', 'dep.ts'), 'utf-8');
+        const mainAfter = fs.readFileSync(path.join(projectRoot, 'main.ts'), 'utf-8');
+        assert.ok(depAfter.includes('class Saudacao'), 'dep.ts deve ter a classe renomeada');
+        assert.ok(!depAfter.includes('Greeter'), 'dep.ts não pode manter o nome antigo');
+        assert.ok(mainAfter.includes('new Saudacao'), 'main.ts deve usar o nome novo');
     } finally {
         await stopServer(child, projectRoot, dataDir);
     }
