@@ -149,7 +149,7 @@ Instaladores Windows **sem assinatura** disparam o aviso do **SmartScreen** ("ed
 3. **Configure os secrets** do repositório GitHub (`Settings → Secrets and variables → Actions`):
    - `WIN_CSC_LINK` — o conteúdo base64 do `.pfx`.
    - `WIN_CSC_KEY_PASSWORD` — a senha do certificado.
-4. No próximo build Windows, o workflow `.github/workflows/ci.yml` importa o certificado e o electron-builder assina o instalador. Sem os secrets, o CI continua buildando, mas **registra um aviso** de que o instalador não será assinado.
+4. No próximo build de release (tag `v*`), o workflow `.github/workflows/ci.yml` importa o certificado e o electron-builder assina o instalador. **Sem os secrets, o release falha no CI** (de propósito): nunca publicar instaladores sem assinatura. Para macOS, configure também `MAC_CSC_LINK` e `MAC_CSC_KEY_PASSWORD`.
 
 ### Testes locais (instaladores sem assinatura)
 
@@ -159,7 +159,10 @@ Para buildar/testar localmente sem certificado (esperado que o SmartScreen alert
 npm run build:win
 ```
 
+> Enquanto os instaladores não forem assinados, o `verifyUpdateCodeSignature` do `package.json` fica em `false`. **Ao assinar de verdade, volte-o para `true`** (o auto-update só é seguro com verificação de assinatura).
+
 ### Publicação e atualizações
 
 - **Instaladores**: publicados via GitHub/GitLab Releases (`scripts/publish.js`). Recomenda-se só publicar **releases oficiais** com builds assinados.
-- **Auto-update**: ainda **não** está implementado. Para ativá-lo será necessário adicionar a dependência `electron-updater`, publicar o `latest.yml` e manter `win.verifyUpdateCodeSignature: true` com builds assinados.
+- **Auto-update**: implementado via `electron-updater` (só em builds empacotados). A cada 4h e no boot o app consulta o `latest.yml` do GitHub Releases; quando há versão nova ele baixa e oferece reiniciar para instalar. Requer que o release contenha o `latest.yml` e o instalador gerados pelo `electron-builder`.
+- **Dados do usuário**: o backend empacotado grava `config.json`, `token_usage.json`, `pricing.json` e logs no **userData do Electron** (nunca dentro do app). No código, esse diretório é definido por `AED_DATA_DIR`.

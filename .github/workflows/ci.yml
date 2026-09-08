@@ -46,17 +46,32 @@ jobs:
         env:
           WIN_CSC_LINK: ${{ secrets.WIN_CSC_LINK }}
 
-      - name: Check Windows code signing
+      # Releases de produção só podem ser publicados ASSINADOS: instalador
+      # Windows não assinado é bloqueado pelo SmartScreen e o auto-update
+      # depende de builds íntegros. Configure os secrets antes de criar a tag.
+      - name: Require Windows code signing (release)
         if: runner.os == 'Windows'
         shell: bash
         run: |
           if [ -z "$WIN_CSC_LINK" ]; then
-            echo "::warning::Instalador Windows NÃO será assinado. Configure os secrets WIN_CSC_LINK e WIN_CSC_KEY_PASSWORD (SmartScreen bloqueará o instalador)."
-          else
-            echo "Instalador Windows será assinado."
+            echo "::error::Release Windows exige assinatura de código. Configure os secrets WIN_CSC_LINK e WIN_CSC_KEY_PASSWORD (instalador não assinado será bloqueado pelo SmartScreen e o auto-update falhará)."
+            exit 1
           fi
+          echo "Instalador Windows será assinado."
         env:
           WIN_CSC_LINK: ${{ secrets.WIN_CSC_LINK }}
+
+      - name: Require macOS code signing (release)
+        if: runner.os == 'macOS'
+        shell: bash
+        run: |
+          if [ -z "$MAC_CSC_LINK" ]; then
+            echo "::error::Release macOS exige assinatura. Configure os secrets MAC_CSC_LINK e MAC_CSC_KEY_PASSWORD."
+            exit 1
+          fi
+          echo "App macOS será assinado."
+        env:
+          MAC_CSC_LINK: ${{ secrets.MAC_CSC_LINK }}
 
       - name: Build
         shell: bash
@@ -66,7 +81,31 @@ jobs:
           if [ "$RUNNER_OS" = "Linux" ]; then npm run build:linux; fi
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          CSC_LINK: ${{ secrets.WIN_CSC_LINK }}
           CSC_KEY_PASSWORD: ${{ secrets.WIN_CSC_KEY_PASSWORD }}
+          MAC_CSC_LINK: ${{ secrets.MAC_CSC_LINK }}
+          MAC_CSC_KEY_PASSWORD: ${{ secrets.MAC_CSC_KEY_PASSWORD }}
+
+      # Smoke test REAL do executável empacotado: valida boot do backend e
+      # gravação de config no userData (regressão do bug de escrita no asar).
+      - name: Smoke test executável empacotado (Windows)
+        if: runner.os == 'Windows'
+        shell: bash
+        timeout-minutes: 6
+        run: |
+          set +e
+          "./dist/win-unpacked/Aedificator Codex IDE.exe"
+          code=$?
+          set -e
+          echo "Smoke exit code: $code"
+          if [ "$code" -ne 0 ]; then
+            echo "::error::Smoke test do executável falhou (exit $code). Verifique logs acima."
+            exit 1
+          fi
+          echo "✅ Smoke test do executável OK"
+        env:
+          AED_SMOKE_TEST: "1"
+          AED_USER_DATA: ${{ runner.temp }}/aedificator-smoke
 
       - uses: actions/upload-artifact@v4
         with:

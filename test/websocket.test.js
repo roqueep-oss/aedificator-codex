@@ -17,7 +17,7 @@ let projectRoot;
 function startServer() {
     projectRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'aedificator-ws-'));
     child = spawn(process.execPath, [SERVER_PATH], {
-        env: { ...process.env, PORT: String(PORT), BACKEND_TOKEN: TOKEN, PROJECT_ROOT: projectRoot },
+        env: { ...process.env, PORT: String(PORT), BACKEND_TOKEN: TOKEN, PROJECT_ROOT: projectRoot, AED_DATA_DIR: projectRoot },
         stdio: ['ignore', 'pipe', 'pipe']
     });
     child.stderr.on('data', () => {});

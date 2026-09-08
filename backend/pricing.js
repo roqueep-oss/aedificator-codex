@@ -5,6 +5,7 @@
 
 const fs = require('fs');
 const path = require('path');
+const { getDataDir } = require('./data-dir');
 
 const TOKEN_PRICES = {
     deepseek: {
@@ -86,8 +87,23 @@ function logErr(type, message, details) {
 
 // Grava pricing.json de forma atômica (tmp + rename) para evitar corrupção
 // quando timers concorrentes escrevem ao mesmo tempo.
+// No primeiro uso copia o pricing.json estático (empacotado, read-only) para o
+// diretório gravável. A partir daí leituras e gravações usam sempre o gravável.
+function ensurePricingSeeded() {
+    try {
+        const dataDir = getDataDir();
+        const target = path.join(dataDir, 'pricing.json');
+        if (fs.existsSync(target)) return;
+        const bundled = path.join(__dirname, 'pricing.json');
+        if (fs.existsSync(bundled)) {
+            fs.mkdirSync(dataDir, { recursive: true });
+            fs.copyFileSync(bundled, target);
+        }
+    } catch (e) {}
+}
+
 function savePricingFile(data) {
-    const pricingFile = path.join(__dirname, 'pricing.json');
+    const pricingFile = path.join(getDataDir(), 'pricing.json');
     const tmpFile = pricingFile + '.tmp';
     try {
         fs.writeFileSync(tmpFile, JSON.stringify(data), 'utf-8');
@@ -112,7 +128,7 @@ async function fetchUsdBrlRate() {
             _usdBrlLastFetch = now;
             console.log(`💲 Cotação USD/BRL atualizada: R$ ${rate}`);
             try {
-                const pricingFile = path.join(__dirname, 'pricing.json');
+                const pricingFile = path.join(getDataDir(), 'pricing.json');
                 const saved = fs.existsSync(pricingFile) ? JSON.parse(fs.readFileSync(pricingFile, 'utf-8')) : {};
                 saved.usdBrl = rate;
                 savePricingFile(saved);
@@ -130,7 +146,7 @@ async function fetchAiPrices(forceRefresh) {
     if (!forceRefresh && now - _aiPricesLastFetch < 3600000) return TOKEN_PRICES;
     _aiPricesLastFetch = now;
 
-    const pricingFile = path.join(__dirname, 'pricing.json');
+    const pricingFile = path.join(getDataDir(), 'pricing.json');
     let saved = {};
     try {
         if (fs.existsSync(pricingFile)) {
@@ -230,7 +246,10 @@ Atualize os valores com os preços REAIS atuais de cada provedor. Retorne SOMENT
     return TOKEN_PRICES;
 }
 
-const usagePath = path.join(__dirname, 'token_usage.json');
+// token_usage.json é dado GRAVÁVEL do usuário → vai para AED_DATA_DIR (userData
+// no app empacotado), nunca para dentro do asar. pricing.json é estático e fica
+// no diretório do módulo (leitura ok mesmo dentro do asar).
+const usagePath = path.join(getDataDir(), 'token_usage.json');
 let tokenUsage = {};
 
 function loadTokenUsage() {
@@ -356,9 +375,10 @@ function getUsageReport(provider, model) {
 }
 
 // Carrega estado persistido (preços salvos em disco e cotação) na inicialização.
+ensurePricingSeeded();
 loadTokenUsage();
 try {
-    const pricingFile = path.join(__dirname, 'pricing.json');
+    const pricingFile = path.join(getDataDir(), 'pricing.json');
     if (fs.existsSync(pricingFile)) {
         const saved = JSON.parse(fs.readFileSync(pricingFile, 'utf-8'));
         if (saved.usdBrl) usdBrlRate = saved.usdBrl;

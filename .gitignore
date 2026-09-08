@@ -3,7 +3,9 @@ node_modules/
 
 # Build / distribuição
 dist/
-build/
+build/*
+!build/icon.ico
+!build/icon.png
 *.exe
 *.msi
 *.AppImage
@@ -12,10 +14,12 @@ build/
 backend/.env
 backend/config.json
 backend/projects/
+backend/token_usage.json
 
 # Tokens / segredos locais
 .env.local
 scripts/.env.local
+backend/.env.local
 
 # Backups gerados pelo app
 .aedificator-codex-ide-backup/
@@ -33,3 +37,6 @@ desktop.ini
 # IDE
 .vscode/
 .idea/
+
+# Scratch manual (agente/WS)
+teste-oc.txt

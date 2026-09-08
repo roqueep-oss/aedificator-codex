@@ -50,7 +50,18 @@
       "backend/**/*",
       "frontend/**/*",
       "opencode.json",
-      "build/icon.ico"
+      "build/icon.ico",
+      "!backend/config.json",
+      "!backend/.env",
+      "!backend/.env.example",
+      "!backend/token_usage.json",
+      "!backend/**/*.log",
+      "!**/.env",
+      "!frontend/vendor/monaco/**",
+      "!node_modules/monaco-editor/esm/**",
+      "!node_modules/monaco-editor/dev/**",
+      "!node_modules/monaco-editor/min-maps/**",
+      "!node_modules/puppeteer-core/src/**"
     ],
     "extraResources": [
       {
@@ -63,9 +74,6 @@
       }
     ],
     "asar": true,
-    "asarUnpack": [
-      "node_modules/monaco-editor/**/*"
-    ],
     "win": {
       "target": [
         {
@@ -77,7 +85,7 @@
         }
       ],
       "icon": "build/icon.ico",
-      "verifyUpdateCodeSignature": true,
+      "verifyUpdateCodeSignature": false,
       "signAndEditExecutable": true
     },
     "nsis": {
@@ -110,17 +118,18 @@
     "electron": "^33.4.0",
     "electron-builder": "^26.15.3",
     "eslint": "^8.56.0",
+    "marked": "^18.0.9",
+    "opencode-ai": "^1.18.23",
     "typescript": "^7.0.2"
   },
   "dependencies": {
     "acorn": "^8.18.0",
     "cors": "^2.8.6",
     "dotenv": "^16.3.1",
+    "electron-updater": "^6.6.2",
     "express": "^4.22.2",
-    "marked": "^18.0.9",
     "merge-descriptors": "^2.0.0",
     "monaco-editor": "^0.56.0",
-    "opencode-ai": "^1.18.23",
     "puppeteer-core": "^25.5.0",
     "ws": "^8.21.1"
   }

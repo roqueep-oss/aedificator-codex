@@ -24,6 +24,7 @@ const {
     getUsageReport, trackTokens, savePricingFile, fetchUsdBrlRate, fetchAiPrices,
     getUsdBrl, setUsdBrl, setPricingDeps
 } = require('./pricing');
+const { getDataDir } = require('./data-dir');
 const { configureSnapshot, registerSnapshotRoutes, restoreSnapshot } = require('./snapshot');
 const { registerStateRoutes } = require('./routes-state');
 const { registerProjectRoutes } = require('./routes-project');
@@ -223,11 +224,18 @@ function decryptSecret(stored) {
 }
 
 // ===== PASTA PADRÃO DO PROJETO =====
-let PROJECT_ROOT = process.env.PROJECT_ROOT || path.join(__dirname, 'projects');
+// Dados graváveis (config, logs, uso de tokens) ficam em AED_DATA_DIR (userData
+// no app empacotado); em dev caem na própria pasta do backend.
+const DATA_DIR = getDataDir();
+try {
+    if (!fs.existsSync(DATA_DIR)) fs.mkdirSync(DATA_DIR, { recursive: true });
+} catch (e) {}
+
+let PROJECT_ROOT = process.env.PROJECT_ROOT || path.join(DATA_DIR, 'projects');
 
 if (!fs.existsSync(PROJECT_ROOT)) {
     console.log(`⚠️ Pasta não encontrada: ${PROJECT_ROOT}`);
-    PROJECT_ROOT = path.join(__dirname, 'projects');
+    PROJECT_ROOT = path.join(DATA_DIR, 'projects');
     if (!fs.existsSync(PROJECT_ROOT)) {
         fs.mkdirSync(PROJECT_ROOT, { recursive: true });
     }
@@ -254,7 +262,7 @@ function setProjectRoot(newPath) {
 }
 
 // ===== LOGGER =====
-const LOG_FILE = path.join(__dirname, 'aedificator.log');
+const LOG_FILE = path.join(DATA_DIR, 'aedificator.log');
 const logBuffer = [];
 const MAX_LOG_BUFFER = 300;
 
@@ -343,7 +351,7 @@ let config = {
 };
 
 
-const configPath = path.join(__dirname, 'config.json');
+const configPath = path.join(DATA_DIR, 'config.json');
 if (fs.existsSync(configPath)) {
     try {
         const savedConfig = JSON.parse(fs.readFileSync(configPath, 'utf-8'));
@@ -872,6 +880,15 @@ async function callGemini(prompt, onChunk, signal, forcedModel) {
 }
 
 function resolveOpenCodeBinary() {
+    // No app empacotado o binário é copiado via extraResources para
+    // process.resourcesPath/opencode/bin/opencode.exe (fora do asar).
+    const packagedCandidates = [];
+    if (process.resourcesPath) {
+        packagedCandidates.push(path.join(process.resourcesPath, 'opencode', 'bin', 'opencode.exe'));
+    }
+    for (const c of packagedCandidates) {
+        if (fs.existsSync(c)) return c;
+    }
     // Prioriza o binário EMPACOTADO com o projeto (node_modules local), para o
     // Aedificator ser autossuficiente e não depender de uma instalação global.
     const projectNodeModules = [

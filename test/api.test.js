@@ -18,7 +18,8 @@ function startServer(token = TOKEN) {
             ...process.env,
             PORT: String(PORT),
             BACKEND_TOKEN: token,
-            PROJECT_ROOT: projectRoot
+            PROJECT_ROOT: projectRoot,
+            AED_DATA_DIR: projectRoot
         },
         stdio: ['ignore', 'pipe', 'pipe']
     });
@@ -135,7 +136,7 @@ test('main.js trata erros não tratados com exit', async (t) => {
 
     const projectRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'aedificator-exit-test-'));
     const child = spawn(process.execPath, [SERVER_PATH], {
-        env: { ...process.env, PORT: String(PORT), BACKEND_TOKEN: TOKEN, PROJECT_ROOT: projectRoot },
+        env: { ...process.env, PORT: String(PORT), BACKEND_TOKEN: TOKEN, PROJECT_ROOT: projectRoot, AED_DATA_DIR: projectRoot },
         stdio: ['ignore', 'pipe', 'pipe']
     });
     child.stderr.on('data', () => {});

@@ -16,6 +16,35 @@ if (!gotTheLock) {
     process.exit(0);
 }
 
+// ===== DIRETÓRIO DE DADOS GRAVÁVEL (config/logs/uso do backend) =====
+// No app empacotado o backend NUNCA deve gravar dentro do app.asar (read-only).
+// O main.js injeta AED_DATA_DIR no processo do backend apontando para o userData.
+// AED_USER_DATA permite redirecionar o userData (usado no smoke test de CI).
+if (process.env.AED_USER_DATA) {
+    app.setPath('userData', path.resolve(process.env.AED_USER_DATA));
+}
+const AED_DATA_DIR = app.getPath('userData');
+
+// Modo smoke test: inicia o backend, valida boot + gravação de config e sai.
+// Usado pela CI para testar o executável empacotado de verdade.
+const SMOKE_TEST = process.env.AED_SMOKE_TEST === '1';
+if (SMOKE_TEST) {
+    app.commandLine.appendSwitch('no-sandbox');
+    app.commandLine.appendSwitch('disable-gpu');
+    app.disableHardwareAcceleration();
+}
+
+// No smoke test o app roda sem console anexado; grava diagnóstico em arquivo.
+function smokeLog(msg) {
+    const line = `[${new Date().toISOString()}] ${msg}`;
+    console.log(line);
+    if (!SMOKE_TEST) return;
+    try {
+        const logFile = path.join(app.getPath('userData'), 'smoke.log');
+        fs.appendFileSync(logFile, line + '\n');
+    } catch (e) {}
+}
+
 // ===== VARIÁVEIS =====
 let mainWindow = null;
 let backendProcess = null;
@@ -169,11 +198,17 @@ async function startBackend() {
         fs.mkdirSync(projectsDir, { recursive: true });
     }
 
+    // No app empacotado process.execPath é o próprio executável (que SEMPRE roda
+    // a main.js — um spawn com [server.js] relançaria o app e esbarraria na
+    // instância única). ELECTRON_RUN_AS_NODE faz o mesmo binário rodar o
+    // server.js como um processo Node puro (funciona em dev e em produção).
     backendProcess = spawn(nodePath, [backendPath], {
         env: {
             ...process.env,
+            ELECTRON_RUN_AS_NODE: '1',
             NODE_ENV: 'production',
             PROJECT_ROOT: projectsDir,
+            AED_DATA_DIR,
             PORT: BACKEND_PORT.toString(),
             BACKEND_TOKEN,
             BACKEND_SECRET: getOrCreateBackendSecret()
@@ -183,15 +218,15 @@ async function startBackend() {
     });
 
     backendProcess.stdout.on('data', (data) => {
-        console.log(`[Backend] ${data}`);
+        smokeLog(`[Backend] ${data}`);
     });
 
     backendProcess.stderr.on('data', (data) => {
-        console.error(`[Backend Error] ${data}`);
+        smokeLog(`[Backend Error] ${data}`);
     });
 
     backendProcess.on('close', (code) => {
-        console.log(`Backend finalizado com código ${code}`);
+        smokeLog(`Backend finalizado com código ${code}`);
     });
 
     let attempts = 0;
@@ -199,13 +234,13 @@ async function startBackend() {
         attempts++;
         const running = await isBackendRunning();
         if (running) {
-            console.log('✅ Backend pronto!');
+            smokeLog('✅ Backend pronto!');
             return true;
         }
         await new Promise(r => setTimeout(r, 500));
     }
 
-    console.error('❌ Timeout ao iniciar backend');
+    smokeLog('❌ Timeout ao iniciar backend');
     return false;
 }
 
@@ -469,10 +504,93 @@ ipcMain.handle('open-in-explorer', (event, folderPath) => {
 //  EVENTOS DO APP
 // =============================================
 
+// =============================================
+//  AUTO-UPDATE (electron-updater)
+//  Ativo apenas em builds empacotados (e fora do smoke test). Enquanto os
+//  instaladores não forem assinados, mantenha `verifyUpdateCodeSignature: false`
+//  no package.json; reative quando a assinatura estiver configurada.
+// =============================================
+function setupAutoUpdater() {
+    if (!app.isPackaged || SMOKE_TEST) return;
+    if (process.platform === 'linux') return; // AppImage exige config extra de repositório
+    try {
+        const { autoUpdater } = require('electron-updater');
+        autoUpdater.logger = console;
+        autoUpdater.autoDownload = true;
+        autoUpdater.autoInstallOnAppQuit = true;
+        autoUpdater.on('error', (err) => console.error('[AutoUpdater] erro:', err && err.message));
+        autoUpdater.on('update-available', () => console.log('[AutoUpdater] nova versão disponível — baixando...'));
+        autoUpdater.on('update-downloaded', async (info) => {
+            console.log('[AutoUpdater] atualização baixada, instalando...');
+            try {
+                const { response } = await dialog.showMessageBox({
+                    type: 'info',
+                    title: 'Atualização disponível',
+                    message: `Aedificator ${info.version} foi baixada.`,
+                    detail: 'Reinicie agora para instalar a nova versão.',
+                    buttons: ['Reiniciar agora', 'Depois'],
+                    defaultId: 0,
+                    cancelId: 1
+                });
+                if (response === 0) autoUpdater.quitAndInstall();
+            } catch (e) {
+                console.error('[AutoUpdater] erro ao confirmar instalação:', e.message);
+            }
+        });
+        setTimeout(() => { try { autoUpdater.checkForUpdates(); } catch (e) {} }, 10000);
+        setInterval(() => { try { autoUpdater.checkForUpdates(); } catch (e) {} }, 4 * 60 * 60 * 1000);
+        console.log('🔄 Auto-update habilitado.');
+    } catch (e) {
+        console.error('❌ Não foi possível inicializar auto-update:', e.message);
+    }
+}
+
+// =============================================
+//  SMOKE TEST (usado pela CI no exe empacotado)
+// =============================================
+async function runSmokeTest(backendOk) {
+    const fail = (msg) => {
+        smokeLog(`SMOKE_FAIL: ${msg}`);
+        try { if (backendProcess) backendProcess.kill(); } catch (e) {}
+        app.exit(1);
+    };
+    if (!backendOk) return fail('backend não iniciou');
+
+    const headers = { 'Authorization': `Bearer ${BACKEND_TOKEN}`, 'Content-Type': 'application/json' };
+    try {
+        const health = await fetch(`http://127.0.0.1:${BACKEND_PORT}/api/health`, { headers });
+        if (health.status !== 200) return fail(`health respondeu ${health.status}`);
+        smokeLog('health OK');
+        // Força uma gravação real de config no diretório de dados gravável
+        // (regressão do bug em que o app empacotado tentava gravar no asar).
+        const cfg = await fetch(`http://127.0.0.1:${BACKEND_PORT}/api/config`, {
+            method: 'POST',
+            headers,
+            body: JSON.stringify({ deepseekModel: 'deepseek-v4-pro' })
+        });
+        if (cfg.status !== 200) return fail(`POST /api/config respondeu ${cfg.status}`);
+        smokeLog('POST /api/config OK');
+        await new Promise((r) => setTimeout(r, 400));
+        const configFile = path.join(AED_DATA_DIR, 'config.json');
+        if (!fs.existsSync(configFile)) return fail('config.json não foi gravado em AED_DATA_DIR (userData)');
+        smokeLog(`SMOKE_OK config.json em: ${configFile}`);
+        try { if (backendProcess) backendProcess.kill(); } catch (e) {}
+        app.exit(0);
+    } catch (e) {
+        return fail(e.message);
+    }
+}
+
 app.whenReady().then(async () => {
     console.log('📱 App pronto!');
-    await startBackend();
+    app.setAppUserModelId('com.aedificator.codex.ide');
+    const backendOk = await startBackend();
+    if (SMOKE_TEST) {
+        await runSmokeTest(backendOk);
+        return;
+    }
     createWindow();
+    setupAutoUpdater();
 });
 
 app.on('second-instance', () => {
@@ -489,6 +607,15 @@ app.on('window-all-closed', () => {
     }
     if (process.platform !== 'darwin') {
         app.quit();
+    }
+});
+
+// Garante que o backend não fique órfão em saídas que não passam por
+// window-all-closed (ex.: auto-update quitAndInstall, app.exit no smoke test).
+app.on('before-quit', () => {
+    if (backendProcess) {
+        try { backendProcess.kill(); } catch (e) {}
+        backendProcess = null;
     }
 });
 
