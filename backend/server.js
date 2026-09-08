@@ -168,6 +168,7 @@ function startHeartbeat() {
 }
 
 const runner = require('./runner');
+const tsbridge = require('./tsbridge');
 const debuggerRunner = require('./debugger');
 const analyzer = require('./analyzer');
 const remote = require('./remote');
@@ -261,6 +262,7 @@ function setProjectRoot(newPath) {
     if (fileWatcher) { fileWatcher.close(); fileWatcher = null; }
     const resolvedPath = path.resolve(newPath);
     if (fs.existsSync(resolvedPath)) {
+        tsbridge.disposeRoot(PROJECT_ROOT);
         PROJECT_ROOT = resolvedPath;
         invalidateDeepseekCache();
         invalidateProjectCache();
@@ -4056,6 +4058,49 @@ app.post('/api/analyzer/project-errors', (req, res) => {
     } catch (e) {
         res.json({ success: true, errors: [] });
     }
+});
+
+// ===== BRIDGE LSP (tsserver) — consultas tipadas de PROJETO INTEIRO =====
+// Consultas typadas (quickinfo/definição/completions) que resolvem símbolos até
+// em arquivos FECHADOS (lendo do disco), diferentemente do worker do Monaco que
+// só enxerga os arquivos abertos. `file` é o caminho relativo ao projeto;
+// `content` é opcional (buffer do editor, quando divergir do disco).
+function lspInt(v) { const n = parseInt(v, 10); return Number.isFinite(n) ? n : 1; }
+function lspErr(res, e) { return res.json({ success: false, error: e && e.message ? String(e.message) : String(e) }); }
+
+app.post('/api/lsp/ts/quickinfo', async (req, res) => {
+    try {
+        if (!PROJECT_ROOT) return lspErr(res, new Error('Nenhum projeto aberto'));
+        const { file, line, offset, content } = req.body || {};
+        if (!file) return lspErr(res, new Error('Arquivo não informado'));
+        const body = await tsbridge.quickinfo(PROJECT_ROOT, file, lspInt(line), lspInt(offset), content);
+        res.json({ success: true, body });
+    } catch (e) { lspErr(res, e); }
+});
+
+app.post('/api/lsp/ts/definition', async (req, res) => {
+    try {
+        if (!PROJECT_ROOT) return lspErr(res, new Error('Nenhum projeto aberto'));
+        const { file, line, offset, content } = req.body || {};
+        if (!file) return lspErr(res, new Error('Arquivo não informado'));
+        const body = await tsbridge.definition(PROJECT_ROOT, file, lspInt(line), lspInt(offset), content);
+        res.json({ success: true, body });
+    } catch (e) { lspErr(res, e); }
+});
+
+app.post('/api/lsp/ts/completions', async (req, res) => {
+    try {
+        if (!PROJECT_ROOT) return lspErr(res, new Error('Nenhum projeto aberto'));
+        const { file, line, offset, prefix, content } = req.body || {};
+        if (!file) return lspErr(res, new Error('Arquivo não informado'));
+        const body = await tsbridge.completions(PROJECT_ROOT, file, lspInt(line), lspInt(offset), prefix || '', content);
+        res.json({ success: true, body });
+    } catch (e) { lspErr(res, e); }
+});
+
+app.post('/api/lsp/ts/close', (req, res) => {
+    tsbridge.disposeRoot(PROJECT_ROOT);
+    res.json({ success: true });
 });
 
 app.post('/api/analyzer/validate', (req, res) => {
