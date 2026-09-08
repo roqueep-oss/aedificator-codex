@@ -121,8 +121,7 @@
     "electron-builder": "^26.15.3",
     "eslint": "^8.56.0",
     "marked": "^18.0.9",
-    "opencode-ai": "^1.18.23",
-    "typescript": "^7.0.2"
+    "opencode-ai": "^1.18.23"
   },
   "dependencies": {
     "acorn": "^8.18.0",
@@ -133,6 +132,7 @@
     "merge-descriptors": "^2.0.0",
     "monaco-editor": "^0.56.0",
     "puppeteer-core": "^25.5.0",
+    "typescript": "^7.0.2",
     "ws": "^8.21.1"
   }
 }
