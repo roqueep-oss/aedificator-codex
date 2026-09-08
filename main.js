@@ -510,6 +510,21 @@ ipcMain.handle('open-in-explorer', (event, folderPath) => {
 //  instaladores não forem assinados, mantenha `verifyUpdateCodeSignature: false`
 //  no package.json; reative quando a assinatura estiver configurada.
 // =============================================
+// O checkForUpdates() retorna uma Promise que REJEITA quando não há feed de
+// atualização válido (ex.: release sem latest.yml). Uma rejeição não tratada
+// cairia no process.on('unhandledRejection') e derrubaria o app — o auto-update
+// nunca pode matar o aplicativo, então sempre anexamos .catch().
+function safeCheckForUpdates(autoUpdater) {
+    try {
+        const p = autoUpdater.checkForUpdates();
+        if (p && typeof p.catch === 'function') {
+            p.catch((err) => console.error('[AutoUpdater] verificação de atualização falhou (ignorada):', err && err.message));
+        }
+    } catch (e) {
+        console.error('[AutoUpdater] verificação de atualização falhou (ignorada):', e && e.message);
+    }
+}
+
 function setupAutoUpdater() {
     if (!app.isPackaged || SMOKE_TEST) return;
     if (process.platform === 'linux') return; // AppImage exige config extra de repositório
@@ -537,8 +552,8 @@ function setupAutoUpdater() {
                 console.error('[AutoUpdater] erro ao confirmar instalação:', e.message);
             }
         });
-        setTimeout(() => { try { autoUpdater.checkForUpdates(); } catch (e) {} }, 10000);
-        setInterval(() => { try { autoUpdater.checkForUpdates(); } catch (e) {} }, 4 * 60 * 60 * 1000);
+        setTimeout(() => { safeCheckForUpdates(autoUpdater); }, 10000);
+        setInterval(() => { safeCheckForUpdates(autoUpdater); }, 4 * 60 * 60 * 1000);
         console.log('🔄 Auto-update habilitado.');
     } catch (e) {
         console.error('❌ Não foi possível inicializar auto-update:', e.message);
