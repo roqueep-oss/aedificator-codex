@@ -942,9 +942,62 @@ function parseJsonC(text) {
     return out;
 }
 
+// ===== DIRETÓRIOS DO CLI OPEncode =====
+// O CLI do opencode resolve caminhos por plataforma: no Windows o data dir é
+// %LOCALAPPDATA%\opencode\Data (auth.json); no Linux/macOS é XDG_DATA_HOME ou
+// ~/.local/share/opencode. Gravar sempre em ~/.local/share/opencode fazia as
+// chaves nunca serem lidas pelo CLI no Windows.
+function getOpenCodeDataDir() {
+    if (process.platform === 'win32') {
+        const base = process.env.LOCALAPPDATA || path.join(os.homedir(), 'AppData', 'Local');
+        return path.join(base, 'opencode', 'Data');
+    }
+    const xdg = process.env.XDG_DATA_HOME;
+    return xdg ? path.join(xdg, 'opencode') : path.join(os.homedir(), '.local', 'share', 'opencode');
+}
+
+function getOpenCodeConfigDir() {
+    const xdg = process.env.XDG_CONFIG_HOME;
+    return xdg ? path.join(xdg, 'opencode') : path.join(os.homedir(), '.config', 'opencode');
+}
+
+function getOpenCodeAuthCandidates() {
+    const candidates = [path.join(getOpenCodeDataDir(), 'auth.json')];
+    // Compat: em máquinas que já tinham o auth.json no caminho antigo (posix),
+    // lê de lá também para não "desconfigurar" chaves já sincronizadas.
+    if (process.platform === 'win32') {
+        candidates.push(path.join(os.homedir(), '.local', 'share', 'opencode', 'auth.json'));
+    }
+    return candidates;
+}
+
+// Arquivo canônico onde o CLI procura as credenciais (sempre o destino da gravação).
+function openCodeAuthFile() {
+    return path.join(getOpenCodeDataDir(), 'auth.json');
+}
+
+// Lê do arquivo canônico; se ainda não existir (upgrade de versão antiga),
+// cai no caminho legado apenas para LER as chaves já gravadas.
+function readOpenCodeAuth() {
+    for (const file of getOpenCodeAuthCandidates()) {
+        try {
+            if (fs.existsSync(file)) {
+                return { auth: JSON.parse(fs.readFileSync(file, 'utf-8')) };
+            }
+        } catch (e) {}
+    }
+    return { auth: {} };
+}
+
+function writeOpenCodeAuth(auth) {
+    const file = openCodeAuthFile();
+    fs.mkdirSync(path.dirname(file), { recursive: true });
+    fs.writeFileSync(file, JSON.stringify(auth, null, 2), 'utf-8');
+}
+
 function ensureOpenCodeConfig() {
     try {
-        const configDir = path.join(os.homedir(), '.config', 'opencode');
+        const configDir = getOpenCodeConfigDir();
         const configFile = path.join(configDir, 'opencode.jsonc');
         let config = {};
         if (fs.existsSync(configFile)) {
@@ -975,22 +1028,14 @@ function ensureOpenCodeConfig() {
 function ensureOpenCodeAuth(apiKey) {
     try {
         if (!apiKey) return false;
-        const dataDir = path.join(os.homedir(), '.local', 'share', 'opencode');
-        const authFile = path.join(dataDir, 'auth.json');
-        let auth = {};
-        if (fs.existsSync(authFile)) {
-            try {
-                auth = JSON.parse(fs.readFileSync(authFile, 'utf-8'));
-            } catch (e) {}
-        }
+        const { auth } = readOpenCodeAuth();
         let changed = false;
         if (auth.opencode?.key !== apiKey) {
             auth.opencode = { type: 'api', key: apiKey };
             changed = true;
         }
         if (changed) {
-            fs.mkdirSync(dataDir, { recursive: true });
-            fs.writeFileSync(authFile, JSON.stringify(auth, null, 2), 'utf-8');
+            writeOpenCodeAuth(auth);
             console.log('✅ Chave opencode Zen gravada no auth.json');
         }
         return true;
@@ -1003,10 +1048,7 @@ function ensureOpenCodeAuth(apiKey) {
 // ===== LÊ A CHAVE ATUAL DO CLI OPEncode =====
 function getOpenCodeAuthKey() {
     try {
-        const authFile = path.join(os.homedir(), '.local', 'share', 'opencode', 'auth.json');
-        if (!fs.existsSync(authFile)) return '';
-        const auth = JSON.parse(fs.readFileSync(authFile, 'utf-8'));
-        return auth.opencode?.key || '';
+        return readOpenCodeAuth().auth.opencode?.key || '';
     } catch (e) {
         return '';
     }
@@ -1031,12 +1073,7 @@ function getOpenCodeProviderKeyPairs() {
 
 function syncOpenCodeProviderAuth() {
     try {
-        const dataDir = path.join(os.homedir(), '.local', 'share', 'opencode');
-        const authFile = path.join(dataDir, 'auth.json');
-        let auth = {};
-        if (fs.existsSync(authFile)) {
-            try { auth = JSON.parse(fs.readFileSync(authFile, 'utf-8')); } catch (e) {}
-        }
+        const { auth } = readOpenCodeAuth();
         let changed = false;
         // Usa os pares obtidos na hora da chamada, evitando depender de uma
         // constante definida depois deste ponto no módulo.
@@ -1048,8 +1085,7 @@ function syncOpenCodeProviderAuth() {
             }
         }
         if (changed) {
-            fs.mkdirSync(dataDir, { recursive: true });
-            fs.writeFileSync(authFile, JSON.stringify(auth, null, 2), 'utf-8');
+            writeOpenCodeAuth(auth);
             console.log('✅ Chaves dos provedores sincronizadas no auth.json do opencode');
         }
     } catch (e) {
@@ -6745,6 +6781,12 @@ snapshotProjectFiles, diffSnapshots, computeDiff, parseRemoteUrl, nextVersion, d
 pushUndoState, undoStack, redoStack, trackTokens, calcCost, getModelPrice, getUsageReport, tokenUsage, listDirectory, 
 getAllFiles, logError, getProviderErrorHint, backupRelativePath, backupFromContent, backupFileBeforeChange, validateAgentCommand, 
 friendlyOpenCodeError, friendlyProviderError, sanitizeClientError, isClarificationSugestoes, callAIWithFallback, isFallbackEligibleError, safeValidate: analyzer.safeValidate };
+
+// Expostos para testes unitários do diretório do CLI opencode.
+module.exports.getOpenCodeDataDir = getOpenCodeDataDir;
+module.exports.getOpenCodeConfigDir = getOpenCodeConfigDir;
+module.exports.ensureOpenCodeAuth = ensureOpenCodeAuth;
+module.exports.getOpenCodeAuthKey = getOpenCodeAuthKey;
 
 // =============================================
 let mcpConfigs = [];
