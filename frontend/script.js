@@ -8324,8 +8324,89 @@ async function provideGoCompletions(model, position) {
     return { suggestions: suggestions.slice(0, 200) };
 }
 
+// =============================================
+//  LSP (tsserver) via bridge — TS/JS de PROJETO INTEIRO
+//  O worker nativo do Monaco só enxerga as abas ABERTAS. Estas funções chamam o
+//  bridge (/api/lsp/ts/*) para resolver símbolos cuja definição está em arquivo
+//  FECHADO (no disco) e devolvem apenas resultados de arquivos fechados — o
+//  nativo continua cobrindo os arquivos abertos, sem duplicar.
+// =============================================
+function openTabRelPaths() {
+    const set = new Set();
+    for (const tab of editorTabs || []) {
+        if (!tab || !tab.path) continue;
+        set.add(String(tab.path).replace(/\\/g, '/'));
+    }
+    return set;
+}
+
+function bridgeLocationToMonaco(loc) {
+    return {
+        uri: monaco.Uri.file(loc.file),
+        range: new monaco.Range(loc.start && loc.start.line || 1, loc.start && loc.start.offset || 1,
+            loc.end && loc.end.line || 1, loc.end && loc.end.offset || 1)
+    };
+}
+
+// Filtra resultados do tsserver (caminhos absolutos) mantendo apenas os de
+// arquivos que NÃO estão abertos no editor (o worker nativo cobre os abertos).
+function bridgeFilterClosed(locations) {
+    const openRel = openTabRelPaths();
+    const rootRel = currentProjectPath ? String(currentProjectPath).replace(/\\/g, '/').replace(/\/+$/, '') : '';
+    return (locations || []).filter((loc) => {
+        const abs = String(loc.file || '').replace(/\\/g, '/');
+        let rel = abs;
+        if (rootRel && abs.toLowerCase().startsWith(rootRel.toLowerCase())) {
+            rel = abs.slice(rootRel.length).replace(/^\/+/, '');
+        }
+        return !openRel.has(rel);
+    });
+}
+
+async function provideTsLspHover(model, position) {
+    try {
+        const word = model.getWordAtPosition(position);
+        if (!word || !activeTabPath) return null;
+        const res = await apiFetch('/api/lsp/ts/quickinfo', {
+            method: 'POST', headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ file: activeTabPath, line: position.lineNumber, offset: position.column, content: model.getValue() })
+        });
+        const data = await res.json();
+        if (!data.success || !data.body || !data.body.displayString) return null;
+        const value = '```ts\n' + data.body.displayString + '\n```'
+            + (data.body.documentation ? '\n\n' + data.body.documentation : '');
+        return { contents: [{ value }] };
+    } catch (e) { return null; }
+}
+
+async function provideTsLspDefinition(model, position) {
+    try {
+        if (!activeTabPath) return [];
+        const res = await apiFetch('/api/lsp/ts/definition', {
+            method: 'POST', headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ file: activeTabPath, line: position.lineNumber, offset: position.column, content: model.getValue() })
+        });
+        const data = await res.json();
+        if (!data.success || !Array.isArray(data.body)) return [];
+        return bridgeFilterClosed(data.body).map(bridgeLocationToMonaco);
+    } catch (e) { return []; }
+}
+
+async function provideTsLspReferences(model, position) {
+    try {
+        if (!activeTabPath) return [];
+        const res = await apiFetch('/api/lsp/ts/references', {
+            method: 'POST', headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ file: activeTabPath, line: position.lineNumber, offset: position.column, content: model.getValue() })
+        });
+        const data = await res.json();
+        if (!data.success || !Array.isArray(data.body)) return [];
+        return bridgeFilterClosed(data.body).map(bridgeLocationToMonaco);
+    } catch (e) { return []; }
+}
+
 async function provideAedHover(model, position) {
-    if (isTsNativeManaged(model.getLanguageId())) return null;
+    if (isTsNativeManaged(model.getLanguageId())) return await provideTsLspHover(model, position);
     const word = model.getWordAtPosition(position);
     if (!word) return null;
     try {
@@ -8344,7 +8425,7 @@ async function provideAedHover(model, position) {
 }
 
 async function provideAedDefinition(model, position) {
-    if (isTsNativeManaged(model.getLanguageId())) return [];
+    if (isTsNativeManaged(model.getLanguageId())) return await provideTsLspDefinition(model, position);
     const word = model.getWordAtPosition(position);
     if (!word) return [];
     try {
@@ -8362,7 +8443,7 @@ async function provideAedDefinition(model, position) {
 }
 
 async function provideAedReferences(model, position, context) {
-    if (isTsNativeManaged(model.getLanguageId())) return [];
+    if (isTsNativeManaged(model.getLanguageId())) return await provideTsLspReferences(model, position);
     const word = model.getWordAtPosition(position);
     if (!word) return [];
     try {

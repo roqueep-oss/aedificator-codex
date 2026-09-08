@@ -4098,6 +4098,19 @@ app.post('/api/lsp/ts/completions', async (req, res) => {
     } catch (e) { lspErr(res, e); }
 });
 
+app.post('/api/lsp/ts/references', async (req, res) => {
+    try {
+        if (!PROJECT_ROOT) return lspErr(res, new Error('Nenhum projeto aberto'));
+        const { file, line, offset, content } = req.body || {};
+        if (!file) return lspErr(res, new Error('Arquivo não informado'));
+        const body = await tsbridge.references(PROJECT_ROOT, file, lspInt(line), lspInt(offset), content);
+        // tsserver devolve { refs: [...] } — normaliza para array.
+        const arr = Array.isArray(body) ? body
+            : (body && Array.isArray(body.refs) ? body.refs : []);
+        res.json({ success: true, body: arr });
+    } catch (e) { lspErr(res, e); }
+});
+
 app.post('/api/lsp/ts/close', (req, res) => {
     tsbridge.disposeRoot(PROJECT_ROOT);
     res.json({ success: true });

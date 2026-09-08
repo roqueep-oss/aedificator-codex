@@ -106,6 +106,13 @@ test('LSP tsserver resolve tipos de arquivo FECHADO (definition + completions)',
         assert.strictEqual(qi.success, true, JSON.stringify(qi));
         assert.ok(qi.body && /Greeter/.test(qi.body.displayString || ''), 'quickinfo deve citar a classe Greeter');
         assert.match(qi.body.displayString || '', /string/);
+
+        // 4) references de `Greeter` (usado em main.ts) acha o uso + a declaração
+        const refs = await call('/api/lsp/ts/references', { file: 'main.ts', line: 2, offset: offsetGreeter });
+        assert.strictEqual(refs.success, true, JSON.stringify(refs));
+        const refFiles = (refs.body || []).map((r) => String(r.file || '').replace(/\\/g, '/'));
+        assert.ok(refFiles.some((f) => /main\.ts$/.test(f)), 'references deve incluir o uso em main.ts');
+        assert.ok(refFiles.some((f) => /lib\/dep\.ts$/.test(f)), 'references deve incluir a declaração em dep.ts');
     } finally {
         await stopServer(child, projectRoot, dataDir);
     }

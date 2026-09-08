@@ -154,6 +154,11 @@ async function definition(root, relPath, line, offset, content) {
     return send(root, 'definition', { file, line, offset });
 }
 
+async function references(root, relPath, line, offset, content) {
+    const file = await ensureOpenFile(root, relPath, content);
+    return send(root, 'references', { file, line, offset });
+}
+
 async function completions(root, relPath, line, offset, prefix, content) {
     const file = await ensureOpenFile(root, relPath, content);
     return send(root, 'completions', { file, line, offset, prefix });
@@ -161,5 +166,5 @@ async function completions(root, relPath, line, offset, prefix, content) {
 
 module.exports = {
     tsserverPath, disposeRoot, disposeAll,
-    ensureOpenFile, quickinfo, definition, completions, send
+    ensureOpenFile, quickinfo, definition, references, completions, send
 };
