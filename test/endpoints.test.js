@@ -410,3 +410,21 @@ test('undo/redo via REST respondem sem estado acumulado', async () => {
     assert.strictEqual(r.status, 200);
     assert.strictEqual(r.body.success, false, 'sem stack, redo deve responder success:false');
 });
+
+// ===== PREVIEW /project (Express 5: wildcard nomeado /*splat) =====
+test('preview /project serve arquivo do projeto e bloqueia arquivos sensíveis', async () => {
+    writeRaw('preview.html', '<h1>preview</h1>');
+    writeRaw('.env', 'SECRETO=nao-deve-vazar');
+    const headers = { Authorization: `Bearer ${TOKEN}` };
+
+    let r = await api('GET', '/project/preview.html');
+    assert.strictEqual(r.status, 200, 'deve servir arquivo normal do projeto');
+    const html = await (await fetch(`${BASE}/project/preview.html`, { headers })).text();
+    assert.match(html, /<h1>preview<\/h1>/);
+
+    r = await api('GET', '/project/.env');
+    assert.strictEqual(r.status, 403, 'arquivos sensíveis devem ser bloqueados');
+
+    r = await api('GET', '/project/nao-existe.js');
+    assert.strictEqual(r.status, 404, 'arquivo inexistente deve dar 404');
+});

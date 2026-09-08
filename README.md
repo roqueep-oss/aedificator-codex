@@ -109,7 +109,7 @@ automaticamente** a partir do `git remote -v` da pasta atual (mesma lógica do b
   - Detecta o repositório e monta a configuração de publicação sozinho;
   - Usa a credencial salva no **credential manager do Git** (Antigravity/VSCode/GitHub CLI), sem você colar token;
   - Se **não houver repositório**, pergunta a plataforma, **cria o repositório via API**, configura o `remote` e faz o push inicial;
-  - Faz o build (Windows x64/ia32 por padrão) e publica a **GitHub Release / GitLab Release** da versão atual.
+  - Faz o build (Windows x64; Electron 44+ não publica mais binário 32-bit) e publica a **GitHub Release / GitLab Release** da versão atual.
 
 Exemplos:
 ```

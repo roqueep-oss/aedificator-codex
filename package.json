@@ -5,6 +5,9 @@
   "author": "Aedificator Codex IDE",
   "license": "MIT",
   "main": "main.js",
+  "overrides": {
+    "dompurify": "^3.4.15"
+  },
   "repository": {
     "type": "git",
     "url": "https://github.com/roqueep-oss/aedificator-codex.git"
@@ -13,7 +16,6 @@
     "start": "electron .",
     "dev": "electron . --enable-logging",
     "build:win": "electron-builder --win --x64",
-    "build:win32": "electron-builder --win --ia32",
     "build:mac": "electron-builder --mac",
     "build:linux": "electron-builder --linux",
     "build:all": "electron-builder --win --mac --linux",
@@ -79,8 +81,7 @@
         {
           "target": "nsis",
           "arch": [
-            "x64",
-            "ia32"
+            "x64"
           ]
         }
       ],
@@ -115,7 +116,7 @@
     }
   },
   "devDependencies": {
-    "electron": "^33.4.0",
+    "electron": "^44.0.0",
     "electron-builder": "^26.15.3",
     "eslint": "^8.56.0",
     "marked": "^18.0.9",
@@ -127,7 +128,7 @@
     "cors": "^2.8.6",
     "dotenv": "^16.3.1",
     "electron-updater": "^6.6.2",
-    "express": "^4.22.2",
+    "express": "^5.1.0",
     "merge-descriptors": "^2.0.0",
     "monaco-editor": "^0.56.0",
     "puppeteer-core": "^25.5.0",

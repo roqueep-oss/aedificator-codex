@@ -103,8 +103,9 @@ const nodeModulesDir = path.join(__dirname, '..', 'node_modules');
 app.use('/node_modules', express.static(nodeModulesDir));
 
 // ===== SERVE ARQUIVOS DO PROJETO PARA O NAVEGADOR INTEGRADO =====
-app.get('/project/*', (req, res) => {
-    const relPath = req.params[0] || 'index.html';
+// Express 5 exige wildcard nomeado (/*splat) e devolve o valor como array
+// quando há múltiplos segmentos — normaliza para string com '/'.
+function serveProjectFile(relPath, req, res) {
     const full = resolveSafePath(relPath);
     if (!full || !fs.existsSync(full) || fs.statSync(full).isDirectory()) {
         return res.status(404).send('Arquivo não encontrado');
@@ -131,6 +132,16 @@ app.get('/project/*', (req, res) => {
     res.setHeader('Pragma', 'no-cache');
     res.setHeader('Expires', '0');
     res.sendFile(full);
+}
+
+app.get('/project/*splat', (req, res) => {
+    const raw = req.params.splat;
+    const relPath = Array.isArray(raw) ? raw.join('/') : (raw || '');
+    serveProjectFile(relPath || 'index.html', req, res);
+});
+// Raiz do preview (sem segmento) serve o index do projeto.
+app.get(['/project', '/project/'], (req, res) => {
+    serveProjectFile('index.html', req, res);
 });
 
 const server = http.createServer(app);
